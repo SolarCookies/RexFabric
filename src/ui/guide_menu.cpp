@@ -58,14 +58,23 @@ void ModPage(Menu& menu, const std::string& folder) {
     model->SetEnabled(index, enabled);
     return;
   }
-  const size_t count = model->mods().EnabledCount();
-  int position = static_cast<int>(index) + 1;
-  if (enabled && count > 1 && menu.Number("Load Order", &position, 1, static_cast<int>(count))) model->Move(index, position - 1 - static_cast<int>(index));
   if (menu.Button("Open Folder")) OpenFolder(mod->dir);
 }
 
-Menu::Look ModLook(const ModInfo& mod) {
-  return {.sub = Detail(mod), .icon = [mod](bool*) { return model->ModIcon(mod); }, .icon_dim = !mod.enabled};
+// A move in the mod lists: on or off, and to a place in the load order.
+void Place(const Menu::ListsAction& action) {
+  size_t index = 0;
+  const ModInfo* mod = FindMod(action.id, &index);
+  if (!mod) return;
+  const bool enable = action.list == 1;
+  if (mod->enabled != enable) {
+    model->SetEnabled(index, enable);
+    if (!enable) return;
+    // Enabling puts it last.
+    index = model->mods().EnabledCount() - 1;
+  }
+  const size_t to = std::min(static_cast<size_t>(std::max(0, action.index)), model->mods().EnabledCount() - 1);
+  if (to != index) model->Move(index, static_cast<int>(to) - static_cast<int>(index));
 }
 
 void PackagePage(Menu& menu, const net::Package& package) {
@@ -188,19 +197,24 @@ void Build(Menu& menu) {
   for (const net::Thunderstore::Failure& failure : model->failures()) menu.Text("Couldn't install " + failure.name + ": " + failure.error, Menu::Tone::kError);
   if (!model->failures().empty() && menu.Button("Dismiss")) model->DismissFailures();
   RestartRow(menu);
-  if (net::Thunderstore* store = model->thunderstore()) menu.Page("Browse Mods", BrowsePage, store->Installing() > 0 ? "Installing" : "");
-  if (menu.Button("Reload Scripts")) model->ReloadScripts();
-  if (menu.Button("Open Mods Folder")) model->OpenModsFolder();
 
-  const std::vector<ModInfo>& mods = model->mods().mods();
-  const size_t enabled = model->mods().EnabledCount();
-  menu.Header("Enabled");
-  if (enabled == 0) menu.Text("No mods enabled", Menu::Tone::kDim);
-  for (size_t i = 0; i < mods.size(); ++i) {
-    if (i == enabled) menu.Header("Available");
-    const std::string folder = mods[i].folder;
-    menu.Page(mods[i].name + "##" + folder, [folder](Menu& sub) { ModPage(sub, folder); }, ModLook(mods[i]));
+  std::vector<Menu::BarButton> actions;
+  if (net::Thunderstore* store = model->thunderstore()) actions.push_back({store->Installing() > 0 ? "Browse Mods (Installing)###browse" : "Browse Mods###browse", BrowsePage});
+  actions.push_back({"Reload Scripts"});
+  actions.push_back({"Open Folder"});
+  const int action = menu.Bar("Actions", actions);
+  if (action >= 0 && actions[static_cast<size_t>(action)].label == "Reload Scripts") model->ReloadScripts();
+  if (action >= 0 && actions[static_cast<size_t>(action)].label == "Open Folder") model->OpenModsFolder();
+
+  // Available and enabled side by side, as on a pack screen; the enabled in load order.
+  Menu::ListsDef lists{.left_title = "Available", .right_title = "Enabled", .to_right = "Enable", .to_left = "Disable"};
+  for (const ModInfo& mod : model->mods().mods()) {
+    const std::string folder = mod.folder;
+    Menu::Item item{.id = folder, .label = mod.name, .sub = Detail(mod), .icon = [mod](bool*) { return model->ModIcon(mod); }, .page = [folder](Menu& sub) { ModPage(sub, folder); }};
+    (mod.enabled ? lists.right : lists.left).push_back(std::move(item));
   }
+  const Menu::ListsAction moved = menu.Lists("Mods", lists);
+  if (moved.kind == Menu::ListsAction::Kind::kMove) Place(moved);
 }
 
 }  // namespace
@@ -208,7 +222,7 @@ void Build(Menu& menu) {
 void AddMenus(MenuModel& menu_model) {
   model = &menu_model;
   rexglue_guide::AddMenu({.id = std::string(kBladeId), .title = "Mods", .place = rexglue_guide::MenuPlace::kRightBlade, .build = Build});
-  rexglue_guide::AddMenu({.id = std::string(kWindowId), .title = "Mods", .place = rexglue_guide::MenuPlace::kDetached, .window = {.width = 640.0f, .height = 760.0f, .hold_input = true}, .build = Build});
+  rexglue_guide::AddMenu({.id = std::string(kWindowId), .title = "Mods", .place = rexglue_guide::MenuPlace::kDetached, .window = {.width = 1000.0f, .height = 760.0f, .hold_input = true}, .build = Build});
 }
 
 void Toggle() { rexglue_guide::ToggleMenu(kWindowId); }
