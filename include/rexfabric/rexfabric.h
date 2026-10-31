@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include <rexfabric/api.h>
 
@@ -60,6 +61,18 @@ void CreateMenus(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* images)
 void ShowMenu(bool show = true);
 void ToggleMenu();
 bool MenuShown();
+
+// A mod in the mods folder, for the game to show or report.
+struct InstalledMod {
+  std::string folder;
+  std::string name;
+  std::string version;
+  std::string author;
+  bool enabled = false;
+};
+// The mods folder as it is now: the enabled mods in load order, then the rest. Reads the folder each call, so
+// it's for occasional use, such as a crash report. Any thread.
+std::vector<InstalledMod> InstalledMods();
 
 // The interface native mods get. The game may use it too, as Host().
 const RexFabricApi& Api();

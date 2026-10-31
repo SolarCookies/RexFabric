@@ -61,11 +61,28 @@ void Setup(Config config) {
 
 const Config& GetConfig() { return Get().config; }
 
+namespace {
+
+std::filesystem::path ModsDir() {
+  const std::filesystem::path& dir = Get().config.mods_dir;
+  return dir.empty() ? rex::filesystem::GetExecutableFolder() / "mods" : dir;
+}
+
+}  // namespace
+
+std::vector<InstalledMod> InstalledMods() {
+  ModList list(ModsDir());
+  list.Scan();
+  std::vector<InstalledMod> mods;
+  for (const ModInfo& mod : list.mods()) mods.push_back({mod.folder, mod.name, mod.version, mod.author, mod.enabled});
+  return mods;
+}
+
 void Start() {
   State& state = Get();
   if (state.started) return;
   state.started = true;
-  if (state.config.mods_dir.empty()) state.config.mods_dir = rex::filesystem::GetExecutableFolder() / "mods";
+  state.config.mods_dir = ModsDir();
   Hooks::Get().Init();
 
   ModList list(state.config.mods_dir);
