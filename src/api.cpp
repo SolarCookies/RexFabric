@@ -1,63 +1,59 @@
 // The RexFabricApi table handed to native mods.
 
-#include <bit>
+#include <algorithm>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
-#include <rex/ppc/context.h>
-#include <rex/system/kernel_state.h>
+#include <rex/cvar.h>
+#include <rex/ppc/func.h>
+#include <rexfabric/game_api.h>
+#include <rexfabric/midasm.h>
 #include <rexfabric/rexfabric.h>
+#include <rexfabric/switches.h>
 
+#include "events.h"
+#include "guest.h"
 #include "hooks.h"
 #include "log.h"
 #include "mod.h"
 
+// What a RexFabricMidasm points at while a native handler runs.
+struct RexFabricMidasm {
+  uint32_t address;
+  const rexfabric::MidasmReg* regs;
+  size_t count;
+};
+
 namespace rexfabric {
 namespace {
 
-using Register = PPCRegister PPCContext::*;
-
-constexpr Register kGprs[32] = {&PPCContext::r0, &PPCContext::r1, &PPCContext::r2, &PPCContext::r3, &PPCContext::r4, &PPCContext::r5, &PPCContext::r6, &PPCContext::r7, &PPCContext::r8, &PPCContext::r9, &PPCContext::r10, &PPCContext::r11, &PPCContext::r12, &PPCContext::r13, &PPCContext::r14, &PPCContext::r15, &PPCContext::r16, &PPCContext::r17, &PPCContext::r18, &PPCContext::r19, &PPCContext::r20, &PPCContext::r21, &PPCContext::r22, &PPCContext::r23, &PPCContext::r24, &PPCContext::r25, &PPCContext::r26, &PPCContext::r27, &PPCContext::r28, &PPCContext::r29, &PPCContext::r30, &PPCContext::r31};
-constexpr Register kFprs[32] = {&PPCContext::f0, &PPCContext::f1, &PPCContext::f2, &PPCContext::f3, &PPCContext::f4, &PPCContext::f5, &PPCContext::f6, &PPCContext::f7, &PPCContext::f8, &PPCContext::f9, &PPCContext::f10, &PPCContext::f11, &PPCContext::f12, &PPCContext::f13, &PPCContext::f14, &PPCContext::f15, &PPCContext::f16, &PPCContext::f17, &PPCContext::f18, &PPCContext::f19, &PPCContext::f20, &PPCContext::f21, &PPCContext::f22, &PPCContext::f23, &PPCContext::f24, &PPCContext::f25, &PPCContext::f26, &PPCContext::f27, &PPCContext::f28, &PPCContext::f29, &PPCContext::f30, &PPCContext::f31};
+static_assert(sizeof(RexFabricRegister) == sizeof(PPCRegister));
+static_assert(static_cast<int>(FieldKind::kChars) == REXFABRIC_FIELD_CHARS);
+static_assert(static_cast<int>(ValueType::kObject) == REXFABRIC_VALUE_OBJECT);
 
 RexFabricMod host_mod{"host"};
 
-uint8_t* Translate(uint32_t address) { return REX_KERNEL_MEMORY()->TranslateVirtual(address); }
-
-template <typename T>
-T Read(uint32_t address) {
-  T value;
-  std::memcpy(&value, Translate(address), sizeof(T));
-  if constexpr (sizeof(T) > 1) value = std::byteswap(value);
-  return value;
-}
-
-template <typename T>
-void Write(uint32_t address, T value) {
-  if constexpr (sizeof(T) > 1) value = std::byteswap(value);
-  std::memcpy(Translate(address), &value, sizeof(T));
-}
-
-template <typename Float, typename Bits>
-Float ReadFloat(uint32_t address) { return std::bit_cast<Float>(Read<Bits>(address)); }
-
-template <typename Float, typename Bits>
-void WriteFloat(uint32_t address, Float value) { Write<Bits>(address, std::bit_cast<Bits>(value)); }
+const char* Name(const RexFabricMod* mod) { return mod ? mod->name.c_str() : "?"; }
 
 void Log(RexFabricMod* mod, RexFabricLogLevel level, const char* message) {
-  const char* name = mod ? mod->name.c_str() : "?";
   switch (level) {
-    case REXFABRIC_LOG_DEBUG: RF_DEBUG("[{}] {}", name, message); break;
-    case REXFABRIC_LOG_INFO: RF_INFO("[{}] {}", name, message); break;
-    case REXFABRIC_LOG_WARN: RF_WARN("[{}] {}", name, message); break;
-    case REXFABRIC_LOG_ERROR: RF_ERROR("[{}] {}", name, message); break;
+    case REXFABRIC_LOG_DEBUG: RF_DEBUG("[{}] {}", Name(mod), message); break;
+    case REXFABRIC_LOG_INFO: RF_INFO("[{}] {}", Name(mod), message); break;
+    case REXFABRIC_LOG_WARN: RF_WARN("[{}] {}", Name(mod), message); break;
+    case REXFABRIC_LOG_ERROR: RF_ERROR("[{}] {}", Name(mod), message); break;
   }
 }
+
+// Hooks and calls ----------------------------------------------------------------------------------------
 
 int IsHookable(uint32_t address) { return Hooks::Get().IsHookable(address); }
 
 RexFabricHookId Hook(RexFabricMod* mod, uint32_t address, RexFabricHookFn fn, void* user) {
   const RexFabricHookId id = Hooks::Get().Add(mod, address, fn, user);
-  if (!id) RF_WARN("[{}] can't hook {:08X}: not a recompiled function", mod ? mod->name : "?", address);
+  if (!id) RF_WARN("[{}] can't hook {:08X}: not a recompiled function", Name(mod), address);
   return id;
 }
 
@@ -65,10 +61,10 @@ int Unhook(RexFabricHookId id) { return Hooks::Get().Remove(id); }
 
 void ApiCallNext(RexFabricCall* call) { CallNext(*call); }
 uint32_t CallAddress(const RexFabricCall* call) { return call->address; }
-uint64_t GetGpr(const RexFabricCall* call, uint32_t index) { return index < 32 ? (call->ctx->*kGprs[index]).u64 : 0; }
-void SetGpr(RexFabricCall* call, uint32_t index, uint64_t value) { if (index < 32) (call->ctx->*kGprs[index]).u64 = value; }
-double GetFpr(const RexFabricCall* call, uint32_t index) { return index < 32 ? (call->ctx->*kFprs[index]).f64 : 0.0; }
-void SetFpr(RexFabricCall* call, uint32_t index, double value) { if (index < 32) (call->ctx->*kFprs[index]).f64 = value; }
+uint64_t GetGpr(const RexFabricCall* call, uint32_t index) { return index < 32 ? (call->ctx->*guest::kGprs[index]).u64 : 0; }
+void SetGpr(RexFabricCall* call, uint32_t index, uint64_t value) { if (index < 32) (call->ctx->*guest::kGprs[index]).u64 = value; }
+double GetFpr(const RexFabricCall* call, uint32_t index) { return index < 32 ? (call->ctx->*guest::kFprs[index]).f64 : 0.0; }
+void SetFpr(RexFabricCall* call, uint32_t index, double value) { if (index < 32) (call->ctx->*guest::kFprs[index]).f64 = value; }
 
 uint64_t CallGuest(RexFabricCall* call, uint32_t address, const uint64_t* args, uint32_t count) {
   PPCFunc* function = rex::runtime::ResolveIndirectFunction(address);
@@ -79,12 +75,163 @@ uint64_t CallGuest(RexFabricCall* call, uint32_t address, const uint64_t* args, 
   // A copy, so the hooked call's registers survive. The stack pointer is the hooked call's, whose own frame
   // isn't live before call_next or after it returns.
   PPCContext ctx = *call->ctx;
-  for (uint32_t i = 0; i < count && i < 8; ++i) (ctx.*kGprs[3 + i]).u64 = args[i];
+  for (uint32_t i = 0; i < count && i < 8; ++i) (ctx.*guest::kGprs[3 + i]).u64 = args[i];
   function(ctx, call->base);
   return ctx.r3.u64;
 }
 
-void* GuestPointer(uint32_t address) { return Translate(address); }
+void* GuestPointer(uint32_t address) { return guest::Translate(address); }
+
+template <typename T>
+T Read(uint32_t address) { return guest::Read<T>(address); }
+
+template <typename T>
+void Write(uint32_t address, T value) { guest::Write<T>(address, value); }
+
+// The game's API -----------------------------------------------------------------------------------------
+
+const TypeDef* AsType(const RexFabricType* type) { return reinterpret_cast<const TypeDef*>(type); }
+const RexFabricType* AsHandle(const TypeDef* type) { return reinterpret_cast<const RexFabricType*>(type); }
+
+// Strings a result points at, until this thread's next call.
+thread_local std::string result_text;
+
+RexFabricValue ToNative(const Value& value) {
+  RexFabricValue out{static_cast<uint32_t>(TypeOf(value))};
+  switch (TypeOf(value)) {
+    case ValueType::kNone: break;
+    case ValueType::kBool: out.i = std::get<bool>(value); break;
+    case ValueType::kInt: out.i = std::get<int64_t>(value); break;
+    case ValueType::kFloat: out.f = std::get<double>(value); break;
+    case ValueType::kString: out.s = std::get<std::string>(value).c_str(); break;
+    case ValueType::kObject:
+      out.address = std::get<Object>(value).address;
+      out.object_type = AsHandle(std::get<Object>(value).type);
+      break;
+  }
+  return out;
+}
+
+// Loosely: an integer passes for a float, and an address for an object.
+bool FromNative(const RexFabricValue& in, ValueType want, Value& out) {
+  switch (want) {
+    case ValueType::kNone: out = {}; return true;
+    case ValueType::kBool: out = in.i != 0; return in.type == REXFABRIC_VALUE_BOOL || in.type == REXFABRIC_VALUE_INT;
+    case ValueType::kInt: out = in.i; return in.type == REXFABRIC_VALUE_INT || in.type == REXFABRIC_VALUE_BOOL;
+    case ValueType::kFloat: out = in.type == REXFABRIC_VALUE_INT ? static_cast<double>(in.i) : in.f; return in.type == REXFABRIC_VALUE_FLOAT || in.type == REXFABRIC_VALUE_INT;
+    case ValueType::kString: out = std::string(in.s ? in.s : ""); return in.type == REXFABRIC_VALUE_STRING && in.s;
+    case ValueType::kObject:
+      out = Object{in.type == REXFABRIC_VALUE_INT ? static_cast<uint32_t>(in.i) : in.address, AsType(in.object_type)};
+      return in.type == REXFABRIC_VALUE_OBJECT || in.type == REXFABRIC_VALUE_INT || in.type == REXFABRIC_VALUE_NONE;
+  }
+  return false;
+}
+
+const RexFabricFunction* FindFunctionC(const char* name) { return reinterpret_cast<const RexFabricFunction*>(name ? FindFunction(name) : nullptr); }
+
+int CallFunction(const RexFabricFunction* handle, const RexFabricValue* args, uint32_t count, RexFabricValue* result) {
+  const auto* function = reinterpret_cast<const FunctionDef*>(handle);
+  if (!function || count != function->params.size()) return 0;
+  std::vector<Value> values(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (!FromNative(args[i], function->params[i], values[i])) {
+      RF_WARN("{}: argument {} should be {}", function->name, i + 1, ValueTypeName(function->params[i]));
+      return 0;
+    }
+  }
+  try {
+    const Value value = function->invoke(values);
+    if (result) {
+      *result = ToNative(value);
+      if (TypeOf(value) == ValueType::kString) result->s = (result_text = std::get<std::string>(value)).c_str();
+    }
+    return 1;
+  } catch (const std::exception& error) {
+    RF_ERROR("{}: {}", function->name, error.what());
+    return 0;
+  }
+}
+
+const RexFabricType* FindTypeC(const char* name) { return AsHandle(name ? FindType(name) : nullptr); }
+uint32_t TypeSize(const RexFabricType* type) { return type ? AsType(type)->size() : 0; }
+
+int TypeField(const RexFabricType* type, const char* name, RexFabricField* out) {
+  const FieldDef* field = type && name ? AsType(type)->FindField(name) : nullptr;
+  if (!field || !out) return 0;
+  *out = {field->offset, static_cast<uint32_t>(field->type.kind), field->count, field->stride, field->type.length, AsHandle(field->type.target)};
+  return 1;
+}
+
+const RexFabricFunction* TypeMethod(const RexFabricType* type, const char* name) { return reinterpret_cast<const RexFabricFunction*>(type && name ? AsType(type)->FindMethod(name) : nullptr); }
+const void* FindInterfaceC(const char* name, uint32_t min_version) { return name ? FindInterface(name, min_version) : nullptr; }
+
+// Events -------------------------------------------------------------------------------------------------
+
+RexFabricListenerId Listen(RexFabricMod* mod, const char* event, RexFabricEventFn fn, void* user) {
+  if (!event || !fn) return 0;
+  return events::Listen(event, mod, [fn, user](std::span<const Value> args) {
+    std::vector<RexFabricValue> values;
+    values.reserve(args.size());
+    for (const Value& arg : args) values.push_back(ToNative(arg));
+    fn(values.data(), static_cast<uint32_t>(values.size()), user);
+  });
+}
+
+int Unlisten(RexFabricListenerId id) { return events::Unlisten(id); }
+
+// Midasm -------------------------------------------------------------------------------------------------
+
+struct NativeClaim {
+  RexFabricMidasmFn fn;
+  void* user;
+};
+
+// Claims live until released, or for good when a mod never releases; they're a few bytes each.
+std::mutex claims_mutex;
+std::unordered_map<RexFabricClaimId, std::unique_ptr<NativeClaim>> claims;
+
+bool RunNativeClaim(void* user, uint32_t address, const MidasmReg* regs, size_t count) {
+  const auto* claim = static_cast<const NativeClaim*>(user);
+  RexFabricMidasm site{address, regs, count};
+  return claim->fn(&site, claim->user) != 0;
+}
+
+RexFabricClaimId ClaimMidasmC(RexFabricMod* mod, uint32_t address, RexFabricMidasmFn fn, void* user) {
+  if (!fn) return 0;
+  auto claim = std::make_unique<NativeClaim>(NativeClaim{fn, user});
+  const RexFabricClaimId id = ClaimMidasm(mod, address, RunNativeClaim, claim.get());
+  std::lock_guard lock(claims_mutex);
+  claims[id] = std::move(claim);
+  return id;
+}
+
+int ReleaseMidasmC(RexFabricClaimId id) { return ReleaseMidasm(id); }
+uint32_t MidasmAddress(const RexFabricMidasm* site) { return site ? site->address : 0; }
+
+RexFabricRegister* MidasmRegister(RexFabricMidasm* site, const char* name) {
+  for (size_t i = 0; site && name && i < site->count; ++i) {
+    if (std::strcmp(site->regs[i].name, name) == 0) return reinterpret_cast<RexFabricRegister*>(site->regs[i].reg);
+  }
+  return nullptr;
+}
+
+// Switches and cvars -------------------------------------------------------------------------------------
+
+int32_t GetSwitchC(const char* name) { return name ? GetSwitch(name) : 0; }
+void SetSwitchC(const char* name, int32_t value) { if (name) SetSwitch(name, value); }
+
+int32_t GetCvar(const char* name, char* buffer, uint32_t size) {
+  if (!name || !rex::cvar::GetFlagInfo(name)) return -1;
+  const std::string value = rex::cvar::GetFlagByName(name);
+  if (buffer && size) {
+    const size_t copied = std::min<size_t>(value.size(), size - 1);
+    std::memcpy(buffer, value.data(), copied);
+    buffer[copied] = '\0';
+  }
+  return static_cast<int32_t>(value.size());
+}
+
+int SetCvar(const char* name, const char* value) { return name && value && rex::cvar::SetFlagByName(name, value); }
 
 constexpr RexFabricApi kApi = {
     .version = REXFABRIC_API_VERSION,
@@ -105,14 +252,31 @@ constexpr RexFabricApi kApi = {
     .read_u16 = Read<uint16_t>,
     .read_u32 = Read<uint32_t>,
     .read_u64 = Read<uint64_t>,
-    .read_f32 = ReadFloat<float, uint32_t>,
-    .read_f64 = ReadFloat<double, uint64_t>,
+    .read_f32 = Read<float>,
+    .read_f64 = Read<double>,
     .write_u8 = Write<uint8_t>,
     .write_u16 = Write<uint16_t>,
     .write_u32 = Write<uint32_t>,
     .write_u64 = Write<uint64_t>,
-    .write_f32 = WriteFloat<float, uint32_t>,
-    .write_f64 = WriteFloat<double, uint64_t>,
+    .write_f32 = Write<float>,
+    .write_f64 = Write<double>,
+    .find_function = FindFunctionC,
+    .call_function = CallFunction,
+    .find_type = FindTypeC,
+    .type_size = TypeSize,
+    .type_field = TypeField,
+    .type_method = TypeMethod,
+    .find_interface = FindInterfaceC,
+    .listen = Listen,
+    .unlisten = Unlisten,
+    .claim_midasm = ClaimMidasmC,
+    .release_midasm = ReleaseMidasmC,
+    .midasm_address = MidasmAddress,
+    .midasm_register = MidasmRegister,
+    .get_switch = GetSwitchC,
+    .set_switch = SetSwitchC,
+    .get_cvar = GetCvar,
+    .set_cvar = SetCvar,
 };
 
 }  // namespace

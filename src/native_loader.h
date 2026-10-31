@@ -16,8 +16,8 @@ namespace rexfabric {
 
 class NativeLoader {
  public:
-  void Load(const std::vector<ModFolder>& mods);
-  // Runs each plugin's shutdown, last loaded first, and removes its hooks.
+  void Load(const std::vector<ModInfo>& mods);
+  // Runs each plugin's shutdown, last loaded first, and removes everything it attached.
   void Unload();
 
  private:
@@ -27,9 +27,12 @@ class NativeLoader {
     RexFabricModShutdownFn shutdown;
   };
 
-  void LoadPlugin(const ModFolder& folder, const std::filesystem::path& file);
+  void LoadPlugin(const ModInfo& owner, const std::filesystem::path& file);
 
   std::vector<Plugin> plugins_;
 };
+
+// Removes the hooks, listeners and midasm claims a mod made.
+void Detach(const RexFabricMod* mod);
 
 }  // namespace rexfabric

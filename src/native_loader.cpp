@@ -2,21 +2,29 @@
 
 #include <ranges>
 
+#include <rexfabric/midasm.h>
 #include <rexfabric/rexfabric.h>
 
+#include "events.h"
 #include "hooks.h"
 #include "log.h"
 
 namespace rexfabric {
 
-void NativeLoader::Load(const std::vector<ModFolder>& mods) {
-  for (const ModFolder& folder : mods) {
-    for (const std::filesystem::path& file : NativePlugins(folder)) LoadPlugin(folder, file);
+void Detach(const RexFabricMod* mod) {
+  Hooks::Get().RemoveAll(mod);
+  events::UnlistenAll(mod);
+  ReleaseAllMidasm(mod);
+}
+
+void NativeLoader::Load(const std::vector<ModInfo>& mods) {
+  for (const ModInfo& mod : mods) {
+    for (const std::filesystem::path& file : NativePlugins(mod.dir)) LoadPlugin(mod, file);
   }
 }
 
-void NativeLoader::LoadPlugin(const ModFolder& folder, const std::filesystem::path& file) {
-  auto mod = std::make_unique<RexFabricMod>(RexFabricMod{folder.name + "/" + file.filename().string()});
+void NativeLoader::LoadPlugin(const ModInfo& owner, const std::filesystem::path& file) {
+  auto mod = std::make_unique<RexFabricMod>(RexFabricMod{owner.folder + "/" + file.filename().string()});
   std::string error;
   std::unique_ptr<Library> library = Library::Open(file, error);
   if (!library) {
@@ -29,7 +37,7 @@ void NativeLoader::LoadPlugin(const ModFolder& folder, const std::filesystem::pa
     RF_INFO("[{}] loaded (no {}, so it sets itself up)", mod->name, REXFABRIC_MOD_INIT_NAME);
   } else if (!init(&Api(), mod.get())) {
     RF_WARN("[{}] declined to load", mod->name);
-    Hooks::Get().RemoveAll(mod.get());
+    Detach(mod.get());
     return;
   } else {
     RF_INFO("[{}] loaded", mod->name);
@@ -39,7 +47,7 @@ void NativeLoader::LoadPlugin(const ModFolder& folder, const std::filesystem::pa
 
 void NativeLoader::Unload() {
   for (Plugin& plugin : plugins_ | std::views::reverse) {
-    Hooks::Get().RemoveAll(plugin.mod.get());
+    Detach(plugin.mod.get());
     if (plugin.shutdown) plugin.shutdown();
     // Left mapped on purpose: a guest thread may still be returning through one of its hooks, and this only
     // runs as the process exits.
