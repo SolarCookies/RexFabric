@@ -60,10 +60,14 @@ void ReadMetadata(ModInfo& mod) {
   if (std::filesystem::is_regular_file(toml_file, error)) {
     try {
       const toml::table table = toml::parse_file(toml_file.string());
-      if (auto name = table["name"].value<std::string>(); name && !name->empty()) mod.name = *name;
-      if (auto description = table["description"].value<std::string>()) mod.description = *description;
-      if (auto version = table["version"].value<std::string>()) mod.version = *version;
-      if (auto author = table["author"].value<std::string>()) mod.author = *author;
+      // A blank entry leaves what the manifest said.
+      const auto take = [&](const char* key, std::string& field) {
+        if (auto value = table[key].value<std::string>(); value && !value->empty()) field = *value;
+      };
+      take("name", mod.name);
+      take("description", mod.description);
+      take("version", mod.version);
+      take("author", mod.author);
     } catch (const toml::parse_error& parse_error) {
       RF_WARN("{}: unreadable mod.toml: {}", mod.folder, parse_error.description());
     }
@@ -156,8 +160,12 @@ void ModList::SetEnabled(size_t index, bool enabled) {
 void ModList::Move(size_t index, int delta) {
   const size_t enabled = EnabledCount();
   const ptrdiff_t target = static_cast<ptrdiff_t>(index) + delta;
-  if (index >= enabled || target < 0 || target >= static_cast<ptrdiff_t>(enabled)) return;
-  std::swap(mods_[index], mods_[static_cast<size_t>(target)]);
+  if (index >= enabled || target < 0 || target >= static_cast<ptrdiff_t>(enabled) || delta == 0) return;
+  // Shifts the ones between along, so they keep their order.
+  const auto from = mods_.begin() + static_cast<ptrdiff_t>(index);
+  const auto to = mods_.begin() + target;
+  if (delta > 0) std::rotate(from, from + 1, to + 1);
+  else std::rotate(to, from, from + 1);
   Save();
 }
 

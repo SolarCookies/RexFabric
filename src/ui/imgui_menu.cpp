@@ -358,6 +358,7 @@ void ModsWindow::DrawCard(const net::Package& package, const ImVec2& size) {
   std::string categories;
   for (const std::string& category : package.categories) categories += (categories.empty() ? "" : ", ") + category;
   if (failed) categories = install->error;
+  if (installing) categories = install->step;
   if (!categories.empty()) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%s", Clip(categories, std::max(20.0f, ImGui::GetContentRegionAvail().x - buttons - style.ItemSpacing.x)).c_str());

@@ -69,6 +69,26 @@ class Thunderstore {
   struct Install {
     Status status = Status::kIdle;
     std::string error;
+    std::string step;  // what it's doing now, while loading
+  };
+
+  struct Dependency {
+    std::string owner;
+    std::string name;
+  };
+
+  // What the listing leaves out: the latest version and what it needs.
+  struct Details {
+    Status status = Status::kIdle;
+    std::string error;
+    std::string version;
+    std::string updated;  // YYYY-MM-DD
+    std::vector<Dependency> dependencies;
+  };
+
+  struct Failure {
+    std::string name;
+    std::string error;
   };
 
   Thunderstore(std::string community, std::filesystem::path mods_dir);
@@ -87,17 +107,26 @@ class Thunderstore {
   // Icons arrive encoded; TakeIcon hands the bytes over once, the frame they're ready.
   void RequestIcon(const std::string& url);
   bool TakeIcon(const std::string& url, std::vector<uint8_t>& bytes);
+  bool IconLoading(const std::string& url) const;
+  // Lets an icon whose texture was dropped be fetched again.
+  void ForgetIcon(const std::string& url);
+
+  // Fetched the first time it's asked for.
+  const Details& GetDetails(const Package& package);
 
   // Installs the latest version into mods_dir/<name>, and any dependency not installed yet.
   void RequestInstall(const Package& package);
   const Install* GetInstall(const Package& package) const;
   // The folders installed since the last call.
   std::vector<std::string> TakeInstalled();
+  // The installs that failed since the last call.
+  std::vector<Failure> TakeFailed();
+  size_t Installing() const;
 
   const std::string& community() const { return community_; }
 
  private:
-  enum class Kind { kListing, kCategories, kIcon, kInstall };
+  enum class Kind { kListing, kCategories, kIcon, kDetails, kInstall };
 
   struct Job {
     Kind kind;
@@ -114,6 +143,7 @@ class Thunderstore {
     std::string error;
     Page page;
     std::vector<Category> categories;
+    Details details;
     std::vector<uint8_t> bytes;
     std::vector<std::string> folders;
   };
@@ -128,6 +158,7 @@ class Thunderstore {
   std::condition_variable wake_;
   std::deque<Job> jobs_;
   std::vector<Result> results_;
+  std::unordered_map<std::string, std::string> steps_;  // installs' steps, from the workers
   std::vector<std::thread> workers_;
   bool stopping_ = false;
 
@@ -136,8 +167,10 @@ class Thunderstore {
   std::vector<Category> categories_;
   bool categories_requested_ = false;
   std::unordered_map<std::string, std::pair<Status, std::vector<uint8_t>>> icons_;
+  std::unordered_map<std::string, Details> details_;
   std::unordered_map<std::string, Install> installs_;
   std::vector<std::string> installed_;
+  std::vector<Failure> failed_;
 };
 
 }  // namespace rexfabric::net

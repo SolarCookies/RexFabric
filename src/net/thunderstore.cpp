@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <set>
 #include <string_view>
 #include <utility>
@@ -96,6 +97,36 @@ bool ParseCategories(const std::string& body, std::vector<Category>& out) {
   return true;
 }
 
+// "Owner-Name-1.2.3" as owner and name. Thunderstore names have no dashes of their own.
+bool SplitDependency(const std::string& text, std::string& owner, std::string& name) {
+  const size_t first = text.find('-');
+  const size_t last = text.rfind('-');
+  if (first == std::string::npos || last == first) return false;
+  owner = text.substr(0, first);
+  name = text.substr(first + 1, last - first - 1);
+  return !owner.empty() && !name.empty();
+}
+
+// A package's latest version, from the package API; null when there's none.
+const nlohmann::json* Latest(const nlohmann::json& root) {
+  const auto latest = root.is_object() ? root.find("latest") : root.end();
+  return latest != root.end() && latest->is_object() ? &*latest : nullptr;
+}
+
+bool ReadDetails(const nlohmann::json& root, Thunderstore::Details& details) {
+  const nlohmann::json* latest = Latest(root);
+  if (!latest) return false;
+  details.version = String(*latest, "version_number");
+  details.updated = String(root, "date_updated").substr(0, 10);
+  if (const auto dependencies = latest->find("dependencies"); dependencies != latest->end() && dependencies->is_array()) {
+    for (const auto& dependency : *dependencies) {
+      Thunderstore::Dependency parsed;
+      if (dependency.is_string() && SplitDependency(dependency.get<std::string>(), parsed.owner, parsed.name)) details.dependencies.push_back(std::move(parsed));
+    }
+  }
+  return true;
+}
+
 // A zip is untrusted: an entry named "../../x" would otherwise land outside the mods folder.
 bool SafePath(std::string_view path) {
   if (path.empty() || path.front() == '/' || path.front() == '\\' || path.find(':') != std::string_view::npos) return false;
@@ -164,18 +195,11 @@ bool InstallArchive(const std::string& archive, const std::filesystem::path& dir
   return true;
 }
 
-// "Owner-Name-1.2.3" as owner and name. Thunderstore names have no dashes of their own.
-bool SplitDependency(const std::string& text, std::string& owner, std::string& name) {
-  const size_t first = text.find('-');
-  const size_t last = text.rfind('-');
-  if (first == std::string::npos || last == first) return false;
-  owner = text.substr(0, first);
-  name = text.substr(first + 1, last - first - 1);
-  return !owner.empty() && !name.empty();
-}
+using Step = std::function<void(std::string)>;
 
-// Installs a package and every dependency not installed yet. `folders` gets each folder installed.
-bool InstallPackage(Http& http, const std::filesystem::path& mods_dir, const std::string& owner, const std::string& name, bool replace, int depth, std::set<std::string>& seen, std::vector<std::string>& folders, std::string& error) {
+// Installs a package and every dependency not installed yet. `folders` gets each folder installed, and
+// `step` hears what it's doing.
+bool InstallPackage(Http& http, const std::filesystem::path& mods_dir, const std::string& owner, const std::string& name, bool replace, int depth, std::set<std::string>& seen, std::vector<std::string>& folders, const Step& step, std::string& error) {
   if (!seen.insert(owner + "-" + name).second) return true;
   std::error_code fs_error;
   if (!replace && std::filesystem::is_directory(mods_dir / name, fs_error)) return true;
@@ -183,24 +207,23 @@ bool InstallPackage(Http& http, const std::filesystem::path& mods_dir, const std
     error = "The dependencies go too deep.";
     return false;
   }
+  step("Checking " + name);
   std::string body;
   if (!http.Get(PackageApiUrl(owner, name), body, error)) return false;
   const nlohmann::json root = nlohmann::json::parse(body, nullptr, false);
-  const auto latest = root.is_object() ? root.find("latest") : root.end();
-  if (latest == root.end() || !latest->is_object() || String(*latest, "download_url").empty()) {
+  const nlohmann::json* latest = Latest(root);
+  Thunderstore::Details details;
+  if (!latest || String(*latest, "download_url").empty() || !ReadDetails(root, details)) {
     error = "Thunderstore offered no download for " + name + ".";
     return false;
   }
-  if (const auto dependencies = latest->find("dependencies"); dependencies != latest->end() && dependencies->is_array()) {
-    for (const auto& dependency : *dependencies) {
-      std::string dependency_owner, dependency_name;
-      if (!dependency.is_string() || !SplitDependency(dependency.get<std::string>(), dependency_owner, dependency_name)) continue;
-      if (!InstallPackage(http, mods_dir, dependency_owner, dependency_name, false, depth + 1, seen, folders, error)) return false;
-    }
+  for (const Thunderstore::Dependency& dependency : details.dependencies) {
+    if (!InstallPackage(http, mods_dir, dependency.owner, dependency.name, false, depth + 1, seen, folders, step, error)) return false;
   }
+  step("Downloading " + name);
   std::string archive;
   if (!http.Get(String(*latest, "download_url"), archive, error) || !InstallArchive(archive, mods_dir / name, error)) return false;
-  RF_INFO("installed {} {} from Thunderstore", name, String(*latest, "version_number"));
+  RF_INFO("installed {} {} from Thunderstore", name, details.version);
   folders.push_back(name);
   return true;
 }
@@ -257,14 +280,23 @@ void Thunderstore::Work() {
         result.ok = http.Get(job.url, body, result.error) && !body.empty();
         result.bytes.assign(body.begin(), body.end());
         break;
+      case Kind::kDetails:
+        result.ok = http.Get(job.url, body, result.error) && ReadDetails(nlohmann::json::parse(body, nullptr, false), result.details);
+        if (!result.ok && result.error.empty()) result.error = "Thunderstore sent details that can't be read.";
+        break;
       case Kind::kInstall: {
         std::set<std::string> seen;
-        result.ok = InstallPackage(http, mods_dir_, job.owner, job.name, true, 0, seen, result.folders, result.error);
+        const Step step = [this, &job](std::string text) {
+          std::lock_guard lock(mutex_);
+          steps_[job.key] = std::move(text);
+        };
+        result.ok = InstallPackage(http, mods_dir_, job.owner, job.name, true, 0, seen, result.folders, step, result.error);
         break;
       }
     }
     std::lock_guard lock(mutex_);
     if (stopping_) return;
+    steps_.erase(job.key);
     results_.push_back(std::move(result));
   }
 }
@@ -274,6 +306,9 @@ void Thunderstore::Poll() {
   {
     std::lock_guard lock(mutex_);
     ready.swap(results_);
+    for (const auto& [key, step] : steps_) {
+      if (const auto it = installs_.find(key); it != installs_.end()) it->second.step = step;
+    }
   }
   for (Result& result : ready) {
     switch (result.kind) {
@@ -292,11 +327,22 @@ void Thunderstore::Poll() {
       case Kind::kIcon:
         icons_[result.key] = {result.ok ? Status::kReady : Status::kError, std::move(result.bytes)};
         break;
+      case Kind::kDetails: {
+        Details& details = details_[result.key];
+        if (result.ok) details = std::move(result.details);
+        details.status = result.ok ? Status::kReady : Status::kError;
+        details.error = std::move(result.error);
+        break;
+      }
       case Kind::kInstall: {
         Install& install = installs_[result.key];
         install.status = result.ok ? Status::kReady : Status::kError;
         install.error = std::move(result.error);
-        if (!result.ok) RF_ERROR("installing {} failed: {}", result.key, install.error);
+        install.step.clear();
+        if (!result.ok) {
+          RF_ERROR("installing {} failed: {}", result.key, install.error);
+          failed_.push_back({result.key.substr(result.key.find('/') + 1), install.error});
+        }
         installed_.insert(installed_.end(), result.folders.begin(), result.folders.end());
         break;
       }
@@ -346,6 +392,26 @@ bool Thunderstore::TakeIcon(const std::string& url, std::vector<uint8_t>& bytes)
   return !bytes.empty();
 }
 
+bool Thunderstore::IconLoading(const std::string& url) const {
+  const auto it = icons_.find(url);
+  return it != icons_.end() && it->second.first == Status::kLoading;
+}
+
+void Thunderstore::ForgetIcon(const std::string& url) {
+  const auto it = icons_.find(url);
+  if (it != icons_.end() && it->second.first != Status::kLoading) icons_.erase(it);
+}
+
+const Thunderstore::Details& Thunderstore::GetDetails(const Package& package) {
+  const std::string key = package.owner + "/" + package.name;
+  const auto [it, inserted] = details_.try_emplace(key);
+  if (inserted) {
+    it->second.status = Status::kLoading;
+    Enqueue({Kind::kDetails, key, PackageApiUrl(package.owner, package.name)});
+  }
+  return it->second;
+}
+
 void Thunderstore::RequestInstall(const Package& package) {
   if (package.name.empty() || package.owner.empty()) return;
   const std::string key = package.owner + "/" + package.name;
@@ -361,5 +427,10 @@ const Thunderstore::Install* Thunderstore::GetInstall(const Package& package) co
 }
 
 std::vector<std::string> Thunderstore::TakeInstalled() { return std::exchange(installed_, {}); }
+std::vector<Thunderstore::Failure> Thunderstore::TakeFailed() { return std::exchange(failed_, {}); }
+
+size_t Thunderstore::Installing() const {
+  return static_cast<size_t>(std::count_if(installs_.begin(), installs_.end(), [](const auto& entry) { return entry.second.status == Status::kLoading; }));
+}
 
 }  // namespace rexfabric::net

@@ -1,5 +1,6 @@
 #include "menu_model.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iterator>
 
@@ -74,6 +75,7 @@ void MenuModel::Poll() {
   ++frame_;
   if (!thunderstore_) return;
   thunderstore_->Poll();
+  for (net::Thunderstore::Failure& failure : thunderstore_->TakeFailed()) failures_.push_back(std::move(failure));
   if (thunderstore_->TakeInstalled().empty()) return;
   mods_.Scan();
   mods_.Save();
@@ -126,7 +128,7 @@ rex::ui::ImmediateTexture* MenuModel::ModIcon(const ModInfo& mod) {
   return it->second.texture.get();
 }
 
-rex::ui::ImmediateTexture* MenuModel::PackageIcon(const net::Package& package) {
+rex::ui::ImmediateTexture* MenuModel::PackageIcon(const net::Package& package, bool* loading) {
   if (!thunderstore_ || package.icon_url.empty()) return nullptr;
   if (auto it = package_icons_.find(package.icon_url); it != package_icons_.end()) {
     it->second.used = frame_;
@@ -134,14 +136,28 @@ rex::ui::ImmediateTexture* MenuModel::PackageIcon(const net::Package& package) {
   }
   thunderstore_->RequestIcon(package.icon_url);
   std::vector<uint8_t> encoded;
-  if (!thunderstore_->TakeIcon(package.icon_url, encoded)) return nullptr;
-  if (package_icons_.size() >= kMaxPackageIcons) {
-    // Only this frame's icons can be on screen; the rest belong to pages already left.
-    std::erase_if(package_icons_, [this](const auto& entry) { return entry.second.used < frame_; });
+  if (!thunderstore_->TakeIcon(package.icon_url, encoded)) {
+    if (loading) *loading = thunderstore_->IconLoading(package.icon_url);
+    return nullptr;
   }
+  if (package_icons_.size() >= kMaxPackageIcons) PrunePackageIcons();
   CachedIcon& icon = package_icons_[package.icon_url];
   icon = {Texture(encoded), frame_};
   return icon.texture.get();
+}
+
+void MenuModel::PrunePackageIcons() {
+  // The least recently drawn go first. This frame's are kept, as its draw list may hold them.
+  std::vector<std::pair<uint64_t, std::string>> by_use;
+  for (const auto& [url, icon] : package_icons_) {
+    if (icon.used < frame_) by_use.emplace_back(icon.used, url);
+  }
+  std::sort(by_use.begin(), by_use.end());
+  const size_t drop = std::min(by_use.size(), package_icons_.size() - kMaxPackageIcons * 3 / 4);
+  for (size_t i = 0; i < drop; ++i) {
+    package_icons_.erase(by_use[i].second);
+    thunderstore_->ForgetIcon(by_use[i].second);
+  }
 }
 
 void MenuModel::OpenModsFolder() const {
