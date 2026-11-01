@@ -42,6 +42,8 @@ class ModList {
   size_t EnabledCount() const;
   const std::filesystem::path& root() const { return root_; }
   const ModInfo* Find(std::string_view folder) const;
+  // A folder the order file doesn't name yet, which the last Scan placed by the rules for new folders.
+  bool New(std::string_view folder) const;
 
   // Enabling puts a mod last in the load order; disabling takes it out. Both save.
   void SetEnabled(size_t index, bool enabled);
@@ -58,6 +60,7 @@ class ModList {
 
   std::filesystem::path root_;
   std::vector<ModInfo> mods_;
+  std::vector<std::string> new_;
 };
 
 bool SameModName(std::string_view a, std::string_view b);

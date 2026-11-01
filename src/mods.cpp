@@ -124,8 +124,10 @@ void ModList::Scan() {
   }
   // What the file doesn't place: new folders join the load order by name, the rest stay off.
   std::sort(found.begin(), found.end(), [](const ModInfo& a, const ModInfo& b) { return Lower(a.folder) < Lower(b.folder); });
+  new_.clear();
   std::vector<ModInfo> off;
   for (ModInfo& mod : found) {
+    if (!Listed(disabled, mod.folder)) new_.push_back(mod.folder);
     mod.enabled = !Listed(disabled, mod.folder);
     (mod.enabled ? mods_ : off).push_back(std::move(mod));
   }
@@ -142,6 +144,10 @@ bool ModList::Save() const {
   out << order.dump(2) << '\n';
   if (!out) RF_ERROR("can't write {}", (root_ / kOrderFile).string());
   return static_cast<bool>(out);
+}
+
+bool ModList::New(std::string_view folder) const {
+  return std::any_of(new_.begin(), new_.end(), [&](const std::string& name) { return SameModName(name, folder); });
 }
 
 size_t ModList::EnabledCount() const { return static_cast<size_t>(std::count_if(mods_.begin(), mods_.end(), [](const ModInfo& mod) { return mod.enabled; })); }
