@@ -3,10 +3,11 @@
 #
 #   include(path/to/RexFabric/CMakeLists.txt)
 #   rexglue_setup_target(<target>)
-#   rexfabric_attach(<target> [WITH_GUIDE])
+#   rexfabric_attach(<target> [WITH_GUIDE] [WITH_TEXTURES])
 #
 # WITH_GUIDE puts the mods menu in RexLiveless's Guide; attach RexLiveless to the target first. Without it the
-# menu is plain ImGui windows.
+# menu is plain ImGui windows. WITH_TEXTURES adds texture packs (rexfabric/textures.h), for a game whose renderer
+# looks textures up in them.
 #
 # The project's manifest needs a template_dir under [entrypoint], which RexFabric fills with the codegen
 # templates its hook slots need:
@@ -78,7 +79,7 @@ function(_rexfabric_finish)
 endfunction()
 
 function(rexfabric_attach target)
-  cmake_parse_arguments(PARSE_ARGV 1 arg "WITH_GUIDE" "" "")
+  cmake_parse_arguments(PARSE_ARGV 1 arg "WITH_GUIDE;WITH_TEXTURES" "" "")
   get_property(attached GLOBAL PROPERTY REXFABRIC_ATTACHED)
   if(attached)
     message(FATAL_ERROR "RexFabric: already attached to ${attached}; a project attaches it once")
@@ -87,7 +88,7 @@ function(rexfabric_attach target)
 
   set(dir ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
   set(sources
-    src/api.cpp src/events.cpp src/game_api.cpp src/hooks.cpp src/host_input.cpp src/library.cpp src/midasm.cpp src/mods.cpp src/native_loader.cpp src/platform.cpp src/rexfabric.cpp src/switches.cpp
+    src/api.cpp src/events.cpp src/game_api.cpp src/guest_hooks.cpp src/hooks.cpp src/host_input.cpp src/library.cpp src/midasm.cpp src/mods.cpp src/native_loader.cpp src/platform.cpp src/rexfabric.cpp src/switches.cpp
     src/lua/lua_game.cpp src/lua/lua_host.cpp src/lua/lua_rex.cpp src/lua/lua_vm.cpp
     src/net/http.cpp src/net/thunderstore.cpp
     src/ui/imgui_menu.cpp src/ui/menu_model.cpp
@@ -95,6 +96,10 @@ function(rexfabric_attach target)
   if(arg_WITH_GUIDE)
     list(APPEND sources src/ui/guide_menu.cpp)
     target_compile_definitions(${target} PRIVATE REXFABRIC_WITH_GUIDE=1)
+  endif()
+  if(arg_WITH_TEXTURES)
+    list(APPEND sources src/content/textures.cpp)
+    target_link_libraries(${target} PRIVATE rex::xxhash)
   endif()
   list(TRANSFORM sources PREPEND ${dir}/)
   target_sources(${target} PRIVATE ${sources})

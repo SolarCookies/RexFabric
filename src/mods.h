@@ -15,6 +15,9 @@
 
 namespace rexfabric {
 
+// The load order, in the mods directory.
+inline constexpr const char* kOrderFile = "mods.json";
+
 struct ModInfo {
   std::string folder;
   std::filesystem::path dir;
@@ -44,6 +47,11 @@ class ModList {
   void SetEnabled(size_t index, bool enabled);
   // Moves an enabled mod `delta` places in the load order, and saves.
   void Move(size_t index, int delta);
+  // Enables these folders in this order and turns every other one off, and saves. Names that match no folder are
+  // skipped.
+  void SetOrder(const std::vector<std::string>& enabled);
+  // Renames a mod's folder on disk, keeping its place in the load order, and saves.
+  bool Rename(size_t index, const std::string& folder, std::string* error);
 
  private:
   void SortDisabled();
@@ -53,6 +61,10 @@ class ModList {
 };
 
 bool SameModName(std::string_view a, std::string_view b);
+
+// The mods folder changed here: the menu, the game or an install turned a mod on or off, moved or renamed one.
+// Bumps ModsRevision. Defined in rexfabric.cpp.
+void NoteModsChanged();
 
 // The native plugins a mod ships: .asi and the platform's library files, in the mod folder itself or in its
 // plugins folder, sorted by name.

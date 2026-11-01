@@ -4,6 +4,8 @@
 #include <array>
 #include <cctype>
 #include <fstream>
+#include <mutex>
+#include <set>
 
 #include <nlohmann/json.hpp>
 #include <toml++/toml.hpp>
@@ -20,8 +22,6 @@ constexpr std::array<std::string_view, 2> kNativeExtensions = {".asi", ".dylib"}
 #else
 constexpr std::array<std::string_view, 2> kNativeExtensions = {".asi", ".so"};
 #endif
-
-constexpr const char* kOrderFile = "mods.json";
 
 std::string Lower(std::string text) {
   std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -69,7 +69,11 @@ void ReadMetadata(ModInfo& mod) {
       take("version", mod.version);
       take("author", mod.author);
     } catch (const toml::parse_error& parse_error) {
-      RF_WARN("{}: unreadable mod.toml: {}", mod.folder, parse_error.description());
+      // The folder is read often (the menu, a game's content loaders), so a broken file is reported once.
+      static std::mutex warned_mutex;
+      static std::set<std::filesystem::path> warned;
+      std::lock_guard lock(warned_mutex);
+      if (warned.insert(toml_file).second) RF_WARN("{}: unreadable mod.toml: {}", mod.folder, parse_error.description());
     }
   }
   if (mod.name.empty()) mod.name = mod.folder;
@@ -167,6 +171,42 @@ void ModList::Move(size_t index, int delta) {
   if (delta > 0) std::rotate(from, from + 1, to + 1);
   else std::rotate(to, from, from + 1);
   Save();
+}
+
+void ModList::SetOrder(const std::vector<std::string>& enabled) {
+  std::vector<ModInfo> ordered;
+  for (const std::string& name : enabled) {
+    const auto it = std::find_if(mods_.begin(), mods_.end(), [&](const ModInfo& mod) { return SameModName(mod.folder, name); });
+    if (it == mods_.end()) continue;
+    it->enabled = true;
+    ordered.push_back(std::move(*it));
+    mods_.erase(it);
+  }
+  for (ModInfo& mod : mods_) mod.enabled = false;
+  ordered.insert(ordered.end(), std::make_move_iterator(mods_.begin()), std::make_move_iterator(mods_.end()));
+  mods_ = std::move(ordered);
+  SortDisabled();
+  Save();
+}
+
+bool ModList::Rename(size_t index, const std::string& folder, std::string* error) {
+  if (index >= mods_.size()) return false;
+  ModInfo& mod = mods_[index];
+  const std::filesystem::path to = root_ / folder;
+  std::error_code fs_error;
+  if (std::filesystem::exists(to, fs_error) && !std::filesystem::equivalent(to, mod.dir, fs_error)) {
+    if (error) *error = "A mod named " + folder + " exists already";
+    return false;
+  }
+  std::filesystem::rename(mod.dir, to, fs_error);
+  if (fs_error) {
+    if (error) *error = "Could not rename the folder: " + fs_error.message();
+    return false;
+  }
+  if (mod.name == mod.folder) mod.name = folder;
+  mod.folder = folder;
+  mod.dir = to;
+  return Save();
 }
 
 void ModList::SortDisabled() {

@@ -67,6 +67,7 @@ class MenuModel {
   std::unordered_map<std::string, CachedIcon> package_icons_;
   std::vector<net::Thunderstore::Failure> failures_;
   uint64_t frame_ = 0;
+  uint64_t seen_revision_ = 0;  // ModsRevision as of the last scan
   bool changed_ = false;
 };
 

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <rexfabric/api.h>
@@ -65,6 +66,7 @@ bool MenuShown();
 // A mod in the mods folder, for the game to show or report.
 struct InstalledMod {
   std::string folder;
+  std::filesystem::path dir;
   std::string name;
   std::string version;
   std::string author;
@@ -73,6 +75,24 @@ struct InstalledMod {
 // The mods folder as it is now: the enabled mods in load order, then the rest. Reads the folder each call, so
 // it's for occasional use, such as a crash report. Any thread.
 std::vector<InstalledMod> InstalledMods();
+
+// Content: for a game that loads files from mods (models, textures, data). Each reads the mods folder as it is
+// now, so a change applies at once, where code mods wait for the next start. Any thread.
+std::filesystem::path ModsDir();
+// The enabled mods' folders, in load order.
+std::vector<std::filesystem::path> EnabledModDirs();
+// Goes up whenever a mod is turned on or off, moved or renamed in this process (the menu, the calls below, an
+// install), so a cache of mod content knows to reload.
+uint64_t ModsRevision();
+// Turns a mod on or off, as the menu does. False when there's no such mod.
+bool SetModEnabled(std::string_view folder, bool enabled);
+// Renames a mod's folder, keeping its place in the load order.
+bool RenameMod(std::string_view from, std::string_view to, std::string* error = nullptr);
+
+// For a game moving from a mod system of its own: when the mods folder has no load order yet, these folders
+// start enabled in this order and every other one starts off. Call before Start. False when there was a load
+// order already, which is then left alone.
+bool SeedLoadOrder(const std::vector<std::string>& enabled);
 
 // The interface native mods get. The game may use it too, as Host().
 const RexFabricApi& Api();

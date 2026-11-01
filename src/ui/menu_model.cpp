@@ -67,29 +67,41 @@ bool Relaunch() {
 MenuModel::MenuModel(std::filesystem::path mods_dir, const std::string& community, rex::ui::ImmediateDrawer* images) : mods_(mods_dir), images_(images) {
   if (!community.empty()) thunderstore_ = std::make_unique<net::Thunderstore>(community, mods_dir);
   mods_.Scan();
+  seen_revision_ = ModsRevision();
 }
 
 MenuModel::~MenuModel() = default;
 
 void MenuModel::Poll() {
   ++frame_;
-  if (!thunderstore_) return;
-  thunderstore_->Poll();
-  for (net::Thunderstore::Failure& failure : thunderstore_->TakeFailed()) failures_.push_back(std::move(failure));
-  if (thunderstore_->TakeInstalled().empty()) return;
-  mods_.Scan();
-  mods_.Save();
-  mod_icons_.clear();
-  changed_ = true;
+  if (thunderstore_) {
+    thunderstore_->Poll();
+    for (net::Thunderstore::Failure& failure : thunderstore_->TakeFailed()) failures_.push_back(std::move(failure));
+    if (!thunderstore_->TakeInstalled().empty()) {
+      mods_.Save();
+      NoteModsChanged();
+      changed_ = true;
+    }
+  }
+  // Something changed the mods since the last scan: an install, or the game.
+  if (ModsRevision() != seen_revision_) {
+    seen_revision_ = ModsRevision();
+    mods_.Scan();
+    mod_icons_.clear();
+  }
 }
 
 void MenuModel::SetEnabled(size_t index, bool enabled) {
   mods_.SetEnabled(index, enabled);
+  NoteModsChanged();
+  seen_revision_ = ModsRevision();
   changed_ = true;
 }
 
 void MenuModel::Move(size_t index, int delta) {
   mods_.Move(index, delta);
+  NoteModsChanged();
+  seen_revision_ = ModsRevision();
   changed_ = true;
 }
 

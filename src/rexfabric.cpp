@@ -1,7 +1,9 @@
 #include <rexfabric/rexfabric.h>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 
 #include <rex/filesystem.h>
 #include <rex/ui/keybinds.h>
@@ -63,19 +65,74 @@ const Config& GetConfig() { return Get().config; }
 
 namespace {
 
+std::atomic<uint64_t> g_mods_revision{0};
+// Changes to mods.json from the game's calls, so two threads don't write it at once.
+std::mutex g_mods_mutex;
+
+}  // namespace
+
+void NoteModsChanged() { g_mods_revision.fetch_add(1, std::memory_order_relaxed); }
+
 std::filesystem::path ModsDir() {
   const std::filesystem::path& dir = Get().config.mods_dir;
   return dir.empty() ? rex::filesystem::GetExecutableFolder() / "mods" : dir;
 }
 
-}  // namespace
-
 std::vector<InstalledMod> InstalledMods() {
   ModList list(ModsDir());
   list.Scan();
   std::vector<InstalledMod> mods;
-  for (const ModInfo& mod : list.mods()) mods.push_back({mod.folder, mod.name, mod.version, mod.author, mod.enabled});
+  for (const ModInfo& mod : list.mods()) mods.push_back({mod.folder, mod.dir, mod.name, mod.version, mod.author, mod.enabled});
   return mods;
+}
+
+std::vector<std::filesystem::path> EnabledModDirs() {
+  ModList list(ModsDir());
+  list.Scan();
+  std::vector<std::filesystem::path> dirs;
+  for (size_t i = 0; i < list.EnabledCount(); ++i) dirs.push_back(list.mods()[i].dir);
+  return dirs;
+}
+
+uint64_t ModsRevision() { return g_mods_revision.load(std::memory_order_relaxed); }
+
+bool SetModEnabled(std::string_view folder, bool enabled) {
+  std::lock_guard lock(g_mods_mutex);
+  ModList list(ModsDir());
+  list.Scan();
+  const ModInfo* mod = list.Find(folder);
+  if (!mod) return false;
+  if (mod->enabled != enabled) {
+    list.SetEnabled(static_cast<size_t>(mod - list.mods().data()), enabled);
+    NoteModsChanged();
+  }
+  return true;
+}
+
+bool SeedLoadOrder(const std::vector<std::string>& enabled) {
+  std::lock_guard lock(g_mods_mutex);
+  std::error_code error;
+  if (std::filesystem::exists(ModsDir() / kOrderFile, error)) return false;
+  ModList list(ModsDir());
+  list.Scan();
+  list.SetOrder(enabled);
+  NoteModsChanged();
+  RF_INFO("load order started from the game's earlier list: {} of {} mods enabled", list.EnabledCount(), list.mods().size());
+  return true;
+}
+
+bool RenameMod(std::string_view from, std::string_view to, std::string* error) {
+  std::lock_guard lock(g_mods_mutex);
+  ModList list(ModsDir());
+  list.Scan();
+  const ModInfo* mod = list.Find(from);
+  if (!mod) {
+    if (error) *error = "There is no mod named " + std::string(from);
+    return false;
+  }
+  if (!list.Rename(static_cast<size_t>(mod - list.mods().data()), std::string(to), error)) return false;
+  NoteModsChanged();
+  return true;
 }
 
 void Start() {
