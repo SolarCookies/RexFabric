@@ -105,11 +105,6 @@ bool SetModEnabled(std::string_view folder, bool enabled) {
   if (mod->enabled != enabled) {
     list.SetEnabled(static_cast<size_t>(mod - list.mods().data()), enabled);
     NoteModsChanged();
-  } else if (list.New(folder)) {
-    // A folder the game just made (a new workspace, say) is on already as a new folder; write it into the load
-    // order so it stays there, and tell the content caches.
-    list.Save();
-    NoteModsChanged();
   }
   return true;
 }
