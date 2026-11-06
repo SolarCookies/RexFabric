@@ -3,11 +3,13 @@
 #
 #   include(path/to/RexFabric/CMakeLists.txt)
 #   rexglue_setup_target(<target>)
-#   rexfabric_attach(<target> [WITH_GUIDE] [WITH_TEXTURES])
+#   rexfabric_attach(<target> [WITH_GUIDE] [WITH_TEXTURES] [WITH_NODE_EDITOR])
 #
 # WITH_GUIDE puts the mods menu in RexLiveless's Guide; attach RexLiveless to the target first. Without it the
 # menu is plain ImGui windows. WITH_TEXTURES adds texture packs (rexfabric/textures.h), for a game whose renderer
-# looks textures up in them.
+# looks textures up in them. WITH_NODE_EDITOR adds the node editor, which makes Lua mods from node graphs in game.
+#
+# With RexGlass attached to the same target (before or after), the menus and the node editor are glass.
 #
 # The project's manifest needs a template_dir under [entrypoint], which RexFabric fills with the codegen
 # templates its hook slots need:
@@ -45,6 +47,31 @@ target_include_directories(rexfabric_miniz PUBLIC ${CMAKE_CURRENT_LIST_DIR}/thir
 target_compile_definitions(rexfabric_miniz PUBLIC MINIZ_NO_ZLIB_COMPATIBLE_NAMES=1)
 target_compile_options(rexfabric_miniz PRIVATE -w)
 
+# imgui-node-editor (thedmd), the canvas behind the node editor, at the commit Toon pins. It's built once, against
+# the SDK's ImGui, the first time a target asks for it. ImGui lives in the runtime library, which exports its functions
+# but not its data, so GImGui is read through GetCurrentContext; imgui_internal.h leaves GImGui alone when it's
+# defined. Its sources use ImGui's ImVec2 operators, which imgui.h only declares with IMGUI_DEFINE_MATH_OPERATORS.
+#
+# A game with node graphs of its own links this copy too, rather than building another: two copies in one program
+# would be the same symbols twice.
+#
+#   rexfabric_link_imgui_node_editor(<target>)
+function(rexfabric_link_imgui_node_editor target)
+  if(NOT TARGET rexfabric_node_editor)
+    _rexfabric_node_editor_library()
+  endif()
+  target_link_libraries(${target} PRIVATE rexfabric_node_editor)
+endfunction()
+
+function(_rexfabric_node_editor_library)
+  set(dir ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/thirdparty/imgui-node-editor)
+  add_library(rexfabric_node_editor STATIC ${dir}/imgui_node_editor.cpp ${dir}/imgui_node_editor_api.cpp ${dir}/imgui_canvas.cpp ${dir}/crude_json.cpp)
+  target_include_directories(rexfabric_node_editor PUBLIC ${dir})
+  target_link_libraries(rexfabric_node_editor PRIVATE rex::runtime)
+  target_compile_definitions(rexfabric_node_editor PRIVATE IMGUI_DEFINE_MATH_OPERATORS "GImGui=ImGui::GetCurrentContext()")
+  target_compile_options(rexfabric_node_editor PRIVATE -w)
+endfunction()
+
 # The manifest's template_dir, or a fatal error saying how to add it.
 function(_rexfabric_template_dir out_var)
   file(GLOB manifests "${CMAKE_SOURCE_DIR}/*_manifest.toml")
@@ -71,6 +98,14 @@ function(_rexfabric_sdk_templates out_var)
   set(${out_var} "${dir}" PARENT_SCOPE)
 endfunction()
 
+# Runs after every module is attached, so RexGlass may come before or after RexFabric.
+function(_rexfabric_use_glass target)
+  get_property(glass TARGET ${target} PROPERTY REXGLASS_ATTACHED)
+  if(glass)
+    target_compile_definitions(${target} PRIVATE REXFABRIC_WITH_GLASS=1)
+  endif()
+endfunction()
+
 # Runs once, after every module has added its fragments.
 function(_rexfabric_finish)
   _rexfabric_sdk_templates(sdk_dir)
@@ -79,7 +114,7 @@ function(_rexfabric_finish)
 endfunction()
 
 function(rexfabric_attach target)
-  cmake_parse_arguments(PARSE_ARGV 1 arg "WITH_GUIDE;WITH_TEXTURES" "" "")
+  cmake_parse_arguments(PARSE_ARGV 1 arg "WITH_GUIDE;WITH_TEXTURES;WITH_NODE_EDITOR" "" "")
   get_property(attached GLOBAL PROPERTY REXFABRIC_ATTACHED)
   if(attached)
     message(FATAL_ERROR "RexFabric: already attached to ${attached}; a project attaches it once")
@@ -101,6 +136,14 @@ function(rexfabric_attach target)
     list(APPEND sources src/content/textures.cpp)
     target_link_libraries(${target} PRIVATE rex::xxhash)
   endif()
+  if(arg_WITH_NODE_EDITOR)
+    list(APPEND sources
+      src/graph/graph.cpp src/graph/graph_document.cpp src/graph/graph_file.cpp src/graph/lua_compiler.cpp src/graph/node_library.cpp src/graph/nodes_builtin.cpp src/graph/nodes_game.cpp
+      src/ui/node_editor.cpp src/ui/node_graph_style.cpp src/ui/node_graph_widgets.cpp
+    )
+    rexfabric_link_imgui_node_editor(${target})
+    target_compile_definitions(${target} PRIVATE REXFABRIC_WITH_NODE_EDITOR=1)
+  endif()
   list(TRANSFORM sources PREPEND ${dir}/)
   target_sources(${target} PRIVATE ${sources})
   target_include_directories(${target} PRIVATE ${dir}/include ${dir}/thirdparty)
@@ -118,4 +161,6 @@ function(rexfabric_attach target)
   rexfabric_template_fragment(codegen/pch_h BEFORE "#ifndef DECLARE_REX_FUNC" FILE ${dir}/templates/pch_hooks.inja)
   rexfabric_template_fragment(codegen/init_cpp APPEND FILE ${dir}/templates/init_slots.inja)
   cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR} CALL _rexfabric_finish)
+  # A deferred call reads its arguments when it runs, so the target's name is put in now.
+  cmake_language(EVAL CODE "cmake_language(DEFER DIRECTORY [[${CMAKE_SOURCE_DIR}]] CALL _rexfabric_use_glass [[${target}]])")
 endfunction()

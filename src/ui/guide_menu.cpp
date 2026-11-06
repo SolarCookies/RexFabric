@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <rexglue_guide/guide.h>
+#include <rexfabric/rexfabric.h>
 
 #include "../platform.h"
 
@@ -202,9 +203,19 @@ void Build(Menu& menu) {
   if (net::Thunderstore* store = model->thunderstore()) actions.push_back({store->Installing() > 0 ? "Browse Mods (Installing)###browse" : "Browse Mods###browse", BrowsePage});
   actions.push_back({"Reload Scripts"});
   actions.push_back({"Open Folder"});
+#if REXFABRIC_WITH_NODE_EDITOR
+  actions.push_back({"Node Editor"});
+#endif
   const int action = menu.Bar("Actions", actions);
-  if (action >= 0 && actions[static_cast<size_t>(action)].label == "Reload Scripts") model->ReloadScripts();
-  if (action >= 0 && actions[static_cast<size_t>(action)].label == "Open Folder") model->OpenModsFolder();
+  const std::string_view chosen = action >= 0 ? std::string_view(actions[static_cast<size_t>(action)].label) : std::string_view();
+  if (chosen == "Reload Scripts") model->ReloadScripts();
+  if (chosen == "Open Folder") model->OpenModsFolder();
+  // The editor wants a mouse, so the Guide steps aside for it.
+  if (chosen == "Node Editor") {
+    rexglue_guide::ShowMenu(kBladeId, false);
+    Show(false);
+    ShowNodeEditor();
+  }
 
   // Available and enabled side by side, as on a pack screen; the enabled in load order.
   Menu::ListsDef lists{.left_title = "Available", .right_title = "Enabled", .to_right = "Enable", .to_left = "Disable"};

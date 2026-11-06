@@ -19,6 +19,9 @@
 #if REXFABRIC_WITH_GUIDE
 #include "ui/guide_menu.h"
 #endif
+#if REXFABRIC_WITH_NODE_EDITOR
+#include "ui/node_editor.h"
+#endif
 
 namespace rexfabric {
 namespace {
@@ -32,6 +35,9 @@ struct State {
   std::unique_ptr<ui::MenuModel> menu;
   rex::ui::ImGuiDrawer* drawer = nullptr;
   ui::ModsWindow* window = nullptr;
+#if REXFABRIC_WITH_NODE_EDITOR
+  ui::NodeEditorWindow* editor = nullptr;
+#endif
 };
 
 State& Get() {
@@ -188,6 +194,9 @@ void CreateMenus(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* images)
   ui::guide::AddMenus(*state.menu);
 #endif
   if (!state.config.menu_key.empty()) rex::ui::RegisterBind("bind_mods", state.config.menu_key, "Toggle the mods menu", [] { ToggleMenu(); });
+#if REXFABRIC_WITH_NODE_EDITOR
+  if (!state.config.node_editor_key.empty()) rex::ui::RegisterBind("bind_node_editor", state.config.node_editor_key, "Toggle the node editor", [] { ShowNodeEditor(!NodeEditorShown()); });
+#endif
 }
 
 void ShowMenu(bool show) {
@@ -201,13 +210,38 @@ void ShowMenu(bool show) {
 #endif
 }
 
-void ToggleMenu() { ShowMenu(!MenuShown()); }
+namespace {
 
-bool MenuShown() {
+bool ModsMenuShown() {
 #if REXFABRIC_WITH_GUIDE
   return ui::guide::Shown();
 #else
   return Get().window != nullptr;
+#endif
+}
+
+}  // namespace
+
+void ToggleMenu() { ShowMenu(!ModsMenuShown()); }
+
+bool MenuShown() { return ModsMenuShown() || NodeEditorShown(); }
+
+void ShowNodeEditor(bool show) {
+#if REXFABRIC_WITH_NODE_EDITOR
+  State& state = Get();
+  if (!state.menu) return;
+  if (show && !state.editor) state.editor = new ui::NodeEditorWindow(state.drawer, *state.menu, [] { Get().editor = nullptr; });
+  else if (!show && state.editor) state.editor->Hide();
+#else
+  (void)show;
+#endif
+}
+
+bool NodeEditorShown() {
+#if REXFABRIC_WITH_NODE_EDITOR
+  return Get().editor != nullptr;
+#else
+  return false;
 #endif
 }
 

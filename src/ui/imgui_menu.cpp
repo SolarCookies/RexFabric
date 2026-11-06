@@ -11,8 +11,10 @@
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/immediate_drawer.h>
+#include <rexfabric/rexfabric.h>
 
 #include "../platform.h"
+#include "glass.h"
 
 namespace rexfabric::ui {
 namespace {
@@ -87,7 +89,7 @@ void ModsWindow::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowSize(ImVec2(940.0f, 560.0f), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSizeConstraints(ImVec2(640.0f, 360.0f), ImVec2(FLT_MAX, FLT_MAX));
   bool open = true;
-  if (ImGui::Begin("Mods##rexfabric", &open, ImGuiWindowFlags_NoCollapse)) DrawMods();
+  if (glass::BeginWindow("Mods##rexfabric", &open, ImGuiWindowFlags_NoCollapse)) DrawMods();
   ImGui::End();
   if (browser_open_) DrawBrowser();
   if (pending_) std::exchange(pending_, {})();
@@ -128,6 +130,10 @@ void ModsWindow::DrawMods() {
   }
   ImGui::SameLine();
   if (ImGui::Button("Reload Scripts")) pending_ = [this] { model_.ReloadScripts(); };
+#if REXFABRIC_WITH_NODE_EDITOR
+  ImGui::SameLine();
+  if (ImGui::Button("Node Editor")) pending_ = [] { ShowNodeEditor(); };
+#endif
 }
 
 void ModsWindow::DrawColumn(const char* id, bool enabled, float width, float height) {
@@ -201,7 +207,7 @@ void ModsWindow::DrawBrowser() {
   ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
   ImGui::SetNextWindowSize(ImVec2(1040.0f, 660.0f), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSizeConstraints(ImVec2(760.0f, 460.0f), ImVec2(FLT_MAX, FLT_MAX));
-  if (ImGui::Begin("Browse Mods##rexfabric", &browser_open_, ImGuiWindowFlags_NoCollapse)) {
+  if (glass::BeginWindow("Browse Mods##rexfabric", &browser_open_, ImGuiWindowFlags_NoCollapse)) {
     DrawToolbar();
     ImGui::Separator();
     const float pager = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
