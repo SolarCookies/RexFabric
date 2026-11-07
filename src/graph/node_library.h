@@ -122,6 +122,9 @@ const Pin* FindPin(const std::vector<Pin>& pins, std::string_view name);
 // A setting's value, or its description's initial value when the node doesn't have it.
 std::string SettingOf(const Node& node, std::string_view name);
 std::string TitleOf(const Node& node);
+// A name as a title: underscores as spaces, camel case split into words, every word capitalized.
+// "set_emissive" is "Set Emissive", "RexLiveless" is "Rex Liveless"; dots and colons stay.
+std::string TitleCase(std::string_view name);
 
 // "Int", "Float", "tip.Pinata": a type as messages and tooltips name it.
 std::string TypeName(const PinType& type);

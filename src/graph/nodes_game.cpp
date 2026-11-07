@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <map>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <rexfabric/game_api.h>
@@ -47,6 +50,39 @@ std::string Member(std::string_view name) { return IsIdentifier(name) ? "." + st
 
 // "tip.Pinata" without its namespace: "Pinata".
 std::string ShortName(const std::string& name, const std::string& space) { return name.size() > space.size() + 1 && name.starts_with(space + ".") ? name.substr(space.size() + 1) : name; }
+
+// Without the underscore a part of a name starts with: "materials._define" is "materials.define".
+std::string WithoutUnderscores(std::string_view local) {
+  std::string shown;
+  for (size_t i = 0; i < local.size(); ++i) {
+    if (local[i] == '_' && (i == 0 || local[i - 1] == '.') && i + 1 < local.size() && local[i + 1] != '.') continue;
+    shown += local[i];
+  }
+  return shown;
+}
+
+// Where a declaration goes in the add menu, and its node's title there and in full (without the namespace).
+struct Placed {
+  std::string category;
+  std::string title;
+  std::string full;
+};
+
+// The namespace's longest Category prefix the name starts with gives the category, and the title leaves it out,
+// as the category already says it ("materials._define" under Materials is "define"). None: `fallback`, the full name.
+Placed Place(const NamespaceDef& space, const std::string& name, std::string fallback) {
+  const std::string local = ShortName(name, space.name);
+  const std::pair<std::string, std::string>* best = nullptr;
+  for (const auto& category : space.categories) {
+    if (local.starts_with(category.first) && (!best || category.first.size() > best->first.size())) best = &category;
+  }
+  Placed placed{best ? best->second : std::move(fallback), WithoutUnderscores(local), {}};
+  placed.full = placed.title;
+  if (best && local.size() > best->first.size()) placed.title = WithoutUnderscores(std::string_view(local).substr(best->first.size()));
+  return placed;
+}
+
+std::string CategoryOf(const NamespaceDef& space, const std::string& name, std::string fallback) { return Place(space, name, std::move(fallback)).category; }
 
 PinType ValuePinType(ValueType type) {
   switch (type) {
@@ -94,8 +130,8 @@ void EmitCall(Emitter& emit, const std::string& callee, const FunctionDef& funct
   emit.Line(function.result != ValueType::kNone && emit.Linked("Result") ? emit.Output("Result") + " = " + call : call);
 }
 
-void AddFunction(Library& library, const std::string& category, const FunctionDef& function) {
-  NodeDesc desc{.id = "game.call:" + function.name, .title = function.name, .category = category + "/Functions", .description = "Calls the game's " + function.name + "."};
+void AddFunction(Library& library, const std::string& category, const std::string& title, const FunctionDef& function) {
+  NodeDesc desc{.id = "game.call:" + function.name, .title = title, .category = category, .description = "Calls the game's " + function.name + "."};
   desc.pins.inputs = {ExecPin()};
   for (Pin& pin : ArgPins(function, 0)) desc.pins.inputs.push_back(std::move(pin));
   desc.pins.outputs = {ExecPin(kExecOut)};
@@ -104,21 +140,21 @@ void AddFunction(Library& library, const std::string& category, const FunctionDe
   library.Add(std::move(desc));
 }
 
-void AddConstant(Library& library, const std::string& category, const ConstantDef& constant) {
-  NodeDesc desc{.id = "game.const:" + constant.name, .title = constant.name, .category = category + "/Constants", .description = "The game's constant " + constant.name + ".", .role = NodeRole::kPure};
+void AddConstant(Library& library, const std::string& category, const std::string& title, const ConstantDef& constant) {
+  NodeDesc desc{.id = "game.const:" + constant.name, .title = title, .category = category, .description = "The game's constant " + constant.name + ".", .role = NodeRole::kPure};
   desc.pins.outputs = {TypedPin("Value", ValuePinType(TypeOf(constant.value)))};
   desc.expression = [path = LuaPath(constant.name)](Emitter&, std::string_view) { return path; };
   library.Add(std::move(desc));
 }
 
-void AddEnum(Library& library, const std::string& category, const EnumDef& enumeration) {
-  NodeDesc desc{.id = "game.enum:" + enumeration.name, .title = enumeration.name, .category = category + "/Enums", .description = "A value of the game's " + enumeration.name + ".", .role = NodeRole::kPure};
+void AddEnum(Library& library, const std::string& category, const std::string& title, const EnumDef& enumeration) {
+  NodeDesc desc{.id = "game.enum:" + enumeration.name, .title = title, .category = category, .description = "A value of the game's " + enumeration.name + ".", .role = NodeRole::kPure};
   desc.pins.outputs = {DataPin("Value", PinKind::kInt)};
   SettingDesc value{.name = "Value", .kind = SettingKind::kChoice};
   for (const auto& [name, number] : enumeration.values) value.choices.push_back(name);
   if (!value.choices.empty()) value.initial = value.choices.front();
   desc.settings = {std::move(value)};
-  desc.title_of = [name = enumeration.name](const Node& node) { return name + "." + SettingOf(node, "Value"); };
+  desc.title_of = [name = TitleCase(title)](const Node& node) { return name + "." + SettingOf(node, "Value"); };
   desc.expression = [&enumeration](Emitter& emit, std::string_view) {
     const std::string value = emit.Setting("Value");
     const bool known = std::any_of(enumeration.values.begin(), enumeration.values.end(), [&](const auto& entry) { return entry.first == value; });
@@ -171,8 +207,8 @@ void AddType(Library& library, const std::string& category, const std::string& s
   }
 }
 
-void AddEvent(Library& library, const std::string& category, const std::string& space, const std::string& event) {
-  NodeDesc desc{.id = "game.event:" + event, .title = "On " + ShortName(event, space), .category = category + "/Events", .description = "Runs when the game fires " + event + ", with whatever it fires it with.", .role = NodeRole::kEvent};
+void AddEvent(Library& library, const std::string& category, const std::string& title, const std::string& event) {
+  NodeDesc desc{.id = "game.event:" + event, .title = title, .category = category, .description = "Runs when the game fires " + event + ", with whatever it fires it with.", .role = NodeRole::kEvent};
   desc.pins.outputs = {ExecPin(kExecOut)};
   for (int i = 1; i <= kEventArgs; ++i) desc.pins.outputs.push_back(DataPin("Arg " + std::to_string(i), PinKind::kAny));
   desc.emit = [event](Emitter& emit) {
@@ -198,12 +234,29 @@ void AddGameNodes(Library& library) {
 
   // The declarations live as long as the process, so the nodes keep references to them.
   for (const std::unique_ptr<NamespaceDef>& space : Namespaces()) {
-    const std::string category = "Game/" + space->name;
-    for (const FunctionDef& function : space->functions) AddFunction(library, category, function);
-    for (const ConstantDef& constant : space->constants) AddConstant(library, category, constant);
-    for (const EnumDef& enumeration : space->enums) AddEnum(library, category, enumeration);
-    for (const std::unique_ptr<TypeDef>& type : space->types) AddType(library, category, space->name, *type);
-    for (const std::string& event : space->events) AddEvent(library, category, space->name, event);
+    // The namespace's own categories, top level in the add menu; Game/<namespace> for the rest.
+    const std::string game = "Game/" + space->name;
+    std::vector<Placed> functions, constants, enums, events;
+    for (const FunctionDef& function : space->functions) functions.push_back(Place(*space, function.name, game + "/Functions"));
+    for (const ConstantDef& constant : space->constants) constants.push_back(Place(*space, constant.name, game + "/Constants"));
+    for (const EnumDef& enumeration : space->enums) enums.push_back(Place(*space, enumeration.name, game + "/Enums"));
+    for (const std::string& event : space->events) {
+      Placed placed = Place(*space, event, game + "/Events");
+      placed.title = "On " + placed.title;
+      placed.full = "On " + placed.full;
+      events.push_back(std::move(placed));
+    }
+    // Titles two nodes of one category would share ("npcs._get", "player._get": Get) keep their full names there.
+    std::map<std::pair<std::string, std::string>, int> titles;
+    for (const std::vector<Placed>* list : {&functions, &constants, &enums, &events}) {
+      for (const Placed& placed : *list) ++titles[{placed.category, TitleCase(placed.title)}];
+    }
+    const auto title = [&titles](const Placed& placed) { return titles[{placed.category, TitleCase(placed.title)}] > 1 ? placed.full : placed.title; };
+    for (size_t i = 0; i < functions.size(); ++i) AddFunction(library, functions[i].category, title(functions[i]), space->functions[i]);
+    for (size_t i = 0; i < constants.size(); ++i) AddConstant(library, constants[i].category, title(constants[i]), space->constants[i]);
+    for (size_t i = 0; i < enums.size(); ++i) AddEnum(library, enums[i].category, title(enums[i]), space->enums[i]);
+    for (const std::unique_ptr<TypeDef>& type : space->types) AddType(library, CategoryOf(*space, type->name(), game), space->name, *type);
+    for (size_t i = 0; i < events.size(); ++i) AddEvent(library, events[i].category, title(events[i]), space->events[i]);
   }
 }
 

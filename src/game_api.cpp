@@ -135,6 +135,11 @@ Namespace& Namespace::Lua(std::string source) {
   return *this;
 }
 
+Namespace& Namespace::Category(std::string prefix, std::string title) {
+  FindOrAdd(name_).categories.emplace_back(std::move(prefix), std::move(title));
+  return *this;
+}
+
 // Lookups -----------------------------------------------------------------------------------------------
 
 const std::vector<std::unique_ptr<NamespaceDef>>& Namespaces() { return GetRegistry().namespaces; }

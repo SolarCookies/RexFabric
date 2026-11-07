@@ -291,6 +291,9 @@ class Namespace {
   // Lua run once the declarations are globals, before any mod: conveniences built on them, such as
   // functions taking tables or callbacks. Front ends without Lua ignore it.
   Namespace& Lua(std::string source);
+  // Where the node editor lists declarations whose names start with `prefix` ("parts." or "part_"): `title`, a
+  // top-level category of its add menu ("Parts"). The longest matching prefix wins; the rest go under Game.
+  Namespace& Category(std::string prefix, std::string title);
 
   const std::string& name() const { return name_; }
 
@@ -320,6 +323,7 @@ struct NamespaceDef {
   std::vector<std::unique_ptr<TypeDef>> types;
   std::vector<std::string> events;
   std::vector<std::string> lua;  // run in order, after every namespace's declarations
+  std::vector<std::pair<std::string, std::string>> categories;  // name prefix (without the namespace), title
 };
 
 const std::vector<std::unique_ptr<NamespaceDef>>& Namespaces();
