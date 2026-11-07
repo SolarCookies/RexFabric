@@ -115,28 +115,42 @@ Pin TypedPin(std::string name, const PinType& type) {
   return DataPin(name, type.kind);
 }
 
-// Arg 1 to Arg n, for a function's parameters from `first`.
-std::vector<Pin> ArgPins(const FunctionDef& function, size_t first) {
+// The pin of argument `index` (from 0): the name the game gave it (Namespace::Args), or Arg 1, Arg 2...
+std::string ArgName(const std::vector<std::string>* names, size_t index) {
+  if (names && index < names->size() && !(*names)[index].empty()) return TitleCase((*names)[index]);
+  return "Arg " + std::to_string(index + 1);
+}
+
+// The names a namespace gave a declaration's arguments, or null.
+const std::vector<std::string>* ArgNamesOf(const NamespaceDef& space, const std::string& name) {
+  for (const auto& [declared, names] : space.args) {
+    if (declared == name) return &names;
+  }
+  return nullptr;
+}
+
+// A pin for each of a function's parameters from `first`.
+std::vector<Pin> ArgPins(const FunctionDef& function, size_t first, const std::vector<std::string>* names = nullptr) {
   std::vector<Pin> pins;
-  for (size_t i = first; i < function.params.size(); ++i) pins.push_back(TypedPin("Arg " + std::to_string(i - first + 1), ValuePinType(function.params[i])));
+  for (size_t i = first; i < function.params.size(); ++i) pins.push_back(TypedPin(ArgName(names, i - first), ValuePinType(function.params[i])));
   return pins;
 }
 
 // `callee(args)`, kept in Result when the function gives something back and Result is used.
-void EmitCall(Emitter& emit, const std::string& callee, const FunctionDef& function, size_t first) {
+void EmitCall(Emitter& emit, const std::string& callee, const FunctionDef& function, size_t first, const std::vector<std::string>* names = nullptr) {
   std::string args;
-  for (size_t i = first; i < function.params.size(); ++i) args += (i > first ? ", " : "") + emit.Input("Arg " + std::to_string(i - first + 1));
+  for (size_t i = first; i < function.params.size(); ++i) args += (i > first ? ", " : "") + emit.Input(ArgName(names, i - first));
   const std::string call = callee + "(" + args + ")";
   emit.Line(function.result != ValueType::kNone && emit.Linked("Result") ? emit.Output("Result") + " = " + call : call);
 }
 
-void AddFunction(Library& library, const std::string& category, const std::string& title, const FunctionDef& function) {
+void AddFunction(Library& library, const std::string& category, const std::string& title, const FunctionDef& function, const std::vector<std::string>* names) {
   NodeDesc desc{.id = "game.call:" + function.name, .title = title, .category = category, .description = "Calls the game's " + function.name + "."};
   desc.pins.inputs = {ExecPin()};
-  for (Pin& pin : ArgPins(function, 0)) desc.pins.inputs.push_back(std::move(pin));
+  for (Pin& pin : ArgPins(function, 0, names)) desc.pins.inputs.push_back(std::move(pin));
   desc.pins.outputs = {ExecPin(kExecOut)};
   if (function.result != ValueType::kNone) desc.pins.outputs.push_back(TypedPin("Result", ValuePinType(function.result)));
-  desc.emit = [&function](Emitter& emit) { EmitCall(emit, LuaPath(function.name), function, 0); };
+  desc.emit = [&function, names](Emitter& emit) { EmitCall(emit, LuaPath(function.name), function, 0, names); };
   library.Add(std::move(desc));
 }
 
@@ -207,13 +221,15 @@ void AddType(Library& library, const std::string& category, const std::string& s
   }
 }
 
-void AddEvent(Library& library, const std::string& category, const std::string& title, const std::string& event) {
+void AddEvent(Library& library, const std::string& category, const std::string& title, const std::string& event, const std::vector<std::string>* names) {
   NodeDesc desc{.id = "game.event:" + event, .title = title, .category = category, .description = "Runs when the game fires " + event + ", with whatever it fires it with.", .role = NodeRole::kEvent};
+  // As many values as the game named, or kEventArgs.
+  const size_t count = names ? names->size() : static_cast<size_t>(kEventArgs);
   desc.pins.outputs = {ExecPin(kExecOut)};
-  for (int i = 1; i <= kEventArgs; ++i) desc.pins.outputs.push_back(DataPin("Arg " + std::to_string(i), PinKind::kAny));
-  desc.emit = [event](Emitter& emit) {
+  for (size_t i = 0; i < count; ++i) desc.pins.outputs.push_back(DataPin(ArgName(names, i), PinKind::kAny));
+  desc.emit = [event, names, count](Emitter& emit) {
     std::string params;
-    for (int i = 1; i <= kEventArgs; ++i) params += (i > 1 ? ", " : "") + emit.Param("Arg " + std::to_string(i));
+    for (size_t i = 0; i < count; ++i) params += (i > 0 ? ", " : "") + emit.Param(ArgName(names, i));
     emit.Line("rex.on(" + LuaQuote(event) + ", function(" + params + ")");
     emit.Open();
     emit.Chain(kExecOut);
@@ -252,11 +268,11 @@ void AddGameNodes(Library& library) {
       for (const Placed& placed : *list) ++titles[{placed.category, TitleCase(placed.title)}];
     }
     const auto title = [&titles](const Placed& placed) { return titles[{placed.category, TitleCase(placed.title)}] > 1 ? placed.full : placed.title; };
-    for (size_t i = 0; i < functions.size(); ++i) AddFunction(library, functions[i].category, title(functions[i]), space->functions[i]);
+    for (size_t i = 0; i < functions.size(); ++i) AddFunction(library, functions[i].category, title(functions[i]), space->functions[i], ArgNamesOf(*space, space->functions[i].name));
     for (size_t i = 0; i < constants.size(); ++i) AddConstant(library, constants[i].category, title(constants[i]), space->constants[i]);
     for (size_t i = 0; i < enums.size(); ++i) AddEnum(library, enums[i].category, title(enums[i]), space->enums[i]);
     for (const std::unique_ptr<TypeDef>& type : space->types) AddType(library, CategoryOf(*space, type->name(), game), space->name, *type);
-    for (size_t i = 0; i < events.size(); ++i) AddEvent(library, events[i].category, title(events[i]), space->events[i]);
+    for (size_t i = 0; i < events.size(); ++i) AddEvent(library, events[i].category, title(events[i]), space->events[i], ArgNamesOf(*space, space->events[i]));
   }
 }
 
