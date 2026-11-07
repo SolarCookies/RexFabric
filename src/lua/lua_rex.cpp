@@ -637,14 +637,20 @@ int LogDebug(lua_State* L) {
   return 0;
 }
 
-// rex.screen_text(text, seconds, rgb): text in the screen's top right corner for a while, for debugging. Two seconds
-// and cyan unless given.
+// rex.screen_text(text, seconds, rgb, size, key): text in the screen's top right corner for a while, for debugging.
+// Two seconds, cyan and the default size unless given; a key replaces the shown line with the same key.
 int ScreenText(lua_State* L) {
   std::string text = luaL_tolstring(L, 1, nullptr);
   lua_pop(L, 1);
   const double seconds = luaL_optnumber(L, 2, 2.0);
   const lua_Integer rgb = luaL_optinteger(L, 3, 0x00A8FF);
-  ui::PrintToScreen(std::move(text), seconds, static_cast<uint32_t>(rgb));
+  const double size = luaL_optnumber(L, 4, 0.0);
+  std::string key;
+  if (!lua_isnoneornil(L, 5)) {
+    key = luaL_tolstring(L, 5, nullptr);
+    lua_pop(L, 1);
+  }
+  ui::PrintToScreen(std::move(text), seconds, static_cast<uint32_t>(rgb), static_cast<float>(size), std::move(key));
   return 0;
 }
 

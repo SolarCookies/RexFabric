@@ -966,9 +966,9 @@ void AddHost(Library& library) {
   SettingDesc color{.name = "Color", .kind = SettingKind::kChoice, .initial = "Cyan", .tooltip = "The text's color on the screen"};
   for (const auto& [name, hex] : colors) color.choices.push_back(name);
   library.Add({.id = "log.print_string", .title = "Print String", .category = "Log",
-      .description = "Shows In String in the screen's top right corner for Duration seconds, newest at the top, and writes it to the log. For debugging.",
+      .description = "Shows In String in the screen's top right corner for Duration seconds, newest at the top, and writes it to the log. Font Size is in pixels (0: the default). A Key replaces the shown line with the same key instead of adding one, so a value printed every frame is one line that changes. For debugging.",
       .keywords = "debug screen text message print",
-      .pins = {{ExecPin(), DataPin("In String", PinKind::kAny, "Hello"), DataPin("Duration", PinKind::kFloat, 2.0), DataPin("Print to Screen", PinKind::kBool, true), DataPin("Print to Log", PinKind::kBool, true)}, {ExecPin(kExecOut)}},
+      .pins = {{ExecPin(), DataPin("In String", PinKind::kAny, "Hello"), DataPin("Duration", PinKind::kFloat, 2.0), DataPin("Font Size", PinKind::kFloat, 0.0), DataPin("Key", PinKind::kString, ""), DataPin("Print to Screen", PinKind::kBool, true), DataPin("Print to Log", PinKind::kBool, true)}, {ExecPin(kExecOut)}},
       .settings = {color},
       .emit = [colors](Emitter& emit) {
         const std::string screen = emit.Input("Print to Screen");
@@ -988,7 +988,8 @@ void AddHost(Library& library) {
           if (when == "true") emit.Line(line);
           else if (when != "false") emit.Line("if " + when + " then " + line + " end");
         };
-        write(screen, "rex.screen_text(" + text + ", " + emit.Input("Duration") + ", " + hex + ")");
+        // An empty Key is none (PrintToScreen).
+        write(screen, "rex.screen_text(" + text + ", " + emit.Input("Duration") + ", " + hex + ", " + emit.Input("Font Size") + ", " + emit.Input("Key") + ")");
         write(log, "rex.info(" + text + ")");
       }});
 
