@@ -326,6 +326,18 @@ void OpenGame(lua_State* L) {
       SetPath(L, type->name());
     }
   }
+  // Each namespace's Lua sees every namespace's globals.
+  for (const auto& ns : Namespaces()) {
+    for (const std::string& source : ns->lua) {
+      const std::string chunk = "=" + ns->name;
+      if (luaL_loadbuffer(L, source.data(), source.size(), chunk.c_str()) != LUA_OK) {
+        RF_ERROR("the {} namespace's Lua: {}", ns->name, lua_tostring(L, -1));
+        lua_pop(L, 1);
+        continue;
+      }
+      CallProtected(L, 0, 0, chunk.c_str() + 1);
+    }
+  }
 }
 
 }  // namespace rexfabric::lua

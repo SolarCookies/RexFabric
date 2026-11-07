@@ -288,6 +288,9 @@ class Namespace {
   // A type of `size` bytes. Asking again for the same name returns the same type.
   TypeDef& Type(std::string name, uint32_t size);
   rexfabric::Event Event(std::string name);
+  // Lua run once the declarations are globals, before any mod: conveniences built on them, such as
+  // functions taking tables or callbacks. Front ends without Lua ignore it.
+  Namespace& Lua(std::string source);
 
   const std::string& name() const { return name_; }
 
@@ -316,6 +319,7 @@ struct NamespaceDef {
   std::vector<EnumDef> enums;
   std::vector<std::unique_ptr<TypeDef>> types;
   std::vector<std::string> events;
+  std::vector<std::string> lua;  // run in order, after every namespace's declarations
 };
 
 const std::vector<std::unique_ptr<NamespaceDef>>& Namespaces();
