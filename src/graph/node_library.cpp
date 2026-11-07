@@ -1,6 +1,7 @@
 #include "node_library.h"
 
 #include <algorithm>
+#include <cctype>
 
 namespace rexfabric::graph {
 namespace {
@@ -54,6 +55,7 @@ const Library& Library::Get() {
 }
 
 void Library::Add(NodeDesc desc) {
+  desc.title = TitleCase(desc.title);
   auto owned = std::make_unique<NodeDesc>(std::move(desc));
   by_id_[owned->id] = owned.get();
   nodes_.push_back(std::move(owned));
@@ -119,6 +121,35 @@ std::string TitleOf(const Node& node) {
   const NodeDesc* desc = FindDesc(node);
   if (!desc) return node.type;
   return desc->title_of ? desc->title_of(node) : desc->title;
+}
+
+std::string TitleCase(std::string_view name) {
+  const auto lower = [](char c) { return std::islower(static_cast<unsigned char>(c)) != 0; };
+  const auto upper = [](char c) { return std::isupper(static_cast<unsigned char>(c)) != 0; };
+  const auto digit = [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; };
+  std::string title;
+  bool word_start = true;
+  for (size_t i = 0; i < name.size(); ++i) {
+    char c = name[i];
+    if (c == '_' || c == ' ') {
+      // One space for a run of them, none at either end.
+      if (!title.empty() && title.back() != ' ' && i + 1 < name.size()) title += ' ';
+      word_start = true;
+      continue;
+    }
+    // A new word where camel case starts one: "tM" in "SetMaterial", "PS" before "Server" in "HTTPServer".
+    if (upper(c) && i > 0 && !word_start) {
+      const char before = name[i - 1];
+      const bool after_lower = lower(before) || digit(before);
+      const bool acronym_end = upper(before) && i + 1 < name.size() && lower(name[i + 1]);
+      if (after_lower || acronym_end) title += ' ';
+    }
+    if (word_start && lower(c)) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    title += c;
+    word_start = c == '.' || c == ':' || c == '/';
+  }
+  while (!title.empty() && title.back() == ' ') title.pop_back();
+  return title;
 }
 
 std::string TypeName(const PinType& type) {
