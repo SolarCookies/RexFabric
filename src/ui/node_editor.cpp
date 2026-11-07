@@ -789,7 +789,9 @@ void NodeEditorWindow::DrawNode(Node& node) {
 
   const float content_x = ImGui::GetCursorPosX();
   ImGui::TextColored(kTitleColor, "%s", graph::TitleOf(node).c_str());
-  const float title_width = ImGui::GetItemRectSize().x;
+  // The title row's width, which the output column lines up with: the title, and an event's delegate pin.
+  const float title_left = ImGui::GetItemRectMin().x;
+  float title_width = ImGui::GetItemRectSize().x;
   float header_bottom = ImGui::GetItemRectMax().y;
 
   // An event's delegate pin, the last of its outputs, sits in the title's top right corner as in Unreal: at the
@@ -806,6 +808,8 @@ void NodeEditorWindow::DrawNode(Node& node) {
     ed::EndPin();
     if (ImGui::IsItemHovered()) pin_tooltip_ = "Event: link it to Set Timer by Event or Bind Event, and they run this event's chain";
     header_bottom = std::max(header_bottom, ImGui::GetItemRectMax().y);
+    // The pin sits at the node's right edge, so the outputs below right align with it.
+    title_width = ImGui::GetItemRectMax().x - title_left;
   }
   ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
 
