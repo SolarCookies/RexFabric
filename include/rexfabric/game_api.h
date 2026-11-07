@@ -297,6 +297,11 @@ class Namespace {
   // The node editor's pins for a function's parameters or an event's values, in order: "id", or "part:Part" for an
   // address as one of the namespace's types ("->Vehicle" types a result). A named event has that many values, not three.
   Namespace& Args(std::string name, std::vector<std::string> names);
+  // A list of (label, value) a text argument typed with its name in Args ("flag:crates.Flag") is picked from in the
+  // node editor, instead of being typed in. An argument typed with an enum is picked from its values the same way.
+  Namespace& Choices(std::string name, std::vector<std::pair<std::string, std::string>> choices);
+  // A list worked out each time the node editor shows it, from the game as it is then: its flags, its worlds.
+  Namespace& Choices(std::string name, std::function<std::vector<std::pair<std::string, std::string>>()> list);
 
   const std::string& name() const { return name_; }
 
@@ -328,6 +333,8 @@ struct NamespaceDef {
   std::vector<std::string> lua;  // run in order, after every namespace's declarations
   std::vector<std::pair<std::string, std::string>> categories;  // name prefix (without the namespace), title
   std::vector<std::pair<std::string, std::vector<std::string>>> args;  // full name, its arguments' names
+  std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> choices;  // full name, (label, value)
+  std::vector<std::pair<std::string, std::function<std::vector<std::pair<std::string, std::string>>()>>> live_choices;
 };
 
 const std::vector<std::unique_ptr<NamespaceDef>>& Namespaces();

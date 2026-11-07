@@ -145,6 +145,16 @@ Namespace& Namespace::Args(std::string name, std::vector<std::string> names) {
   return *this;
 }
 
+Namespace& Namespace::Choices(std::string name, std::vector<std::pair<std::string, std::string>> choices) {
+  FindOrAdd(name_).choices.emplace_back(Qualify(name), std::move(choices));
+  return *this;
+}
+
+Namespace& Namespace::Choices(std::string name, std::function<std::vector<std::pair<std::string, std::string>>()> list) {
+  FindOrAdd(name_).live_choices.emplace_back(Qualify(name), std::move(list));
+  return *this;
+}
+
 // Lookups -----------------------------------------------------------------------------------------------
 
 const std::vector<std::unique_ptr<NamespaceDef>>& Namespaces() { return GetRegistry().namespaces; }
