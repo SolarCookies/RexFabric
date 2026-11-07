@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <deque>
 #include <map>
 #include <string>
 #include <string_view>
@@ -90,42 +91,78 @@ Pin TypedPin(std::string name, const PinType& type) {
   return DataPin(name, type.kind);
 }
 
-// The pin of argument `index` (from 0): the name the game gave it (Namespace::Args), or Arg 1, Arg 2...
-std::string ArgName(const std::vector<std::string>* names, size_t index) {
-  if (names && index < names->size() && !(*names)[index].empty()) return TitleCase((*names)[index]);
+// A declaration's arguments as the game named them (Namespace::Args), each with the full name of the game type it
+// carries ("part:Part": an address as a Part), or none; "->Vehicle" types the result the same way.
+struct NamedArgs {
+  std::vector<std::pair<std::string, std::string>> args;
+  std::string result;
+};
+
+// What a namespace named a declaration's arguments, or null. Made once, for the library's nodes to keep.
+const NamedArgs* NamedArgsOf(const NamespaceDef& space, const std::string& name) {
+  static std::deque<NamedArgs> parsed;
+  const auto found = std::find_if(space.args.begin(), space.args.end(), [&name](const auto& entry) { return entry.first == name; });
+  if (found == space.args.end()) return nullptr;
+  // A type the namespace declared, or none: an unknown one leaves the pin as it was.
+  const auto typed = [&space](std::string_view type) {
+    const std::string full = space.name + "." + std::string(type);
+    return FindType(full) ? full : std::string();
+  };
+  NamedArgs& named = parsed.emplace_back();
+  for (const std::string& entry : found->second) {
+    if (entry.starts_with("->")) {
+      named.result = typed(std::string_view(entry).substr(2));
+      continue;
+    }
+    const size_t colon = entry.find(':');
+    named.args.emplace_back(entry.substr(0, colon), colon == std::string::npos ? std::string() : typed(std::string_view(entry).substr(colon + 1)));
+  }
+  return &named;
+}
+
+// The pin of argument `index` (from 0): the name the game gave it, or Arg 1, Arg 2...
+std::string ArgName(const NamedArgs* named, size_t index) {
+  if (named && index < named->args.size() && !named->args[index].first.empty()) return TitleCase(named->args[index].first);
   return "Arg " + std::to_string(index + 1);
 }
 
-// The names a namespace gave a declaration's arguments, or null.
-const std::vector<std::string>* ArgNamesOf(const NamespaceDef& space, const std::string& name) {
-  for (const auto& [declared, names] : space.args) {
-    if (declared == name) return &names;
-  }
-  return nullptr;
+// The game type argument `index` carries, or empty.
+std::string ArgType(const NamedArgs* named, size_t index) { return named && index < named->args.size() ? named->args[index].second : std::string(); }
+
+// Argument `index`'s pin: an object of its game type when it has one, otherwise `plain`.
+Pin ArgPin(const NamedArgs* named, size_t index, const PinType& plain) {
+  const std::string type = ArgType(named, index);
+  return type.empty() ? TypedPin(ArgName(named, index), plain) : ObjectPin(ArgName(named, index), type);
 }
 
-// A pin for each of a function's parameters from `first`.
-std::vector<Pin> ArgPins(const FunctionDef& function, size_t first, const std::vector<std::string>* names = nullptr) {
+// A pin for each of a function's parameters from `first`. An object goes into an address parameter as its address
+// (lua_game.cpp's CheckValue), so typed pins need nothing more.
+std::vector<Pin> ArgPins(const FunctionDef& function, size_t first, const NamedArgs* named = nullptr) {
   std::vector<Pin> pins;
-  for (size_t i = first; i < function.params.size(); ++i) pins.push_back(TypedPin(ArgName(names, i - first), ValuePinType(function.params[i])));
+  for (size_t i = first; i < function.params.size(); ++i) pins.push_back(ArgPin(named, i - first, ValuePinType(function.params[i])));
   return pins;
 }
 
-// `callee(args)`, kept in Result when the function gives something back and Result is used.
-void EmitCall(Emitter& emit, const std::string& callee, const FunctionDef& function, size_t first, const std::vector<std::string>* names = nullptr) {
+// `callee(args)`, kept in Result when the function gives something back and Result is used: as its game type's
+// object when the result is typed.
+void EmitCall(Emitter& emit, const std::string& callee, const FunctionDef& function, size_t first, const NamedArgs* named = nullptr) {
   std::string args;
-  for (size_t i = first; i < function.params.size(); ++i) args += (i > first ? ", " : "") + emit.Input(ArgName(names, i - first));
-  const std::string call = callee + "(" + args + ")";
+  for (size_t i = first; i < function.params.size(); ++i) args += (i > first ? ", " : "") + emit.Input(ArgName(named, i - first));
+  std::string call = callee + "(" + args + ")";
+  if (named && !named->result.empty()) call = LuaPath(named->result) + "(" + call + ")";
   emit.Line(function.result != ValueType::kNone && emit.Linked("Result") ? emit.Output("Result") + " = " + call : call);
 }
 
-void AddFunction(Library& library, const std::string& category, const std::string& title, const FunctionDef& function, const std::vector<std::string>* names) {
+void AddFunction(Library& library, const std::string& category, const std::string& title, const FunctionDef& function, const NamedArgs* named) {
   NodeDesc desc{.id = "game.call:" + function.name, .title = title, .category = category, .description = "Calls the game's " + function.name + "."};
   desc.pins.inputs = {ExecPin()};
-  for (Pin& pin : ArgPins(function, 0, names)) desc.pins.inputs.push_back(std::move(pin));
+  for (Pin& pin : ArgPins(function, 0, named)) desc.pins.inputs.push_back(std::move(pin));
   desc.pins.outputs = {ExecPin(kExecOut)};
-  if (function.result != ValueType::kNone) desc.pins.outputs.push_back(TypedPin("Result", ValuePinType(function.result)));
-  desc.emit = [&function, names](Emitter& emit) { EmitCall(emit, LuaPath(function.name), function, 0, names); };
+  if (function.result != ValueType::kNone) {
+    const bool typed = named && !named->result.empty();
+    desc.pins.outputs.push_back(typed ? ObjectPin("Result", named->result) : TypedPin("Result", ValuePinType(function.result)));
+  }
+  desc.emit = [&function, named](Emitter& emit) { EmitCall(emit, LuaPath(function.name), function, 0, named); };
   library.Add(std::move(desc));
 }
 
@@ -196,17 +233,22 @@ void AddType(Library& library, const std::string& category, const std::string& s
   }
 }
 
-void AddEvent(Library& library, const std::string& category, const std::string& title, const std::string& event, const std::vector<std::string>* names) {
+void AddEvent(Library& library, const std::string& category, const std::string& title, const std::string& event, const NamedArgs* named) {
   NodeDesc desc{.id = "game.event:" + event, .title = title, .category = category, .description = "Runs when the game fires " + event + ", with whatever it fires it with.", .role = NodeRole::kEvent, .delegate = true};
   // As many values as the game named, or kEventArgs.
-  const size_t count = names ? names->size() : static_cast<size_t>(kEventArgs);
+  const size_t count = named ? named->args.size() : static_cast<size_t>(kEventArgs);
   desc.pins.outputs = {ExecPin(kExecOut)};
-  for (size_t i = 0; i < count; ++i) desc.pins.outputs.push_back(DataPin(ArgName(names, i), PinKind::kAny));
-  desc.emit = [event, names, count](Emitter& emit) {
+  for (size_t i = 0; i < count; ++i) desc.pins.outputs.push_back(ArgPin(named, i, {PinKind::kAny}));
+  desc.emit = [event, named, count](Emitter& emit) {
     std::string params;
-    for (size_t i = 0; i < count; ++i) params += (i > 0 ? ", " : "") + emit.Param(ArgName(names, i));
+    for (size_t i = 0; i < count; ++i) params += (i > 0 ? ", " : "") + emit.Param(ArgName(named, i));
     emit.Line("rex.on(" + LuaQuote(event) + ", function(" + params + ")");
     emit.Open();
+    // An address the game fires with becomes its type's object (nil for none) before anything reads it.
+    for (size_t i = 0; i < count; ++i) {
+      const std::string type = ArgType(named, i);
+      if (!type.empty()) emit.Line(emit.Param(ArgName(named, i)) + " = " + LuaPath(type) + "(" + emit.Param(ArgName(named, i)) + ")");
+    }
     emit.Chain(kExecOut);
     emit.Close();
     emit.Line("end)");
@@ -243,11 +285,11 @@ void AddGameNodes(Library& library) {
       for (const Placed& placed : *list) ++titles[{placed.category, TitleCase(placed.title)}];
     }
     const auto title = [&titles](const Placed& placed) { return titles[{placed.category, TitleCase(placed.title)}] > 1 ? placed.full : placed.title; };
-    for (size_t i = 0; i < functions.size(); ++i) AddFunction(library, functions[i].category, title(functions[i]), space->functions[i], ArgNamesOf(*space, space->functions[i].name));
+    for (size_t i = 0; i < functions.size(); ++i) AddFunction(library, functions[i].category, title(functions[i]), space->functions[i], NamedArgsOf(*space, space->functions[i].name));
     for (size_t i = 0; i < constants.size(); ++i) AddConstant(library, constants[i].category, title(constants[i]), space->constants[i]);
     for (size_t i = 0; i < enums.size(); ++i) AddEnum(library, enums[i].category, title(enums[i]), space->enums[i]);
     for (const std::unique_ptr<TypeDef>& type : space->types) AddType(library, CategoryOf(*space, type->name(), game), space->name, *type);
-    for (size_t i = 0; i < events.size(); ++i) AddEvent(library, events[i].category, title(events[i]), space->events[i], ArgNamesOf(*space, space->events[i]));
+    for (size_t i = 0; i < events.size(); ++i) AddEvent(library, events[i].category, title(events[i]), space->events[i], NamedArgsOf(*space, space->events[i]));
   }
 }
 
