@@ -85,6 +85,11 @@ constexpr ImVec4 kPaneTint{0.05f, 0.06f, 0.11f, 0.42f};
 constexpr const char* kAddMenu = "AddNode";
 constexpr const char* kDropMenu = "DropVariable";
 constexpr const char* kNodeMenu = "NodeMenu";
+constexpr const char* kChoiceMenu = "PinChoices";
+// The pin's dropdown is wider than typed text, as enum names are long; its list, in font sizes.
+constexpr float kInlineChoiceWidth = 12.0f;
+constexpr float kChoiceListWidth = 24.0f;
+constexpr float kChoiceListHeight = 20.0f;
 // What the sidebar's rows carry when dragged onto the canvas: a variable's name, a function's or macro's id.
 constexpr const char* kVariablePayload = "REXFABRIC_VARIABLE";
 constexpr const char* kRoutinePayload = "REXFABRIC_ROUTINE";
@@ -727,6 +732,12 @@ void NodeEditorWindow::DrawCanvas() {
     ImGui::OpenPopup(kAddMenu);
   }
   DrawAddMenu();
+  if (open_choice_menu_) {
+    open_choice_menu_ = false;
+    choice_filter_.clear();
+    ImGui::OpenPopup(kChoiceMenu);
+  }
+  DrawChoiceMenu();
   ed::Resume();
 
   SyncFromCanvas();
@@ -991,6 +1002,20 @@ void NodeEditorWindow::DrawInlineValue(Node& node, const Pin& pin) {
   // Ints and numbers are typed as text, so hex addresses stay hex.
   std::string text;
   TextValue(value, text);
+
+  // Picked from a list instead: a button with the chosen label opens it once the canvas is suspended.
+  if (pin.choices) {
+    const graph::ChoiceList& list = ChoicesOf(*pin.choices);
+    const auto chosen = std::find_if(list.begin(), list.end(), [&text](const auto& choice) { return choice.second == text; });
+    const std::string label = chosen != list.end() ? chosen->first : text.empty() ? std::string("None") : text;
+    if (ImGui::Button((label + id).c_str(), ImVec2(font * kInlineChoiceWidth, 0.0f))) {
+      choice_node_ = node.id;
+      choice_pin_ = pin.name;
+      open_choice_menu_ = true;
+    }
+    if (ImGui::IsItemHovered()) pin_tooltip_ = label;
+    return;
+  }
   ImGui::SetNextItemWidth(font * (kind == PinKind::kInt || kind == PinKind::kNumber ? kInlineNumberWidth : kInlineTextWidth));
   const char* hint = kind == PinKind::kInt && pin.name == "Address" ? "0x82000000" : nullptr;
   if (node_widgets::InputString(id.c_str(), text, 0, hint)) {
@@ -1178,6 +1203,58 @@ void NodeEditorWindow::PasteNodes(const std::string& text, float x, float y) {
   selected_node_ = pasted.size() == 1 ? pasted.front() : 0;
   focus_ = Focus::kNode;
   Edited();
+}
+
+void NodeEditorWindow::DrawChoiceMenu() {
+  if (!ImGui::BeginPopup(kChoiceMenu)) return;
+  graph::Graph& graph = document_->graph();
+  Node* node = graph.FindNode(choice_node_);
+  const NodePins pins = node ? graph::PinsOf(*node, graph) : NodePins{};
+  const Pin* pin = node ? graph::FindPin(pins.inputs, choice_pin_) : nullptr;
+  if (!pin || !pin->choices) {
+    ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+    return;
+  }
+  const auto stored = node->values.find(pin->name);
+  std::string current;
+  TextValue(stored != node->values.end() ? stored->second : pin->initial, current);
+
+  const float font = ImGui::GetFontSize();
+  const bool appearing = ImGui::IsWindowAppearing();
+  const graph::ChoiceList& list = ChoicesOf(*pin->choices, appearing);
+  if (appearing) ImGui::SetKeyboardFocusHere();
+  ImGui::SetNextItemWidth(font * kChoiceListWidth);
+  node_widgets::InputString("##search", choice_filter_, 0, "Search, or type your own");
+  const auto pick = [&](const std::string& value) {
+    node->values[pin->name] = value;
+    Edited();
+    ImGui::CloseCurrentPopup();
+  };
+  ImGui::BeginChild("##choices", ImVec2(font * kChoiceListWidth, font * kChoiceListHeight));
+  // What's typed, when it isn't one of the values: the list is a help, not a limit.
+  const bool listed = std::any_of(list.begin(), list.end(), [this](const auto& choice) { return choice.second == choice_filter_; });
+  if (!choice_filter_.empty() && !listed && ImGui::Selectable(("Use \"" + choice_filter_ + "\"").c_str())) pick(choice_filter_);
+  for (const auto& [label, value] : list) {
+    if (!choice_filter_.empty() && !node_widgets::ContainsIgnoringCase(label, choice_filter_) && !node_widgets::ContainsIgnoringCase(value, choice_filter_)) continue;
+    const bool selected = value == current;
+    if (ImGui::Selectable((label + "##" + value).c_str(), selected)) pick(value);
+    if (selected && appearing) ImGui::SetScrollHereY();
+  }
+  if (list.empty() && choice_filter_.empty()) ImGui::TextDisabled("Nothing to pick from yet: type a value.");
+  ImGui::EndChild();
+  ImGui::EndPopup();
+}
+
+const graph::ChoiceList& NodeEditorWindow::ChoicesOf(const graph::ChoiceSource& source, bool refresh) {
+  if (!source.live) return source.fixed;
+  auto cached = live_choices_.find(&source);
+  if (cached == live_choices_.end()) {
+    cached = live_choices_.emplace(&source, source.live()).first;
+  } else if (refresh) {
+    cached->second = source.live();
+  }
+  return cached->second;
 }
 
 void NodeEditorWindow::DrawAddMenu() {

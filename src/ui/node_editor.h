@@ -21,6 +21,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -89,6 +90,10 @@ class NodeEditorWindow : public rex::ui::ImGuiDialog {
   // A double clicked link gets a reroute where it was clicked.
   void HandleDoubleClick();
   void DrawInlineValue(graph::Node& node, const graph::Pin& pin);
+  // The list an input with choices (Pin::choices) is picked from, with a search box.
+  void DrawChoiceMenu();
+  // An input's choices: a live list as it was when last opened (worked out the first time it's needed).
+  const graph::ChoiceList& ChoicesOf(const graph::ChoiceSource& source, bool refresh = false);
   void HandleCreate();
   void HandleDelete();
   void HandleClipboard();
@@ -181,6 +186,13 @@ class NodeEditorWindow : public rex::ui::ImGuiDialog {
   bool open_drop_menu_ = false;
   int context_node_ = 0;
   bool open_node_menu_ = false;
+
+  // The input whose choices are being picked from.
+  int choice_node_ = 0;
+  std::string choice_pin_;
+  std::string choice_filter_;
+  bool open_choice_menu_ = false;
+  std::map<const graph::ChoiceSource*, graph::ChoiceList> live_choices_;
 
   Ask ask_ = Ask::kNone;
   bool open_ask_ = false;
