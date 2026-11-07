@@ -37,6 +37,8 @@ struct Config {
   // The key that opens the mods menu, by name ("F5"); it becomes the rebindable bind_mods. Empty: no key,
   // and the game opens the menu with ShowMenu.
   std::string menu_key;
+  // The key that opens the node editor ("F10"); it becomes bind_node_editor. Only built WITH_NODE_EDITOR.
+  std::string node_editor_key;
   // A guest function the game runs once a frame, such as its present. RexFabric hooks it and fires the
   // frame event from there, on the guest thread. 0: the game calls Tick itself.
   uint32_t frame_function = 0;
@@ -62,6 +64,9 @@ void CreateMenus(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* images)
 void ShowMenu(bool show = true);
 void ToggleMenu();
 bool MenuShown();
+// The node editor, when built WITH_NODE_EDITOR; otherwise these do nothing.
+void ShowNodeEditor(bool show = true);
+bool NodeEditorShown();
 
 // A mod in the mods folder, for the game to show or report.
 struct InstalledMod {

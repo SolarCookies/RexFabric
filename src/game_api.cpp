@@ -130,6 +130,11 @@ rexfabric::Event Namespace::Event(std::string name) {
   return rexfabric::Event(full);
 }
 
+Namespace& Namespace::Lua(std::string source) {
+  FindOrAdd(name_).lua.push_back(std::move(source));
+  return *this;
+}
+
 // Lookups -----------------------------------------------------------------------------------------------
 
 const std::vector<std::unique_ptr<NamespaceDef>>& Namespaces() { return GetRegistry().namespaces; }
