@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <map>
 #include <string>
@@ -92,11 +94,25 @@ Pin TypedPin(std::string name, const PinType& type) {
 }
 
 // A declaration's arguments as the game named them (Namespace::Args), each with the full name of the game type it
-// carries ("part:Part": an address as a Part), or none; "->Vehicle" types the result the same way.
+// carries ("part:Part": an address as a Part), or none; "->Vehicle" types the result the same way. An argument of
+// one of the game's enums ("effect:fx.Effect") or Choices lists ("flag:crates.Flag") is picked from it instead.
 struct NamedArgs {
   std::vector<std::pair<std::string, std::string>> args;
+  std::vector<ChoiceSource> choices;  // per argument
+  std::vector<bool> optional;  // per argument: a typed one ending in '?' may be left unlinked
   std::string result;
 };
+
+// Argument `index` is an object that may be left unlinked.
+bool ArgOptional(const NamedArgs* named, size_t index) { return named && index < named->optional.size() && named->optional[index]; }
+
+// An enum value as it's typed into a pin: hex, as the game's ids are.
+std::string ChoiceText(int64_t value) {
+  if (value < 0) return std::to_string(value);
+  char text[24];
+  std::snprintf(text, sizeof(text), "0x%llX", static_cast<unsigned long long>(value));
+  return text;
+}
 
 // What a namespace named a declaration's arguments, or null. Made once, for the library's nodes to keep.
 const NamedArgs* NamedArgsOf(const NamespaceDef& space, const std::string& name) {
@@ -115,7 +131,26 @@ const NamedArgs* NamedArgsOf(const NamespaceDef& space, const std::string& name)
       continue;
     }
     const size_t colon = entry.find(':');
-    named.args.emplace_back(entry.substr(0, colon), colon == std::string::npos ? std::string() : typed(std::string_view(entry).substr(colon + 1)));
+    std::string type = colon == std::string::npos ? std::string() : entry.substr(colon + 1);
+    // "vehicle:Vehicle?": the object may be left unlinked, which passes 0.
+    const bool optional = type.ends_with('?');
+    if (optional) type.pop_back();
+    named.optional.push_back(optional);
+    named.args.emplace_back(entry.substr(0, colon), type.empty() ? std::string() : typed(type));
+    ChoiceSource& choices = named.choices.emplace_back();
+    const std::string full = space.name + "." + type;
+    const auto named_as = [&full](const auto& list) { return list.first == full; };
+    const auto listed = std::find_if(space.choices.begin(), space.choices.end(), named_as);
+    const auto live = std::find_if(space.live_choices.begin(), space.live_choices.end(), named_as);
+    if (type.empty()) {
+      // A plain argument.
+    } else if (listed != space.choices.end()) {
+      choices.fixed = listed->second;
+    } else if (live != space.live_choices.end()) {
+      choices.live = live->second;
+    } else if (const EnumDef* enumeration = FindEnum(full)) {
+      for (const auto& [label, value] : enumeration->values) choices.fixed.emplace_back(label, ChoiceText(value));
+    }
   }
   return &named;
 }
@@ -129,10 +164,21 @@ std::string ArgName(const NamedArgs* named, size_t index) {
 // The game type argument `index` carries, or empty.
 std::string ArgType(const NamedArgs* named, size_t index) { return named && index < named->args.size() ? named->args[index].second : std::string(); }
 
-// Argument `index`'s pin: an object of its game type when it has one, otherwise `plain`.
+// Argument `index`'s pin: an object of its game type when it has one, otherwise `plain`, picked from its enum's values
+// when it has one.
 Pin ArgPin(const NamedArgs* named, size_t index, const PinType& plain) {
   const std::string type = ArgType(named, index);
-  return type.empty() ? TypedPin(ArgName(named, index), plain) : ObjectPin(ArgName(named, index), type);
+  if (!type.empty()) {
+    Pin pin = ObjectPin(ArgName(named, index), type);
+    pin.required = !ArgOptional(named, index);
+    return pin;
+  }
+  Pin pin = TypedPin(ArgName(named, index), plain);
+  if (named && index < named->choices.size() && !named->choices[index].empty() && (plain.kind == PinKind::kInt || plain.kind == PinKind::kString)) {
+    pin.choices = &named->choices[index];
+    if (!pin.choices->fixed.empty()) pin.initial = pin.choices->fixed.front().second;
+  }
+  return pin;
 }
 
 // A pin for each of a function's parameters from `first`. An object goes into an address parameter as its address
@@ -147,7 +193,12 @@ std::vector<Pin> ArgPins(const FunctionDef& function, size_t first, const NamedA
 // object when the result is typed.
 void EmitCall(Emitter& emit, const std::string& callee, const FunctionDef& function, size_t first, const NamedArgs* named = nullptr) {
   std::string args;
-  for (size_t i = first; i < function.params.size(); ++i) args += (i > first ? ", " : "") + emit.Input(ArgName(named, i - first));
+  for (size_t i = first; i < function.params.size(); ++i) {
+    const std::string name = ArgName(named, i - first);
+    // An optional object left unlinked is none: 0 for an address, nil otherwise.
+    const bool none = ArgOptional(named, i - first) && !emit.Linked(name);
+    args += (i > first ? ", " : "") + (none ? std::string(function.params[i] == ValueType::kInt ? "0" : "nil") : emit.Input(name));
+  }
   std::string call = callee + "(" + args + ")";
   if (named && !named->result.empty()) call = LuaPath(named->result) + "(" + call + ")";
   emit.Line(function.result != ValueType::kNone && emit.Linked("Result") ? emit.Output("Result") + " = " + call : call);

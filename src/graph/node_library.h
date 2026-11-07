@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -28,6 +29,15 @@ struct EnumDef;
 namespace rexfabric::graph {
 
 class Emitter;
+
+using ChoiceList = std::vector<std::pair<std::string, std::string>>;  // label, value as typed
+
+// What an input is picked from: a list fixed when its node was made, or one the game works out when it's shown.
+struct ChoiceSource {
+  ChoiceList fixed;
+  std::function<ChoiceList()> live;
+  bool empty() const { return fixed.empty() && !live; }
+};
 
 struct PinType {
   PinKind kind = PinKind::kExec;
@@ -46,6 +56,8 @@ struct Pin {
   bool required = false;
   // Takes whatever links to it first, exec or data, and is that type from then on: an unlinked reroute's pins.
   bool wildcard = false;
+  // An unlinked input picked from these instead of typed in (an argument of a game enum or list), or any typed value.
+  const ChoiceSource* choices = nullptr;
 };
 
 struct NodePins {
