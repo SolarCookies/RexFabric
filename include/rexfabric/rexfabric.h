@@ -37,7 +37,8 @@ struct Config {
   // The key that opens the mods menu, by name ("F5"); it becomes the rebindable bind_mods. Empty: no key,
   // and the game opens the menu with ShowMenu.
   std::string menu_key;
-  // The key that opens the node editor ("F10"); it becomes bind_node_editor. Only built WITH_NODE_EDITOR.
+  // The key that opens the node editor, by name; it becomes the rebindable bind_node_editor. Only with
+  // WITH_NODE_EDITOR. Empty: no key; the mods menu still opens it.
   std::string node_editor_key;
   // A guest function the game runs once a frame, such as its present. RexFabric hooks it and fires the
   // frame event from there, on the guest thread. 0: the game calls Tick itself.
@@ -63,8 +64,11 @@ void Tick();
 void CreateMenus(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* images);
 void ShowMenu(bool show = true);
 void ToggleMenu();
+// A RexFabric window is open: the mods menu, or the node editor. For a game deciding whether mods get input.
 bool MenuShown();
-// The node editor, when built WITH_NODE_EDITOR; otherwise these do nothing.
+
+// The node editor, which makes Lua mods from node graphs in game. Only with WITH_NODE_EDITOR; without it these do
+// nothing. Closing it asks first when a graph has unsaved changes.
 void ShowNodeEditor(bool show = true);
 bool NodeEditorShown();
 

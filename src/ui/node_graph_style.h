@@ -46,6 +46,9 @@ class NodeGraphStyle {
   float time_ = 0.0f;
   float delta_ = 0.0f;
   int appearing_ = 0;
+  // Where the aurora was drawn this frame, on screen, for glass nodes to show it through themselves.
+  ImVec2 aurora_min_;
+  ImVec2 aurora_max_;
 };
 
 }  // namespace rexfabric::ui

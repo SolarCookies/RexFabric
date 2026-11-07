@@ -21,6 +21,8 @@ constexpr float kRounding = 10.0f;
 #if REXFABRIC_WITH_GLASS
 // Glass nodes are rounder, as Toon's are.
 constexpr float kGlassRounding = 14.0f;
+// imgui-node-editor's grid, in canvas units, which glass nodes show through themselves.
+constexpr float kGridSpacing = 32.0f;
 #endif
 // The backdrop's colors drift through one cycle in this many seconds.
 constexpr float kBackdropCycle = 40.0f;
@@ -73,6 +75,8 @@ void NodeGraphStyle::DrawBackdrop() {
   // Under glass nodes, Toon's drifting colored light, for the glass to show.
   if (glass::Enabled()) {
     rexglass::DrawAurora(ImGui::GetWindowDrawList(), min, max, time_);
+    aurora_min_ = min;
+    aurora_max_ = max;
     return;
   }
 #endif
@@ -123,10 +127,27 @@ void NodeGraphStyle::EndNode(int node, const ImVec4& color, float header_bottom,
     panel.header_tint = ImVec4(color.x * 0.75f, color.y * 0.75f, color.z * 0.75f, 0.55f);
     panel.header_height = header_bottom > min.y ? header_bottom - min.y + 4.0f : 0.0f;
     panel.highlight = state.hover;
+    panel.refraction = 1.0f + 0.25f * state.hover;
     panel.frost = 0.4f;
     panel.opacity = appear;
-    // Over the canvas, which is what should show through, not the game.
+    // What's under the node shows through, bent at the rim: with the game's renderer handing over the screen as drawn
+    // so far (RexGlass's Config::screen), the aurora, grid, wires and other nodes as they are, found on screen through
+    // the canvas's transform. Without it, a description of the canvas: the aurora where it is on screen, and the grid
+    // imgui-node-editor draws over it every 32 canvas units, fading as it zooms out. Never the game, which would show
+    // through the canvas as a hole.
+    panel.to_screen = [](const ImVec2& point) { return ed::CanvasToScreen(point); };
     panel.see_game = false;
+    const ImVec2 aurora_min = aurora_min_;
+    const ImVec2 aurora_max = aurora_max_;
+    const float seconds = time_;
+    const float zoom = ed::GetCurrentZoom();
+    ImVec4 grid = ed::GetStyle().Colors[ed::StyleColor_Grid];
+    grid.w *= std::clamp(zoom * zoom, 0.0f, 1.0f);
+    rexglass::Canvas canvas;
+    canvas.color = [&](const ImVec2& point) { return rexglass::AuroraColor(aurora_min, aurora_max, seconds, ed::CanvasToScreen(point)); };
+    canvas.grid_spacing = kGridSpacing;
+    canvas.grid_color = ImGui::ColorConvertFloat4ToU32(grid);
+    panel.canvas = &canvas;
     // Hovering brightens the rim; selecting lights it in the node's own color; a problem lights it red.
     const float glow = std::max(state.hover * 0.25f, state.selected * 0.8f);
     const bool lit = state.selected > state.hover * 0.3f;
