@@ -61,6 +61,7 @@ lua_State* Create() {
   OpenRex(L);
   OpenHost(L);
   lua_setglobal(L, "rex");
+  OpenTimers(L);
   OpenGame(L);
   lua_pushcfunction(L, Print);
   lua_setglobal(L, "print");

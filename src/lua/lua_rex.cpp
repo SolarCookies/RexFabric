@@ -22,6 +22,7 @@
 #include "../guest.h"
 #include "../hooks.h"
 #include "../log.h"
+#include "../ui/screen_text.h"
 #include "lua_vm.h"
 
 namespace rexfabric::lua {
@@ -636,6 +637,17 @@ int LogDebug(lua_State* L) {
   return 0;
 }
 
+// rex.screen_text(text, seconds, rgb): text in the screen's top right corner for a while, for debugging. Two seconds
+// and cyan unless given.
+int ScreenText(lua_State* L) {
+  std::string text = luaL_tolstring(L, 1, nullptr);
+  lua_pop(L, 1);
+  const double seconds = luaL_optnumber(L, 2, 2.0);
+  const lua_Integer rgb = luaL_optinteger(L, 3, 0x00A8FF);
+  ui::PrintToScreen(std::move(text), seconds, static_cast<uint32_t>(rgb));
+  return 0;
+}
+
 // Monotonic seconds. Only differences mean anything.
 int Now(lua_State* L) {
   lua_pushnumber(L, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -644,7 +656,7 @@ int Now(lua_State* L) {
 
 constexpr luaL_Reg kRexFuncs[] = {
     {"hook", Hook}, {"hook_after", HookAfter}, {"unhook", Unhook}, {"hooks", ListHooks}, {"hookable", Hookable}, {"call", Call},
-    {"on", On}, {"now", Now}, {"log", LogInfo}, {"info", LogInfo}, {"warn", LogWarn}, {"error", LogError}, {"debug", LogDebug},
+    {"on", On}, {"now", Now}, {"screen_text", ScreenText}, {"log", LogInfo}, {"info", LogInfo}, {"warn", LogWarn}, {"error", LogError}, {"debug", LogDebug},
     {nullptr, nullptr},
 };
 

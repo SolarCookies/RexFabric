@@ -23,31 +23,6 @@ namespace {
 // Any outputs.
 constexpr int kEventArgs = 3;
 
-bool IsIdentifier(std::string_view text) {
-  if (text.empty() || std::isdigit(static_cast<unsigned char>(text[0]))) return false;
-  for (char c : text) {
-    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') return false;
-  }
-  return true;
-}
-
-// "tip.garden.money" as Lua reaches it: tip.garden.money, or tip["odd name"] for a part that isn't a name.
-std::string LuaPath(std::string_view name) {
-  std::string path;
-  size_t start = 0;
-  while (start <= name.size()) {
-    const size_t dot = name.find('.', start);
-    const std::string_view part = name.substr(start, dot == std::string_view::npos ? std::string_view::npos : dot - start);
-    if (path.empty()) path = std::string(part);
-    else path += IsIdentifier(part) ? "." + std::string(part) : "[" + LuaQuote(part) + "]";
-    if (dot == std::string_view::npos) break;
-    start = dot + 1;
-  }
-  return path;
-}
-
-std::string Member(std::string_view name) { return IsIdentifier(name) ? "." + std::string(name) : "[" + LuaQuote(name) + "]"; }
-
 // "tip.Pinata" without its namespace: "Pinata".
 std::string ShortName(const std::string& name, const std::string& space) { return name.size() > space.size() + 1 && name.starts_with(space + ".") ? name.substr(space.size() + 1) : name; }
 
@@ -173,7 +148,7 @@ void AddEnum(Library& library, const std::string& category, const std::string& t
     const std::string value = emit.Setting("Value");
     const bool known = std::any_of(enumeration.values.begin(), enumeration.values.end(), [&](const auto& entry) { return entry.first == value; });
     if (!known) emit.Error(enumeration.name + " has no value " + value);
-    return LuaPath(enumeration.name) + Member(value);
+    return LuaPath(enumeration.name) + LuaMember(value);
   };
   library.Add(std::move(desc));
 }
@@ -193,7 +168,7 @@ void AddType(Library& library, const std::string& category, const std::string& s
     // Arrays index from 1, as Lua tables do.
     std::vector<Pin> target = {ObjectPin("Target", type.name())};
     if (field.count) target.push_back(DataPin("Index", PinKind::kInt, "1"));
-    const auto access = [name = field.name, array = field.count != 0](Emitter& emit) { return emit.Input("Target") + Member(name) + (array ? "[" + emit.Input("Index") + "]" : std::string()); };
+    const auto access = [name = field.name, array = field.count != 0](Emitter& emit) { return emit.Input("Target") + LuaMember(name) + (array ? "[" + emit.Input("Index") + "]" : std::string()); };
 
     NodeDesc get{.id = "game.get:" + type.name() + "." + field.name, .title = "Get " + label, .category = type_category, .description = "Reads " + label + (field.count ? ", element Index of " + std::to_string(field.count) : std::string()) + ".", .role = NodeRole::kPure};
     get.pins = {target, {TypedPin("Value", value_type)}};
@@ -222,7 +197,7 @@ void AddType(Library& library, const std::string& category, const std::string& s
 }
 
 void AddEvent(Library& library, const std::string& category, const std::string& title, const std::string& event, const std::vector<std::string>* names) {
-  NodeDesc desc{.id = "game.event:" + event, .title = title, .category = category, .description = "Runs when the game fires " + event + ", with whatever it fires it with.", .role = NodeRole::kEvent};
+  NodeDesc desc{.id = "game.event:" + event, .title = title, .category = category, .description = "Runs when the game fires " + event + ", with whatever it fires it with.", .role = NodeRole::kEvent, .delegate = true};
   // As many values as the game named, or kEventArgs.
   const size_t count = names ? names->size() : static_cast<size_t>(kEventArgs);
   desc.pins.outputs = {ExecPin(kExecOut)};

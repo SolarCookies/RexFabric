@@ -15,6 +15,7 @@ namespace rexfabric::ui::node_widgets {
 enum class PinShape {
   kCircle,  // values
   kArrow,   // execution order
+  kSquare,  // an event handed on, a delegate
 };
 
 // A pin icon a text line high, filled when linked and hollow when not. Call between ed::BeginPin and ed::EndPin:

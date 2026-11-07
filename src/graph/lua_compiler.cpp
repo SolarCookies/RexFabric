@@ -85,6 +85,8 @@ bool Compiled::ok() const {
   return std::none_of(problems.begin(), problems.end(), [](const Problem& problem) { return !problem.warning; });
 }
 
+bool IntegerText(std::string_view typed, std::string& literal) { return IntegerLiteral(typed, literal); }
+
 std::string LuaQuote(std::string_view text) {
   std::string quoted = "\"";
   for (unsigned char c : text) {
@@ -193,15 +195,15 @@ bool Emitter::Linked(std::string_view pin) const {
 }
 
 std::string Emitter::Output(std::string_view pin) {
-  const std::string name = "n" + std::to_string(node().id) + "_" + NamePart(pin);
+  const std::string name = LocalName(stack_.back().instance, node().id, pin);
   Declare(name);
   return name;
 }
 
-std::string Emitter::Param(std::string_view pin) { return "n" + std::to_string(node().id) + "_" + NamePart(pin); }
+std::string Emitter::Param(std::string_view pin) { return LocalName(stack_.back().instance, node().id, pin); }
 
 std::string Emitter::State(std::string_view name, std::string_view initial) {
-  const std::string local = "n" + std::to_string(node().id) + "_" + NamePart(name);
+  const std::string local = LocalName(stack_.back().instance, node().id, name);
   if (state_names_.insert(local).second) state_.push_back("local " + local + " = " + std::string(initial));
   return local;
 }
@@ -239,10 +241,29 @@ void Emitter::Close() {
 
 void Emitter::Chain(std::string_view output) {
   const int from = node().id;
+  const int instance = stack_.back().instance;
   stack_.back().chained.insert(std::string(output));
-  for (const Link* link : graph_.LinksOutOf({from, std::string(output)})) {
-    if (const Node* target = graph_.FindNode(link->to.node)) EmitAction(*target, link->to.pin);
+  // An event's chain written as its delegate function already: the event runs it by calling it.
+  if (output == kExecOut && from != delegate_ && Delegated(node())) {
+    std::string params;
+    for (const Pin& pin : stack_.back().pins.outputs) {
+      if (pin.type.kind != PinKind::kExec && pin.type.kind != PinKind::kDelegate) params += (params.empty() ? "" : ", ") + Param(pin.name);
+    }
+    Line(LocalName(-1, from, "Run") + "(" + params + ")");
+    return;
   }
+  for (const Link* link : graph_.LinksOutOf({from, std::string(output)})) {
+    if (const Node* target = graph_.FindNode(link->to.node)) EmitAction(*target, link->to.pin, instance);
+  }
+}
+
+void Emitter::Helper(std::string_view name, std::string_view code) {
+  if (state_names_.insert("helper:" + std::string(name)).second) state_.push_back(std::string(code));
+}
+
+bool Emitter::Delegated(const Node& node) const {
+  const NodeDesc* desc = FindDesc(node);
+  return desc && desc->delegate && node.owner == 0 && graph_.HasLinkAt({node.id, std::string(kDelegatePin)}, true);
 }
 
 void Emitter::Error(std::string message) { problems_.push_back({stack_.empty() ? 0 : node().id, std::move(message), false}); }
@@ -258,13 +279,64 @@ void Emitter::Declare(const std::string& name) {
   if (std::find(locals.begin(), locals.end(), name) == locals.end()) locals.push_back(name);
 }
 
-void Emitter::Push(const Node& node, std::string entered) {
+void Emitter::Push(const Node& node, std::string entered) { Push(node, std::move(entered), stack_.empty() ? -1 : stack_.back().instance); }
+
+void Emitter::Push(const Node& node, std::string entered, int instance) {
   Current current;
   current.node = &node;
   current.desc = FindDesc(node);
   current.pins = PinsOf(node, graph_);
   current.entered = std::move(entered);
+  current.instance = instance;
   stack_.push_back(std::move(current));
+}
+
+const std::string& Emitter::Prefix(int instance) const {
+  static const std::string kNone;
+  return instance < 0 ? kNone : instances_[static_cast<size_t>(instance)].prefix;
+}
+
+std::string Emitter::LocalName(int instance, int node, std::string_view pin) const { return Prefix(instance) + "n" + std::to_string(node) + "_" + NamePart(pin); }
+
+std::string Emitter::Key(int instance, int node) const { return Prefix(instance) + std::to_string(node); }
+
+int Emitter::InstanceOf(const Node& call, int parent) {
+  const Routine* routine = RoutineOf(call, graph_);
+  if (!routine) return -1;
+  // A macro using itself, directly or through others, would be written out forever.
+  for (int at = parent; at >= 0; at = instances_[static_cast<size_t>(at)].parent) {
+    if (instances_[static_cast<size_t>(at)].routine == routine->id) return -1;
+  }
+  const std::string prefix = Prefix(parent) + "m" + std::to_string(call.id) + "_";
+  for (size_t i = 0; i < instances_.size(); ++i) {
+    if (instances_[i].prefix == prefix) return static_cast<int>(i);
+  }
+  instances_.push_back({&call, parent, routine->id, prefix});
+  return static_cast<int>(instances_.size() - 1);
+}
+
+void Emitter::EnterMacro(const Node& call, const Routine& routine, const std::string& entered, int instance) {
+  const int inside = InstanceOf(call, instance);
+  const Node* entry = EntryOf(graph_, routine.id);
+  if (inside < 0) {
+    Error(routine.name + " uses itself, so it would never end");
+    return;
+  }
+  if (!entry) {
+    Error(routine.name + " has no inputs node");
+    return;
+  }
+  Push(*entry, {}, inside);
+  Chain(entered);
+  Pop();
+}
+
+void Emitter::LeaveMacro(const std::string& entered, int instance) {
+  // On through the same exec output of the node using the macro, in the graph it's in.
+  const Instance inside = instances_[static_cast<size_t>(instance)];
+  Push(*inside.call, {}, inside.parent);
+  Chain(entered);
+  Pop();
 }
 
 std::string Emitter::ValueOf(const PinRef& output) {
@@ -274,8 +346,50 @@ std::string Emitter::ValueOf(const PinRef& output) {
     Error("Reads from a node the editor doesn't know");
     return "nil";
   }
+  const int instance = stack_.back().instance;
 
-  switch (desc->role) {
+  // An event's delegate pin is its chain's function, written before the events, so any of them can take it.
+  if (desc->delegate && output.pin == kDelegatePin) return LocalName(-1, source->id, "Run");
+
+  // A macro's inputs are what the node using it is given there; its outputs, what its exit is given inside it.
+  const Routine* routine = source->type == kRoutineEntry || source->type == kRoutineCall ? RoutineOf(*source, graph_) : nullptr;
+  if (routine && routine->kind == RoutineKind::kMacro) {
+    if (depth_ >= kMaxExpressionDepth) {
+      Error("Can't work out " + TitleOf(*source));
+      return "nil";
+    }
+    if (source->type == kRoutineEntry) {
+      if (instance < 0) {
+        Error("Reads a macro's input outside a use of the macro");
+        return "nil";
+      }
+      const Instance inside = instances_[static_cast<size_t>(instance)];
+      ++depth_;
+      Push(*inside.call, {}, inside.parent);
+      std::string value = Input(output.pin);
+      Pop();
+      --depth_;
+      return value;
+    }
+    if (RoleOf(*source, graph_) == NodeRole::kAction && (functions_.empty() || !functions_.back().ran.contains(Key(instance, source->id)))) {
+      Error("Reads " + output.pin + " of " + TitleOf(*source) + " before it runs; it has to come earlier in the same event's chain");
+      return "nil";
+    }
+    const int inside = InstanceOf(*source, instance);
+    const Node* exit = ExitOf(graph_, routine->id);
+    if (inside < 0 || !exit) {
+      Error(routine->name + (inside < 0 ? " uses itself, so it would never end" : " has no outputs node"));
+      return "nil";
+    }
+    ++depth_;
+    Push(*exit, {}, inside);
+    std::string value = Input(output.pin);
+    Pop();
+    --depth_;
+    return value;
+  }
+
+  switch (RoleOf(*source, graph_)) {
     case NodeRole::kPure: {
       if (!desc->expression || depth_ >= kMaxExpressionDepth) {
         Error("Can't work out " + TitleOf(*source));
@@ -293,13 +407,13 @@ std::string Emitter::ValueOf(const PinRef& output) {
         Error("Reads " + output.pin + " of " + TitleOf(*source) + ", which only exists in that event's chain");
         return "nil";
       }
-      return "n" + std::to_string(source->id) + "_" + NamePart(output.pin);
+      return LocalName(instance, source->id, output.pin);
     case NodeRole::kAction:
-      if (functions_.empty() || !functions_.back().ran.contains(source->id)) {
+      if (functions_.empty() || !functions_.back().ran.contains(Key(instance, source->id))) {
         Error("Reads " + output.pin + " of " + TitleOf(*source) + " before it runs; it has to come earlier in the same event's chain");
         return "nil";
       }
-      return "n" + std::to_string(source->id) + "_" + NamePart(output.pin);
+      return LocalName(instance, source->id, output.pin);
   }
   return "nil";
 }
@@ -335,21 +449,80 @@ void Emitter::EmitEvent(const Node& node) {
   Pop();
 }
 
-void Emitter::EmitAction(const Node& node, const std::string& entered) {
+void Emitter::EmitDelegate(const Node& event) {
+  Push(event, {}, -1);
+  const std::string name = LocalName(-1, event.id, "Run");
+  // Declared at the top, so a chain written earlier can take it.
+  Declare(name);
+  std::string params;
+  for (const Pin& pin : stack_.back().pins.outputs) {
+    if (pin.type.kind != PinKind::kExec && pin.type.kind != PinKind::kDelegate) params += (params.empty() ? "" : ", ") + Param(pin.name);
+  }
+  lines_.push_back({});
+  lines_.push_back("-- " + TitleOf(event) + ", which a timer or a dispatcher can run too");
+  Line("function " + name + "(" + params + ")");
+  delegate_ = event.id;
+  Open();
+  Chain(kExecOut);
+  Close();
+  delegate_ = 0;
+  Line("end");
+  Pop();
+}
+
+void Emitter::EmitFunction(const Routine& routine) {
+  const Node* entry = EntryOf(graph_, routine.id);
+  if (!entry) {
+    problems_.push_back({0, "Function " + routine.name + " has no inputs node", false});
+    return;
+  }
+  Push(*entry, {}, -1);
+  std::string params;
+  for (const graph::Param& param : routine.inputs) params += (params.empty() ? "" : ", ") + Param(param.name);
+  lines_.push_back({});
+  lines_.push_back("-- " + routine.name);
+  Line("function " + routine.name + "(" + params + ")");
+  Open();
+  if (routine.pure) {
+    // No chain: the function gives back what its outputs work out to.
+    if (const Node* exit = ExitOf(graph_, routine.id); exit && !routine.outputs.empty()) {
+      Push(*exit, {}, -1);
+      std::string values;
+      for (const graph::Param& param : routine.outputs) values += (values.empty() ? "" : ", ") + Input(param.name);
+      Pop();
+      Line("return " + values);
+    }
+  } else {
+    Chain(kExecOut);
+  }
+  Close();
+  Line("end");
+  Pop();
+}
+
+void Emitter::EmitAction(const Node& node, const std::string& entered, int instance) {
   const NodeDesc* desc = FindDesc(node);
-  if (!desc || desc->role != NodeRole::kAction || functions_.empty()) return;
-  if (std::find(path_.begin(), path_.end(), node.id) != path_.end()) {
+  if (!desc || RoleOf(node, graph_) != NodeRole::kAction || functions_.empty()) return;
+  const std::string key = Key(instance, node.id);
+  if (std::find(path_.begin(), path_.end(), key) != path_.end()) {
     Error("This chain runs back into " + TitleOf(node) + "; use a For Loop to repeat things");
     return;
   }
 
   reached_.insert(node.id);
-  functions_.back().ran.insert(node.id);
-  path_.push_back(node.id);
-  Push(node, entered);
-  if (desc->emit) desc->emit(*this);
-  const bool then_left = FindPin(stack_.back().pins.outputs, kExecOut) && !stack_.back().chained.contains(std::string(kExecOut));
-  if (then_left) Chain(kExecOut);
+  functions_.back().ran.insert(key);
+  path_.push_back(key);
+  Push(node, entered, instance);
+  const Routine* routine = node.type == kRoutineCall || node.type == kRoutineExit ? RoutineOf(node, graph_) : nullptr;
+  if (node.type == kRoutineCall && routine && routine->kind == RoutineKind::kMacro) {
+    EnterMacro(node, *routine, entered, instance);
+  } else if (node.type == kRoutineExit && instance >= 0) {
+    LeaveMacro(entered, instance);
+  } else {
+    if (desc->emit) desc->emit(*this);
+    const bool then_left = FindPin(stack_.back().pins.outputs, kExecOut) && !stack_.back().chained.contains(std::string(kExecOut));
+    if (then_left) Chain(kExecOut);
+  }
   Pop();
   path_.pop_back();
 }
@@ -368,6 +541,41 @@ void Emitter::CheckLinks() {
   }
 }
 
+void Emitter::CheckRoutines() {
+  std::set<std::string> names;
+  for (const Routine& routine : graph_.routines()) {
+    const std::string what = (routine.kind == RoutineKind::kMacro ? "Macro " : "Function ") + routine.name;
+    std::string reason;
+    if (!IsVariableName(routine.name, options_.globals, &reason)) problems_.push_back({0, what + ": " + reason, false});
+    if (!names.insert(routine.name).second || graph_.FindVariable(routine.name)) problems_.push_back({0, what + ": another function, macro or variable has that name", false});
+    if (!EntryOf(graph_, routine.id) || !ExitOf(graph_, routine.id)) problems_.push_back({0, what + " is missing its inputs or outputs node", false});
+    for (const auto* side : {&routine.inputs, &routine.outputs}) {
+      std::set<std::string> params;
+      for (const graph::Param& param : *side) {
+        if (param.name.empty()) problems_.push_back({0, what + " has an input or output without a name", false});
+        else if (!params.insert(param.name).second) problems_.push_back({0, what + " has two inputs or outputs named " + param.name, false});
+        if (routine.kind == RoutineKind::kFunction && (param.type == PinKind::kExec || param.name == kExecIn || param.name == kExecOut)) problems_.push_back({0, what + ": " + param.name + " is kept for the function's own exec pins", false});
+      }
+    }
+  }
+}
+
+void Emitter::CheckDispatchers() {
+  std::set<std::string> seen;
+  for (const Dispatcher& dispatcher : graph_.dispatchers()) {
+    const std::string what = "Event dispatcher " + dispatcher.name;
+    std::string reason;
+    if (!IsVariableName(dispatcher.name, options_.globals, &reason)) problems_.push_back({0, what + ": " + reason, false});
+    const bool routine = std::any_of(graph_.routines().begin(), graph_.routines().end(), [&](const Routine& entry) { return entry.name == dispatcher.name; });
+    if (!seen.insert(dispatcher.name).second || routine || graph_.FindVariable(dispatcher.name)) problems_.push_back({0, what + ": something else in the graph has that name", false});
+    std::set<std::string> params;
+    for (const graph::Param& param : dispatcher.params) {
+      if (param.name.empty()) problems_.push_back({0, what + " has a param without a name", false});
+      else if (!params.insert(param.name).second) problems_.push_back({0, what + " has two params named " + param.name, false});
+    }
+  }
+}
+
 void Emitter::CheckVariables() {
   std::set<std::string> seen;
   for (const Variable& variable : graph_.variables()) {
@@ -379,24 +587,56 @@ void Emitter::CheckVariables() {
 
 Compiled Emitter::Finish(std::string_view source) {
   CheckVariables();
+  CheckRoutines();
+  CheckDispatchers();
   CheckLinks();
 
   std::vector<const Node*> events;
+  std::set<int> macros_used;
   for (const Node& node : graph_.nodes()) {
     const NodeDesc* desc = FindDesc(node);
-    if (!desc) problems_.push_back({node.id, "There's no " + node.type + " node; the game may not declare it any more", false});
-    else if (desc->role == NodeRole::kEvent) events.push_back(&node);
+    if (!desc) {
+      problems_.push_back({node.id, "There's no " + node.type + " node; the game may not declare it any more", false});
+      continue;
+    }
+    if (node.type == kRoutineCall) {
+      if (const Routine* routine = RoutineOf(node, graph_)) macros_used.insert(routine->id);
+    }
+    if (RoleOf(node, graph_) != NodeRole::kEvent || node.type == kRoutineEntry) continue;
+    if (node.owner == 0) events.push_back(&node);
+    else problems_.push_back({node.id, "Events only run in the event graph", false});
+  }
+
+  // Functions first, declared together so each can call any other.
+  std::string functions;
+  for (const Routine& routine : graph_.routines()) {
+    if (routine.kind == RoutineKind::kFunction) functions += (functions.empty() ? "" : ", ") + routine.name;
+  }
+  if (!functions.empty()) state_.push_back("local " + functions);
+  for (const Routine& routine : graph_.routines()) {
+    if (routine.kind == RoutineKind::kFunction) EmitFunction(routine);
   }
   std::sort(events.begin(), events.end(), [](const Node* a, const Node* b) { return a->y != b->y ? a->y < b->y : a->x != b->x ? a->x < b->x : a->id < b->id; });
+  // The chains timers and dispatchers run, before any event, so even On Start can hand them on.
+  for (const Node* event : events) {
+    if (Delegated(*event)) EmitDelegate(*event);
+  }
   for (const Node* event : events) {
     lines_.push_back({});
     lines_.push_back("-- " + TitleOf(*event));
+    const size_t before = lines_.size();
     EmitEvent(*event);
+    // An event that registers nothing of its own (a custom event) leaves no heading behind.
+    if (lines_.size() == before) lines_.resize(before - 2);
   }
 
   for (const Node& node : graph_.nodes()) {
     const NodeDesc* desc = FindDesc(node);
-    if (desc && desc->role == NodeRole::kAction && !reached_.contains(node.id)) problems_.push_back({node.id, "Never runs: no event's chain leads here", true});
+    if (!desc || RoleOf(node, graph_) != NodeRole::kAction || reached_.contains(node.id) || node.type == kRoutineExit) continue;
+    // A macro nothing uses isn't written out, which says nothing about its nodes.
+    const Routine* owner = node.owner != 0 ? graph_.FindRoutine(node.owner) : nullptr;
+    if (owner && owner->kind == RoutineKind::kMacro && !macros_used.contains(owner->id)) continue;
+    problems_.push_back({node.id, "Never runs: no event's chain leads here", true});
   }
 
   Compiled compiled;
@@ -405,13 +645,23 @@ Compiled Emitter::Finish(std::string_view source) {
   if (!source.empty()) lua += " from " + std::string(source);
   lua += ".\n-- Saving the graph again replaces this file, so change the graph rather than this file.\n";
 
-  if (!graph_.variables().empty() || !state_.empty()) lua += "\n";
+  if (!graph_.variables().empty() || !graph_.dispatchers().empty() || !state_.empty()) lua += "\n";
   for (const Variable& variable : graph_.variables()) {
     const Pin pin = DataPin(variable.name, variable.type);
     lua += "local " + variable.name;
     if (!variable.initial.is_null()) lua += " = " + Literal(pin, variable.initial);
     if (!variable.comment.empty()) {
       std::string comment = variable.comment;
+      std::replace(comment.begin(), comment.end(), '\n', ' ');
+      lua += "  -- " + comment;
+    }
+    lua += "\n";
+  }
+  // Each dispatcher, the events bound to it in the order they were bound.
+  for (const Dispatcher& dispatcher : graph_.dispatchers()) {
+    lua += "local " + dispatcher.name + " = {}";
+    if (!dispatcher.comment.empty()) {
+      std::string comment = dispatcher.comment;
       std::replace(comment.begin(), comment.end(), '\n', ' ');
       lua += "  -- " + comment;
     }

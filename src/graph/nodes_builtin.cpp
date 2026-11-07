@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include <rexfabric/game_api.h>
+
 #include "lua_compiler.h"
 #include "node_library.h"
 
@@ -102,9 +104,17 @@ NodeDesc Pure(std::string id, std::string title, std::string category, std::stri
   return desc;
 }
 
-// A and B into Result, as `(A op B)`.
+// A and B into Result, as `(A op B)`. Searching for the operator finds it.
 NodeDesc Binary(std::string id, std::string title, std::string category, std::string description, PinKind in, PinKind out, std::string op) {
-  return Pure(std::move(id), std::move(title), std::move(category), std::move(description), {DataPin("A", in), DataPin("B", in)}, DataPin("Result", out), [op = std::move(op)](Emitter& emit) { return "(" + emit.Input("A") + " " + op + " " + emit.Input("B") + ")"; });
+  NodeDesc desc = Pure(std::move(id), std::move(title), std::move(category), std::move(description), {DataPin("A", in), DataPin("B", in)}, DataPin("Result", out), [op](Emitter& emit) { return "(" + emit.Input("A") + " " + op + " " + emit.Input("B") + ")"; });
+  desc.keywords = op;
+  return desc;
+}
+
+// A node found by searching for `keywords` as well as its title.
+NodeDesc Keyed(NodeDesc desc, std::string keywords) {
+  desc.keywords = std::move(keywords);
+  return desc;
 }
 
 // Value into Result, as `function(Value)`.
@@ -128,7 +138,7 @@ void AddEvents(Library& library) {
 
   library.Add({.id = "event.start", .title = "On Start", .category = category,
       .description = "Runs once as the scripts load, before the game's first frame. Set things up here: settings, variables. The game can't be called yet.",
-      .role = NodeRole::kEvent, .pins = {{}, {ExecPin(kExecOut)}},
+      .role = NodeRole::kEvent, .delegate = true, .pins = {{}, {ExecPin(kExecOut)}},
       .emit = [](Emitter& emit) {
         emit.Line("do");
         emit.Open();
@@ -139,7 +149,7 @@ void AddEvents(Library& library) {
 
   library.Add({.id = "event.frame", .title = "On Frame", .category = category,
       .description = "Runs every frame, with the seconds since the last one.",
-      .role = NodeRole::kEvent, .pins = {{}, {ExecPin(kExecOut), DataPin("Seconds", PinKind::kFloat)}},
+      .role = NodeRole::kEvent, .delegate = true, .pins = {{}, {ExecPin(kExecOut), DataPin("Seconds", PinKind::kFloat)}},
       .emit = [](Emitter& emit) { EmitListener(emit, "\"frame\"", {emit.Param("Seconds")}); }});
 
   library.Add({.id = "event.hook_before", .title = "Before Function", .category = category,
@@ -187,7 +197,7 @@ void AddEvents(Library& library) {
 
   library.Add({.id = "event.key", .title = "Key Pressed", .category = category,
       .description = "Runs once when the key goes down, while the game window has focus and no menu wants the keyboard.",
-      .role = NodeRole::kEvent, .pins = {{}, {ExecPin(kExecOut)}},
+      .role = NodeRole::kEvent, .delegate = true, .pins = {{}, {ExecPin(kExecOut)}},
       .settings = {{.name = "Key", .kind = SettingKind::kChoice, .initial = "F9", .choices = KeyNames()}},
       .title_of = [](const Node& node) { return Titled(node, "Key ", "Key", " Pressed"); },
       .emit = [](Emitter& emit) {
@@ -208,7 +218,7 @@ void AddEvents(Library& library) {
 
   library.Add({.id = "event.setting_changed", .title = "Setting Changed", .category = category,
       .description = "Runs on the frame after the cvar named Setting changes, with its new value.",
-      .role = NodeRole::kEvent, .pins = {{}, {ExecPin(kExecOut), DataPin("Value", PinKind::kAny)}},
+      .role = NodeRole::kEvent, .delegate = true, .pins = {{}, {ExecPin(kExecOut), DataPin("Value", PinKind::kAny)}},
       .settings = {{.name = "Setting", .kind = SettingKind::kText, .tooltip = "The cvar's name"}},
       .title_of = [](const Node& node) { return Titled(node, "", "Setting", " Changed"); },
       .emit = [](Emitter& emit) {
@@ -220,10 +230,50 @@ void AddEvents(Library& library) {
       }});
 }
 
+// An event that only runs when something runs it: a timer, a dispatcher it's bound to. Its params are a dispatcher's
+// when it picks one, so it can be bound to that dispatcher and get what Call gives.
+void AddCustomEvent(Library& library) {
+  library.Add({.id = "event.custom", .title = "Custom Event", .category = "Events",
+      .description = "Runs when a timer or an event dispatcher runs it. Link its top right pin to Set Timer by Event, or to a dispatcher's Bind Event. With Params From set, it has that dispatcher's params.",
+      .role = NodeRole::kEvent, .delegate = true, .pins = {{}, {ExecPin(kExecOut)}},
+      .settings = {{.name = "Name", .kind = SettingKind::kText, .initial = "CustomEvent", .tooltip = "What the event is called on the canvas"},
+                   {.name = "Params From", .kind = SettingKind::kDispatcher, .tooltip = "A dispatcher whose params the event takes, to be bound to it", .optional = true}},
+      .shape = [](const Node& node, const Graph& graph, NodePins& pins) {
+        if (const Dispatcher* dispatcher = graph.FindDispatcher(SettingOf(node, "Params From"))) {
+          for (const Param& param : dispatcher->params) pins.outputs.push_back(DataPin(param.name, param.type));
+        }
+      },
+      .title_of = [](const Node& node) { return Titled(node, "", "Name"); },
+      // Nothing registers it: its chain is its delegate function, which the compiler writes when it's taken.
+      .emit = [](Emitter& emit) {
+        if (!emit.Linked(kDelegatePin)) emit.Warn("Nothing runs this event: link its top right pin to Set Timer by Event or a dispatcher's Bind Event");
+      }});
+}
+
 // Flow -------------------------------------------------------------------------------------------------
 
 void AddFlow(Library& library) {
   const std::string category = "Flow";
+
+  // Placed by double clicking a link rather than from the add menu, so it has no category.
+  Pin reroute_in{.name = std::string(kRerouteIn), .type = {PinKind::kAny}, .wildcard = true};
+  Pin reroute_out{.name = std::string(kRerouteOut), .type = {PinKind::kAny}, .wildcard = true};
+  library.Add({.id = std::string(kReroute), .title = "Reroute", .category = {},
+      .description = "A point a link passes through, to lead it around things. Double click a link to add one.",
+      .pins = {{reroute_in}, {reroute_out}},
+      .shape = [](const Node& node, const Graph& graph, NodePins& pins) {
+        // Wildcards until something links to it; then both pins are the type of what passes through.
+        const bool linked = graph.HasLinkAt({node.id, std::string(kRerouteIn)}, false) || graph.HasLinkAt({node.id, std::string(kRerouteOut)}, true);
+        if (!linked) return;
+        const PinType type = RerouteType(graph, node);
+        for (Pin* pin : {&pins.inputs.front(), &pins.outputs.front()}) {
+          pin->type = type;
+          pin->wildcard = false;
+        }
+      },
+      .emit = [](Emitter& emit) { emit.Chain(kRerouteOut); },
+      .expression = [](Emitter& emit, std::string_view) { return emit.Input(kRerouteIn); },
+      .role_of = [](const Node& node, const Graph& graph) { return RerouteType(graph, node).kind == PinKind::kExec ? NodeRole::kAction : NodeRole::kPure; }});
 
   library.Add({.id = "flow.branch", .title = "Branch", .category = category,
       .description = "Goes on through True or False.",
@@ -401,14 +451,63 @@ std::string VariableName(Emitter& emit) {
 void AddVariables(Library& library) {
   const std::string category = "Variables";
   const SettingDesc variable{.name = "Variable", .kind = SettingKind::kVariable};
+  SettingDesc boolean = variable;
+  boolean.kinds = {PinKind::kBool};
+  SettingDesc number = variable;
+  number.kinds = {PinKind::kInt, PinKind::kFloat};
 
+  // A Get is just the variable's name and its value, on one row.
   library.Add({.id = "var.get", .title = "Get", .category = category,
       .description = "A variable's value. Variables keep their values between events.",
-      .role = NodeRole::kPure, .pins = {{}, {DataPin("Value", PinKind::kAny)}},
+      .role = NodeRole::kPure, .compact = true, .pins = {{}, {DataPin("Value", PinKind::kAny)}},
       .settings = {variable},
       .shape = [](const Node& node, const Graph& graph, NodePins& pins) { Retype(pins.outputs, "Value", VariableKind(node, graph)); },
-      .title_of = [](const Node& node) { return Titled(node, "Get ", "Variable"); },
+      .title_of = [](const Node& node) { return Titled(node, "", "Variable"); },
       .expression = [](Emitter& emit, std::string_view) { return VariableName(emit); }});
+
+  // A Bool variable as its own branch: a Get and a Branch in one node.
+  library.Add({.id = "var.branch", .title = "If", .category = category,
+      .description = "Goes on through True or False, as the Bool variable is.",
+      .pins = {{ExecPin()}, {ExecPin("True"), ExecPin("False")}},
+      .settings = {boolean},
+      .title_of = [](const Node& node) { return Titled(node, "If ", "Variable"); },
+      .emit = [](Emitter& emit) {
+        const std::string name = VariableName(emit);
+        const Variable* variable = emit.graph().FindVariable(emit.Setting("Variable"));
+        if (variable && variable->type != PinKind::kBool) emit.Error(variable->name + " isn't a Bool");
+        emit.Line("if " + name + " then");
+        emit.Indent();
+        emit.Chain("True");
+        emit.Dedent();
+        if (emit.Linked("False")) {
+          emit.Line("else");
+          emit.Indent();
+          emit.Chain("False");
+          emit.Dedent();
+        }
+        emit.Line("end");
+      }});
+
+  // Count = Count + 1, as `Count++` would be.
+  const auto step = [&](std::string id, std::string title, std::string keywords, std::string op) {
+    library.Add({.id = std::move(id), .title = title, .category = category,
+        .description = title + "s a number variable by 1 and gives its new value.",
+        .keywords = std::move(keywords),
+        .pins = {{ExecPin()}, {ExecPin(kExecOut), DataPin("Value", PinKind::kNumber)}},
+        .settings = {number},
+        .shape = [](const Node& node, const Graph& graph, NodePins& pins) { Retype(pins.outputs, "Value", VariableKind(node, graph)); },
+        .title_of = [title](const Node& node) { return Titled(node, title + " ", "Variable"); },
+        .emit = [op](Emitter& emit) {
+          const std::string name = VariableName(emit);
+          if (name == "nil") return;
+          const Variable* variable = emit.graph().FindVariable(name);
+          if (variable->type != PinKind::kInt && variable->type != PinKind::kFloat) emit.Error(name + " isn't a number");
+          emit.Line(name + " = " + name + " " + op + " 1");
+          if (emit.Linked("Value")) emit.Line(emit.Output("Value") + " = " + name);
+        }});
+  };
+  step("var.increment", "Increment", "++ +=", "+");
+  step("var.decrement", "Decrement", "-- -=", "-");
 
   library.Add({.id = "var.set", .title = "Set", .category = category,
       .description = "Gives a variable a new value.",
@@ -419,6 +518,360 @@ void AddVariables(Library& library) {
       .emit = [](Emitter& emit) {
         const std::string name = VariableName(emit);
         if (name != "nil") emit.Line(name + " = " + emit.Input("Value"));
+      }});
+}
+
+// Functions and macros ---------------------------------------------------------------------------------
+
+Pin ParamPin(const Param& param) { return param.type == PinKind::kExec ? ExecPin(param.name) : DataPin(param.name, param.type); }
+
+// The routine's name, kept on its nodes (entry, calls) for their titles.
+std::string RoutineName(const Node& node, std::string_view fallback) {
+  const std::string name = SettingOf(node, kRoutineNameSetting);
+  return name.empty() ? std::string(fallback) : name;
+}
+
+// A function with exec pins, or a macro with an exec input, is reached by a chain; the rest are worked out where read.
+NodeRole CallRole(const Node& node, const Graph& graph) {
+  const Routine* routine = RoutineOf(node, graph);
+  if (!routine) return NodeRole::kAction;
+  if (routine->kind == RoutineKind::kFunction) return routine->pure ? NodeRole::kPure : NodeRole::kAction;
+  const bool exec = std::any_of(routine->inputs.begin(), routine->inputs.end(), [](const Param& param) { return param.type == PinKind::kExec; });
+  return exec ? NodeRole::kAction : NodeRole::kPure;
+}
+
+// `name(args)` for a call to a function.
+std::string FunctionCall(Emitter& emit, const Routine& routine) {
+  std::vector<std::string> args;
+  for (const Param& param : routine.inputs) args.push_back(emit.Input(param.name));
+  return routine.name + "(" + Joined(args) + ")";
+}
+
+// The routine nodes are drawn and added by the editor and the compiler knows them; the add menu doesn't list them.
+void AddRoutines(Library& library) {
+  library.Add({.id = std::string(kRoutineEntry), .title = "Inputs", .category = {},
+      .description = "Where the function or macro starts: its inputs, given by whoever uses it.",
+      .role = NodeRole::kEvent,
+      .shape = [](const Node& node, const Graph& graph, NodePins& pins) {
+        const Routine* routine = RoutineOf(node, graph);
+        if (!routine) return;
+        if (routine->kind == RoutineKind::kFunction && !routine->pure) pins.outputs.push_back(ExecPin(kExecOut));
+        for (const Param& param : routine->inputs) pins.outputs.push_back(ParamPin(param));
+      },
+      .title_of = [](const Node& node) { return RoutineName(node, "Inputs"); }});
+
+  library.Add({.id = std::string(kRoutineExit), .title = "Outputs", .category = {},
+      .description = "Where the function or macro ends: its outputs, given back to whoever used it.",
+      .shape = [](const Node& node, const Graph& graph, NodePins& pins) {
+        const Routine* routine = RoutineOf(node, graph);
+        if (!routine) return;
+        if (routine->kind == RoutineKind::kFunction && !routine->pure) pins.inputs.push_back(ExecPin());
+        for (const Param& param : routine->outputs) pins.inputs.push_back(ParamPin(param));
+      },
+      // A function's: return its outputs. A macro's is followed by the compiler into the graph using it.
+      .emit = [](Emitter& emit) {
+        const Routine* routine = RoutineOf(emit.node(), emit.graph());
+        if (!routine) return;
+        std::vector<std::string> values;
+        for (const Param& param : routine->outputs) values.push_back(emit.Input(param.name));
+        emit.Line(values.empty() ? std::string("do return end") : "do return " + Joined(values) + " end");
+      }});
+
+  library.Add({.id = std::string(kRoutineCall), .title = "Call", .category = {},
+      .description = "Runs a function or macro of the graph's own.",
+      .shape = [](const Node& node, const Graph& graph, NodePins& pins) {
+        const Routine* routine = RoutineOf(node, graph);
+        if (!routine) return;
+        const bool exec = routine->kind == RoutineKind::kFunction && !routine->pure;
+        if (exec) pins.inputs.push_back(ExecPin());
+        for (const Param& param : routine->inputs) pins.inputs.push_back(ParamPin(param));
+        if (exec) pins.outputs.push_back(ExecPin(kExecOut));
+        for (const Param& param : routine->outputs) pins.outputs.push_back(ParamPin(param));
+      },
+      .title_of = [](const Node& node) { return RoutineName(node, "Call"); },
+      // A function's call; a macro's is written out in full by the compiler instead.
+      .emit = [](Emitter& emit) {
+        const Routine* routine = RoutineOf(emit.node(), emit.graph());
+        if (!routine) {
+          emit.Error("Calls a function the graph doesn't have any more");
+          return;
+        }
+        const std::string call = FunctionCall(emit, *routine);
+        const bool used = std::any_of(routine->outputs.begin(), routine->outputs.end(), [&](const Param& param) { return emit.Linked(param.name); });
+        if (!used) {
+          emit.Line(call);
+          return;
+        }
+        std::vector<std::string> results;
+        for (const Param& param : routine->outputs) results.push_back(emit.Output(param.name));
+        emit.Line(Joined(results) + " = " + call);
+      },
+      .expression = [](Emitter& emit, std::string_view output) -> std::string {
+        const Routine* routine = RoutineOf(emit.node(), emit.graph());
+        if (!routine) {
+          emit.Error("Calls a function the graph doesn't have any more");
+          return "nil";
+        }
+        const std::string call = FunctionCall(emit, *routine);
+        if (routine->outputs.size() <= 1) return call;
+        const auto found = std::find_if(routine->outputs.begin(), routine->outputs.end(), [&](const Param& param) { return param.name == output; });
+        return "(select(" + std::to_string(found - routine->outputs.begin() + 1) + ", " + call + "))";
+      },
+      .role_of = CallRole});
+}
+
+// Switch and Select ------------------------------------------------------------------------------------
+
+// What a Switch or Select picks by: an Int, a String, a Bool (Select only), or one of the game's enums by its full name.
+std::vector<std::string> PickChoices(bool with_bool) {
+  std::vector<std::string> choices = {"Int", "String"};
+  if (with_bool) choices.push_back("Bool");
+  for (const std::string& name : EnumNames()) choices.push_back(name);
+  return choices;
+}
+
+// A node picking by an Int or a String has entries added in the details panel; by a Bool or an enum, its own.
+bool PicksByList(const Node& node, std::string_view setting) {
+  const std::string by = SettingOf(node, setting);
+  return by == "Int" || by == "String";
+}
+
+// The values a Switch's cases or a Select's options are, in order: the list's, a Bool's, an enum's.
+std::vector<std::string> PickValues(const Node& node, std::string_view by_setting, std::string_view list_setting) {
+  const std::string by = SettingOf(node, by_setting);
+  if (by == "Bool") return {"False", "True"};
+  if (const EnumDef* enumeration = FindEnum(by)) {
+    std::vector<std::string> values;
+    for (const auto& [name, number] : enumeration->values) values.push_back(name);
+    return values;
+  }
+  return ListOf(node, list_setting);
+}
+
+// A case's or an option's value as Lua: 3, "Hello", true, tip.Species.Whirlm.
+std::string PickKey(Emitter& emit, std::string_view by, const std::string& value) {
+  if (by == "String") return LuaQuote(value);
+  if (by == "Bool") return value == "True" ? "true" : "false";
+  if (FindEnum(by)) return LuaPath(by) + LuaMember(value);
+  std::string literal;
+  if (IntegerText(value, literal)) return literal;
+  emit.Error(value + " isn't a whole number, so it can't be a case of an Int");
+  return "nil";
+}
+
+PinKind PickKind(std::string_view by) { return by == "String" ? PinKind::kString : by == "Bool" ? PinKind::kBool : PinKind::kInt; }
+
+// The type a Select gives: what comes into its options, or else what its value goes to; Any until it's linked.
+PinType SelectType(const Node& node, const Graph& graph) {
+  // A Select linked to another Select asks it in turn, which could ask back; a few steps are plenty.
+  static thread_local int depth = 0;
+  if (depth > 8) return {PinKind::kAny};
+  ++depth;
+  PinType type{PinKind::kAny};
+  for (const std::string& option : PickValues(node, "Index", "Options")) {
+    if (const Link* link = graph.LinkInto({node.id, option})) {
+      type = OutputType(graph, link->from);
+      if (type.kind != PinKind::kAny) break;
+    }
+  }
+  if (type.kind == PinKind::kAny) {
+    for (const Link* link : graph.LinksOutOf({node.id, "Return Value"})) {
+      const Node* target = graph.FindNode(link->to.node);
+      const NodePins pins = target ? PinsOf(*target, graph) : NodePins{};
+      if (const Pin* pin = FindPin(pins.inputs, link->to.pin); pin && pin->type.kind != PinKind::kAny) {
+        type = pin->type;
+        break;
+      }
+    }
+  }
+  --depth;
+  return type;
+}
+
+void AddPicks(Library& library) {
+  // As Unreal's Switch on Int, Switch on String and Switch on an enum.
+  library.Add({.id = "flow.switch", .title = "Switch", .category = "Flow",
+      .description = "Goes on through the case Selection matches, or Default when it matches none. On an Int or a String, add cases in the details panel; on an enum, its values are the cases.",
+      .keywords = "case select branch on",
+      .pins = {{ExecPin()}, {}},
+      .settings = {{.name = "On", .kind = SettingKind::kChoice, .initial = "Int", .choices = PickChoices(false), .tooltip = "What Selection is: an Int, a String or one of the game's enums"},
+                   {.name = "Cases", .kind = SettingKind::kList, .initial = "0\n1", .item = "Case", .shown = [](const Node& node) { return PicksByList(node, "On"); }}},
+      .shape = [](const Node& node, const Graph&, NodePins& pins) {
+        pins.inputs.push_back(DataPin("Selection", PickKind(SettingOf(node, "On"))));
+        for (const std::string& value : PickValues(node, "On", "Cases")) pins.outputs.push_back(ExecPin(value));
+        pins.outputs.push_back(ExecPin("Default"));
+      },
+      .title_of = [](const Node& node) { return Titled(node, "Switch On ", "On"); },
+      .emit = [](Emitter& emit) {
+        const std::string by = emit.Setting("On");
+        const std::vector<std::string> cases = PickValues(emit.node(), "On", "Cases");
+        if (cases.empty()) {
+          emit.Chain("Default");
+          return;
+        }
+        // Worked out once, then compared with each case in turn.
+        const std::string selection = emit.Output("Selection");
+        emit.Line(selection + " = " + emit.Input("Selection"));
+        for (size_t i = 0; i < cases.size(); ++i) {
+          emit.Line((i == 0 ? "if " : "elseif ") + selection + " == " + PickKey(emit, by, cases[i]) + " then");
+          emit.Indent();
+          emit.Chain(cases[i]);
+          emit.Dedent();
+        }
+        if (emit.Linked("Default")) {
+          emit.Line("else");
+          emit.Indent();
+          emit.Chain("Default");
+          emit.Dedent();
+        }
+        emit.Line("end");
+      }});
+
+  // As Unreal's Select: the option Index picks, every option worked out, each of the type it's linked to.
+  library.Add({.id = "logic.select", .title = "Select", .category = "Logic",
+      .description = "The option Index picks, or nil when it picks none. On an Int or a String, add options in the details panel; on a Bool or an enum, its values are the options. The options take the type of what's linked to them or to the result.",
+      .keywords = "pick choose ternary option",
+      .role = NodeRole::kPure, .pins = {{}, {DataPin("Return Value", PinKind::kAny)}},
+      .settings = {{.name = "Index", .kind = SettingKind::kChoice, .initial = "Int", .choices = PickChoices(true), .tooltip = "What Index is: an Int, a String, a Bool or one of the game's enums"},
+                   {.name = "Options", .kind = SettingKind::kList, .initial = "0\n1", .item = "Option", .shown = [](const Node& node) { return PicksByList(node, "Index"); }}},
+      .shape = [](const Node& node, const Graph& graph, NodePins& pins) {
+        pins.inputs.push_back(DataPin("Index", PickKind(SettingOf(node, "Index"))));
+        const PinType type = SelectType(node, graph);
+        for (const std::string& option : PickValues(node, "Index", "Options")) {
+          Pin pin = DataPin(option, type.kind);
+          pin.type = type;
+          pins.inputs.push_back(std::move(pin));
+        }
+        pins.outputs.front().type = type;
+      },
+      .expression = [](Emitter& emit, std::string_view) -> std::string {
+        const std::string by = emit.Setting("Index");
+        std::vector<std::string> entries;
+        for (const std::string& option : PickValues(emit.node(), "Index", "Options")) entries.push_back("[" + PickKey(emit, by, option) + "] = " + emit.Input(option));
+        return "({" + Joined(entries) + "})[" + emit.Input("Index") + "]";
+      }});
+}
+
+// Time: delays and timers -------------------------------------------------------------------------------
+
+void AddTimers(Library& library) {
+  const std::string category = "Time";
+
+  // As Unreal's Delay: running it again while it waits does nothing.
+  library.Add({.id = "time.delay", .title = "Delay", .category = category,
+      .description = "Goes on through Completed once Duration seconds have passed. Reached again while it waits, it does nothing.",
+      .keywords = "wait sleep later",
+      .pins = {{ExecPin(), DataPin("Duration", PinKind::kFloat, 1.0)}, {ExecPin("Completed")}},
+      .emit = [](Emitter& emit) {
+        const std::string waiting = emit.State("Waiting", "false");
+        emit.Line("if not " + waiting + " then");
+        emit.Indent();
+        emit.Line(waiting + " = true");
+        emit.Line("rex.after(" + emit.Input("Duration") + ", function()");
+        emit.Indent();
+        emit.Line(waiting + " = false");
+        emit.Chain("Completed");
+        emit.Dedent();
+        emit.Line("end)");
+        emit.Dedent();
+        emit.Line("end");
+      }});
+
+  library.Add({.id = "time.set_timer", .title = "Set Timer by Event", .category = category,
+      .description = "Runs the event linked to Event once Time seconds have passed, or every Time seconds when Looping. Handle stops it with Clear Timer.",
+      .keywords = "timer every repeat interval",
+      .pins = {{ExecPin(), DelegatePin(), DataPin("Time", PinKind::kFloat, 1.0), DataPin("Looping", PinKind::kBool, false)}, {ExecPin(kExecOut), DataPin("Handle", PinKind::kInt)}},
+      .emit = [](Emitter& emit) {
+        const std::string event = emit.Input(kDelegatePin);
+        const std::string time = emit.Input("Time");
+        // A Looping typed in picks the function; one that's linked picks it as the script runs.
+        const std::string looping = emit.Input("Looping");
+        const std::string start = looping == "true" ? "rex.every" : looping == "false" ? "rex.after" : "(" + looping + " and rex.every or rex.after)";
+        const std::string call = start + "(" + time + ", " + event + ")";
+        emit.Line(emit.Linked("Handle") ? emit.Output("Handle") + " = " + call : call);
+      }});
+
+  library.Add({.id = "time.clear_timer", .title = "Clear Timer", .category = category,
+      .description = "Stops a timer Set Timer by Event started. One that already ran is fine.",
+      .keywords = "stop cancel",
+      .pins = {{ExecPin(), DataPin("Handle", PinKind::kInt)}, {ExecPin(kExecOut)}},
+      .emit = [](Emitter& emit) { emit.Line("rex.cancel(" + emit.Input("Handle") + ")"); }});
+}
+
+// Event dispatchers ---------------------------------------------------------------------------------------
+
+// The dispatcher's table, or an error when the graph has no such dispatcher.
+std::string DispatcherName(Emitter& emit) {
+  const std::string name = emit.Setting("Dispatcher");
+  if (!emit.graph().FindDispatcher(name)) {
+    emit.Error(name.empty() ? "Pick an event dispatcher" : "There's no event dispatcher named " + name);
+    return {};
+  }
+  return name;
+}
+
+constexpr std::string_view kBindHelper = "local function rf_bind(list, run)\n  for _, bound in ipairs(list) do if bound == run then return end end\n  list[#list + 1] = run\nend";
+constexpr std::string_view kUnbindHelper = "local function rf_unbind(list, run)\n  for i, bound in ipairs(list) do if bound == run then table.remove(list, i) return end end\nend";
+
+void AddDispatchers(Library& library) {
+  const std::string category = "Event Dispatchers";
+  const SettingDesc dispatcher{.name = "Dispatcher", .kind = SettingKind::kDispatcher};
+
+  library.Add({.id = "dispatch.call", .title = "Call", .category = category,
+      .description = "Runs every event bound to the dispatcher, in the order they were bound, with these params.",
+      .keywords = "broadcast fire dispatch",
+      .pins = {{ExecPin()}, {ExecPin(kExecOut)}},
+      .settings = {dispatcher},
+      .shape = [](const Node& node, const Graph& graph, NodePins& pins) {
+        if (const Dispatcher* found = graph.FindDispatcher(SettingOf(node, "Dispatcher"))) {
+          for (const Param& param : found->params) pins.inputs.push_back(DataPin(param.name, param.type));
+        }
+      },
+      .title_of = [](const Node& node) { return Titled(node, "Call ", "Dispatcher"); },
+      .emit = [](Emitter& emit) {
+        const std::string name = DispatcherName(emit);
+        if (name.empty()) return;
+        std::vector<std::string> args;
+        for (const Param& param : emit.graph().FindDispatcher(name)->params) args.push_back(emit.Input(param.name));
+        // Over a copy, so an event unbinding itself as it runs doesn't make the next one skipped.
+        emit.Line("for _, run in ipairs({table.unpack(" + name + ")}) do run(" + Joined(args) + ") end");
+      }});
+
+  library.Add({.id = "dispatch.bind", .title = "Bind Event to", .category = category,
+      .description = "Binds the event linked to Event to the dispatcher, so Call runs it. Bound already, it stays bound once.",
+      .keywords = "subscribe listen add",
+      .pins = {{ExecPin(), DelegatePin()}, {ExecPin(kExecOut)}},
+      .settings = {dispatcher},
+      .title_of = [](const Node& node) { return Titled(node, "Bind Event To ", "Dispatcher"); },
+      .emit = [](Emitter& emit) {
+        const std::string name = DispatcherName(emit);
+        if (name.empty()) return;
+        emit.Helper("rf_bind", kBindHelper);
+        emit.Line("rf_bind(" + name + ", " + emit.Input(kDelegatePin) + ")");
+      }});
+
+  library.Add({.id = "dispatch.unbind", .title = "Unbind Event from", .category = category,
+      .description = "Unbinds the event linked to Event from the dispatcher.",
+      .keywords = "unsubscribe remove",
+      .pins = {{ExecPin(), DelegatePin()}, {ExecPin(kExecOut)}},
+      .settings = {dispatcher},
+      .title_of = [](const Node& node) { return Titled(node, "Unbind Event From ", "Dispatcher"); },
+      .emit = [](Emitter& emit) {
+        const std::string name = DispatcherName(emit);
+        if (name.empty()) return;
+        emit.Helper("rf_unbind", kUnbindHelper);
+        emit.Line("rf_unbind(" + name + ", " + emit.Input(kDelegatePin) + ")");
+      }});
+
+  library.Add({.id = "dispatch.unbind_all", .title = "Unbind All from", .category = category,
+      .description = "Unbinds every event from the dispatcher.",
+      .keywords = "clear",
+      .pins = {{ExecPin()}, {ExecPin(kExecOut)}},
+      .settings = {dispatcher},
+      .title_of = [](const Node& node) { return Titled(node, "Unbind All From ", "Dispatcher"); },
+      .emit = [](Emitter& emit) {
+        const std::string name = DispatcherName(emit);
+        if (!name.empty()) emit.Line(name + " = {}");
       }});
 }
 
@@ -441,6 +894,8 @@ void AddMath(Library& library) {
   library.Add(Pure("math.clamp", "Clamp", math, "Value kept between Min and Max.", {DataPin("Value", number), DataPin("Min", number), DataPin("Max", number, "1")}, DataPin("Result", number), [](Emitter& emit) { return "math.max(" + emit.Input("Min") + ", math.min(" + emit.Input("Max") + ", " + emit.Input("Value") + "))"; }));
   library.Add(Pure("math.lerp", "Lerp", math, "From A at Alpha 0 to B at Alpha 1.", {DataPin("A", real), DataPin("B", real, 1.0), DataPin("Alpha", real, 0.5)}, DataPin("Result", real), [](Emitter& emit) { const std::string a = emit.Input("A"); return "(" + a + " + (" + emit.Input("B") + " - " + a + ") * " + emit.Input("Alpha") + ")"; }));
   library.Add(Unary("math.negate", "Negate", math, "-Value.", number, number, "-"));
+  library.Add(Keyed(Pure("math.increment", "Increment", math, "Value + 1.", {DataPin("Value", number)}, DataPin("Result", number), [](Emitter& emit) { return "(" + emit.Input("Value") + " + 1)"; }), "++ +1"));
+  library.Add(Keyed(Pure("math.decrement", "Decrement", math, "Value - 1.", {DataPin("Value", number)}, DataPin("Result", number), [](Emitter& emit) { return "(" + emit.Input("Value") + " - 1)"; }), "-- -1"));
   library.Add(Unary("math.abs", "Abs", math, "Value without its sign.", number, number, "math.abs"));
   library.Add(Unary("math.floor", "Floor", math, "Value rounded down to an integer.", number, integer, "math.floor"));
   library.Add(Unary("math.ceil", "Ceil", math, "Value rounded up to an integer.", number, integer, "math.ceil"));
@@ -458,7 +913,7 @@ void AddMath(Library& library) {
   library.Add(Binary("bits.xor", "Bitwise Xor", bits, "The bits set in A or B but not both.", integer, integer, "~"));
   library.Add(Binary("bits.left", "Shift Left", bits, "A's bits moved B places up.", integer, integer, "<<"));
   library.Add(Binary("bits.right", "Shift Right", bits, "A's bits moved B places down.", integer, integer, ">>"));
-  library.Add(Unary("bits.not", "Bitwise Not", bits, "Every bit of Value flipped.", integer, integer, "~"));
+  library.Add(Keyed(Unary("bits.not", "Bitwise Not", bits, "Every bit of Value flipped.", integer, integer, "~"), "~"));
 }
 
 void AddLogic(Library& library) {
@@ -468,7 +923,7 @@ void AddLogic(Library& library) {
 
   library.Add(Binary("logic.and", "And", logic, "True when A and B both are.", boolean, boolean, "and"));
   library.Add(Binary("logic.or", "Or", logic, "True when A or B is.", boolean, boolean, "or"));
-  library.Add(Pure("logic.not", "Not", logic, "True when Value is false.", {DataPin("Value", boolean)}, DataPin("Result", boolean), [](Emitter& emit) { return "(not " + emit.Input("Value") + ")"; }));
+  library.Add(Keyed(Pure("logic.not", "Not", logic, "True when Value is false.", {DataPin("Value", boolean)}, DataPin("Result", boolean), [](Emitter& emit) { return "(not " + emit.Input("Value") + ")"; }), "! ~"));
   library.Add(Binary("logic.equal", "Equal", logic, "True when A and B are the same.", PinKind::kAny, boolean, "=="));
   library.Add(Binary("logic.not_equal", "Not Equal", logic, "True when A and B differ.", PinKind::kAny, boolean, "~="));
   library.Add(Binary("logic.less", "Less", logic, "A < B.", number, boolean, "<"));
@@ -482,7 +937,7 @@ void AddText(Library& library) {
   const std::string text = "Text";
   const PinKind string = PinKind::kString;
 
-  library.Add(Pure("text.join", "Join", text, "A followed by B, each turned into text.", {DataPin("A", PinKind::kAny), DataPin("B", PinKind::kAny)}, DataPin("Result", string), [](Emitter& emit) { return "(tostring(" + emit.Input("A") + ") .. tostring(" + emit.Input("B") + "))"; }));
+  library.Add(Keyed(Pure("text.join", "Join", text, "A followed by B, each turned into text.", {DataPin("A", PinKind::kAny), DataPin("B", PinKind::kAny)}, DataPin("Result", string), [](Emitter& emit) { return "(tostring(" + emit.Input("A") + ") .. tostring(" + emit.Input("B") + "))"; }), ".. concat"));
   library.Add(Unary("text.to_text", "To Text", text, "Any value as text.", PinKind::kAny, string, "tostring"));
   library.Add(Pure("text.hex", "Hex", text, "An integer as eight hex digits, like 82558D28.", {DataPin("Value", PinKind::kInt)}, DataPin("Result", string), [](Emitter& emit) { return "string.format(\"%08X\", " + emit.Input("Value") + ")"; }));
   library.Add(Pure("text.length", "Length", text, "How many bytes the text has.", {DataPin("Text", string)}, DataPin("Result", PinKind::kInt), [](Emitter& emit) { return "#" + emit.Input("Text"); }));
@@ -504,6 +959,37 @@ void AddHost(Library& library) {
         const auto typed = emit.node().values.find("Value");
         const bool value = emit.Linked("Value") || (typed != emit.node().values.end() && typed->second.is_string() && !typed->second.get<std::string>().empty());
         emit.Line("rex." + emit.Setting("Level") + "(" + emit.Input("Message") + (value ? ", " + emit.Input("Value") : std::string()) + ")");
+      }});
+
+  // As Unreal's Print String: text on the screen for a while, for debugging, and in the log.
+  const std::vector<std::pair<std::string, std::string>> colors = {{"Cyan", "0x00A8FF"}, {"White", "0xFFFFFF"}, {"Yellow", "0xFFD84A"}, {"Orange", "0xFF9A3C"}, {"Red", "0xFF5A50"}, {"Green", "0x5CFF6E"}, {"Pink", "0xFF6EC7"}};
+  SettingDesc color{.name = "Color", .kind = SettingKind::kChoice, .initial = "Cyan", .tooltip = "The text's color on the screen"};
+  for (const auto& [name, hex] : colors) color.choices.push_back(name);
+  library.Add({.id = "log.print_string", .title = "Print String", .category = "Log",
+      .description = "Shows In String in the screen's top right corner for Duration seconds, newest at the top, and writes it to the log. For debugging.",
+      .keywords = "debug screen text message print",
+      .pins = {{ExecPin(), DataPin("In String", PinKind::kAny, "Hello"), DataPin("Duration", PinKind::kFloat, 2.0), DataPin("Print to Screen", PinKind::kBool, true), DataPin("Print to Log", PinKind::kBool, true)}, {ExecPin(kExecOut)}},
+      .settings = {color},
+      .emit = [colors](Emitter& emit) {
+        const std::string screen = emit.Input("Print to Screen");
+        const std::string log = emit.Input("Print to Log");
+        if (screen == "false" && log == "false") return;
+        std::string text = "tostring(" + emit.Input("In String") + ")";
+        // Worked out once when it goes to both.
+        if (screen != "false" && log != "false") {
+          const std::string local = emit.Output("Text");
+          emit.Line(local + " = " + text);
+          text = local;
+        }
+        const auto found = std::find_if(colors.begin(), colors.end(), [&](const auto& entry) { return entry.first == emit.Setting("Color"); });
+        const std::string hex = found != colors.end() ? found->second : colors.front().second;
+        // A flag typed in decides now; one that's linked, as the script runs.
+        const auto write = [&emit](const std::string& when, const std::string& line) {
+          if (when == "true") emit.Line(line);
+          else if (when != "false") emit.Line("if " + when + " then " + line + " end");
+        };
+        write(screen, "rex.screen_text(" + text + ", " + emit.Input("Duration") + ", " + hex + ")");
+        write(log, "rex.info(" + text + ")");
       }});
 
   library.Add(Pure("time.now", "Now", "Time", "A clock in seconds, for timing things.", {}, DataPin("Seconds", PinKind::kFloat), [](Emitter&) { return std::string("rex.now()"); }));
@@ -594,10 +1080,15 @@ void AddHost(Library& library) {
 
 void AddBuiltinNodes(Library& library) {
   AddEvents(library);
+  AddCustomEvent(library);
   AddFlow(library);
   AddGuest(library);
   AddMemory(library);
   AddVariables(library);
+  AddRoutines(library);
+  AddPicks(library);
+  AddTimers(library);
+  AddDispatchers(library);
   AddMath(library);
   AddLogic(library);
   AddText(library);

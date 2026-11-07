@@ -124,9 +124,9 @@ function(rexfabric_attach target)
   set(dir ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
   set(sources
     src/api.cpp src/events.cpp src/game_api.cpp src/guest_hooks.cpp src/hooks.cpp src/host_input.cpp src/library.cpp src/midasm.cpp src/mods.cpp src/native_loader.cpp src/platform.cpp src/rexfabric.cpp src/switches.cpp
-    src/lua/lua_game.cpp src/lua/lua_host.cpp src/lua/lua_rex.cpp src/lua/lua_vm.cpp
+    src/lua/lua_game.cpp src/lua/lua_host.cpp src/lua/lua_rex.cpp src/lua/lua_timers.cpp src/lua/lua_vm.cpp
     src/net/http.cpp src/net/thunderstore.cpp
-    src/ui/imgui_menu.cpp src/ui/menu_model.cpp
+    src/ui/imgui_menu.cpp src/ui/menu_model.cpp src/ui/screen_text.cpp
   )
   if(arg_WITH_GUIDE)
     list(APPEND sources src/ui/guide_menu.cpp)

@@ -63,18 +63,19 @@ void NodeGraphStyle::Apply() {
   style.Colors[ed::StyleColor_FlowMarker] = ImVec4(1.0f, 1.0f, 1.0f, 0.6f);
 }
 
-void NodeGraphStyle::DrawBackdrop() {
+void NodeGraphStyle::DrawBackdrop(const ImVec2& min, const ImVec2& max, float rounding) {
   delta_ = ImGui::GetIO().DeltaTime;
   time_ += delta_;
   appearing_ = 0;
 
-  const ImVec2 min = ImGui::GetCursorScreenPos();
-  const ImVec2 size = ImGui::GetContentRegionAvail();
-  const ImVec2 max(min.x + size.x, min.y + size.y);
+  // Over the window's padding as well as its content.
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+  draw->PushClipRect(min, max, false);
 #if REXFABRIC_WITH_GLASS
-  // Under glass nodes, Toon's drifting colored light, for the glass to show.
+  // Under glass nodes and panels, Toon's drifting colored light, for the glass to show.
   if (glass::Enabled()) {
-    rexglass::DrawAurora(ImGui::GetWindowDrawList(), min, max, time_);
+    rexglass::DrawAurora(draw, min, max, time_, 1.0f, rounding, ImDrawFlags_RoundCornersBottom);
+    draw->PopClipRect();
     aurora_min_ = min;
     aurora_max_ = max;
     return;
@@ -87,7 +88,11 @@ void NodeGraphStyle::DrawBackdrop() {
   const ImVec4 blue(0.07f, 0.11f, 0.20f, 1.0f);
   const ImVec4 violet(0.13f, 0.08f, 0.19f, 1.0f);
   const auto corner = [&](float offset) { return ImGui::ColorConvertFloat4ToU32(Mix(deep, Mix(blue, violet, 0.5f + 0.5f * std::sin(phase + offset)), 0.75f)); };
-  ImGui::GetWindowDrawList()->AddRectFilledMultiColor(min, max, corner(0.0f), corner(1.6f), corner(3.1f), corner(4.7f));
+  // ImGui rounds solid fills only, so the window's rounded corners get the deep color and the drift runs above them.
+  const ImVec2 drift_max(max.x, std::max(min.y, max.y - rounding));
+  draw->AddRectFilled(min, max, ImGui::ColorConvertFloat4ToU32(deep), rounding, ImDrawFlags_RoundCornersBottom);
+  draw->AddRectFilledMultiColor(min, drift_max, corner(0.0f), corner(1.6f), corner(3.1f), corner(4.7f));
+  draw->PopClipRect();
 }
 
 void NodeGraphStyle::BeginNode(int node) {

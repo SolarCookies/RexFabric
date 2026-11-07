@@ -16,6 +16,7 @@
 #include "native_loader.h"
 #include "ui/imgui_menu.h"
 #include "ui/menu_model.h"
+#include "ui/screen_text.h"
 #if REXFABRIC_WITH_GUIDE
 #include "ui/guide_menu.h"
 #endif
@@ -189,6 +190,7 @@ void CreateMenus(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* images)
   State& state = Get();
   if (state.menu) return;
   state.drawer = drawer;
+  ui::SetScreenTextDrawer(drawer);
   state.menu = std::make_unique<ui::MenuModel>(state.config.mods_dir, state.config.thunderstore, images);
 #if REXFABRIC_WITH_GUIDE
   ui::guide::AddMenus(*state.menu);

@@ -25,6 +25,7 @@ enum class PinKind : uint8_t {
   kString,
   kObject,     // an object of one of the game's types
   kRegisters,  // a hook's or a midasm site's registers
+  kDelegate,   // an event's chain, handed to something that runs it later: a timer, an event dispatcher
   kAny,        // whatever Lua value comes in
 };
 
@@ -33,6 +34,8 @@ bool ParsePinKind(std::string_view name, PinKind& kind);
 
 struct Node {
   int id = 0;
+  // The graph the node is in: 0 for the event graph, otherwise the id of the function or macro whose graph it is.
+  int owner = 0;
   // A node type from the library: "flow.branch", "game.call:tip.version".
   std::string type;
   float x = 0.0f;
@@ -66,6 +69,37 @@ struct Variable {
   std::string comment;
 };
 
+// A function or a macro: a graph of its own, used from other graphs through call nodes. Its nodes are in the same
+// Graph as everything else, owned by its id; an entry node gives its inputs and an exit node takes its outputs.
+//
+// A function compiles to a Lua function, called where it's used; one marked pure has no exec pins and is worked out
+// where its outputs are read. A macro is written out in full wherever it's used, so its inputs and outputs can be
+// exec pins too: a macro can be flow of its own, like Branch.
+enum class RoutineKind : uint8_t { kFunction, kMacro };
+
+struct Param {
+  std::string name;
+  PinKind type = PinKind::kFloat;
+};
+
+// A list of events to run, as Unreal's event dispatchers are: Bind adds an event to it, Call runs every event bound to
+// it, with its params. It compiles to a table at the top of the script, named after it.
+struct Dispatcher {
+  std::string name;
+  std::vector<Param> params;
+  std::string comment;
+};
+
+struct Routine {
+  int id = 0;  // at least 1; the owner of its nodes
+  RoutineKind kind = RoutineKind::kFunction;
+  std::string name;
+  std::vector<Param> inputs;
+  std::vector<Param> outputs;
+  bool pure = false;  // functions only
+  std::string comment;
+};
+
 class Graph {
  public:
   Node& AddNode(std::string type, float x, float y);
@@ -81,12 +115,36 @@ class Graph {
   void RemoveLink(int id);
   // Drops every link at this pin.
   void RemoveLinksAt(const PinRef& pin, bool output);
+  // A pin of a node now goes by `name`: its links follow, and so does a value typed into it.
+  void RenamePin(const PinRef& pin, bool output, const std::string& name);
 
   std::vector<Node>& nodes() { return nodes_; }
   const std::vector<Node>& nodes() const { return nodes_; }
   const std::vector<Link>& links() const { return links_; }
   std::vector<Variable>& variables() { return variables_; }
   const std::vector<Variable>& variables() const { return variables_; }
+
+  // A routine with a new id, and no nodes yet (node_library.h's CreateRoutine adds its entry and exit).
+  Routine& AddRoutine(RoutineKind kind, std::string name);
+  // Keeps the routine's own id, as loaded from a file.
+  Routine& InsertRoutine(Routine routine);
+  // Removes the routine and every node in its graph.
+  void RemoveRoutine(int id);
+  std::vector<Dispatcher>& dispatchers() { return dispatchers_; }
+  const std::vector<Dispatcher>& dispatchers() const { return dispatchers_; }
+  Dispatcher* FindDispatcher(std::string_view name);
+  const Dispatcher* FindDispatcher(std::string_view name) const;
+  // "Done", "Done1": a dispatcher name nothing uses yet.
+  std::string UniqueDispatcherName(std::string_view base) const;
+  // Variables, functions, macros and dispatchers share one set of names, as each is a Lua name in the script.
+  bool NameTaken(std::string_view name) const;
+
+  std::vector<Routine>& routines() { return routines_; }
+  const std::vector<Routine>& routines() const { return routines_; }
+  Routine* FindRoutine(int id);
+  const Routine* FindRoutine(int id) const;
+  // "Function", "Function1": a routine name nothing uses yet.
+  std::string UniqueRoutineName(std::string_view base) const;
 
   Node* FindNode(int id);
   const Node* FindNode(int id) const;
@@ -106,8 +164,11 @@ class Graph {
   std::vector<Node> nodes_;
   std::vector<Link> links_;
   std::vector<Variable> variables_;
+  std::vector<Routine> routines_;
+  std::vector<Dispatcher> dispatchers_;
   int next_node_ = 1;
   int next_link_ = 1;
+  int next_routine_ = 1;
 };
 
 }  // namespace rexfabric::graph

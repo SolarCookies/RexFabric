@@ -47,6 +47,8 @@ void OpenRex(lua_State* L);
 void OpenHost(lua_State* L);
 // The game's namespaces, as globals.
 void OpenGame(lua_State* L);
+// rex.after, rex.every and rex.cancel (lua_timers.cpp), once the `rex` global is set.
+void OpenTimers(lua_State* L);
 
 // Drops what the parts keep beside the VM: hook sites, claims, listeners, caches. The VM is still open.
 void ResetRex();

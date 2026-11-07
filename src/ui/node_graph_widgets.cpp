@@ -40,6 +40,15 @@ void PinIcon(bool linked, ImU32 color, PinShape shape) {
     return;
   }
 
+  if (shape == PinShape::kSquare) {
+    const float half = size * 0.24f;
+    const ImVec2 min(center.x - half, center.y - half);
+    const ImVec2 max(center.x + half, center.y + half);
+    if (linked) draw->AddRectFilled(min, max, color, 1.5f);
+    else draw->AddRect(min, max, color, 1.5f, 0, 1.5f);
+    return;
+  }
+
   // A right pointing triangle, as execution pins usually are.
   const float half = size * 0.3f;
   const ImVec2 a(center.x - half, center.y - half);

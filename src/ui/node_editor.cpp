@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cfloat>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -34,6 +37,8 @@ using graph::Pin;
 using graph::PinKind;
 using graph::PinRef;
 using graph::PinType;
+using graph::Routine;
+using graph::RoutineKind;
 using node_widgets::PinShape;
 
 // In multiples of the font size, so the layout follows the UI's scale.
@@ -42,6 +47,13 @@ constexpr float kDetailsWidth = 20.0f;
 constexpr float kInlineNumberWidth = 5.0f;
 constexpr float kInlineFloatWidth = 4.0f;
 constexpr float kInlineTextWidth = 7.0f;
+// A reroute's body, which moves it, and the grip on either side of it that a link is dragged from or dropped on.
+// The dot drawn is smaller than the body, so it's easy to pick up.
+constexpr float kRerouteDot = 2.0f;
+constexpr float kRerouteGrip = 0.6f;
+constexpr float kRerouteDrawn = 0.27f;
+// The room left around a graph fitted to the view.
+constexpr float kFitMargin = 3.0f;
 
 // Canvas ids: nodes are the graph's own ids; pins and links are moved out of their way.
 constexpr uint64_t kPinBase = uint64_t(1) << 40;
@@ -65,8 +77,22 @@ constexpr ImVec4 kErrorColor{1.0f, 0.45f, 0.4f, 1.0f};
 constexpr ImVec4 kWarningColor{1.0f, 0.75f, 0.35f, 1.0f};
 constexpr ImVec4 kGoodColor{0.5f, 0.9f, 0.5f, 1.0f};
 constexpr ImVec4 kTitleColor{1.0f, 1.0f, 1.0f, 0.95f};
+constexpr ImVec4 kFunctionColor{0.45f, 0.62f, 1.0f, 1.0f};
+constexpr ImVec4 kMacroColor{0.72f, 0.5f, 1.0f, 1.0f};
+// The glass of the panels beside the canvas.
+constexpr ImVec4 kPaneTint{0.05f, 0.06f, 0.11f, 0.42f};
 
 constexpr const char* kAddMenu = "AddNode";
+constexpr const char* kDropMenu = "DropVariable";
+constexpr const char* kNodeMenu = "NodeMenu";
+// What the sidebar's rows carry when dragged onto the canvas: a variable's name, a function's or macro's id.
+constexpr const char* kVariablePayload = "REXFABRIC_VARIABLE";
+constexpr const char* kRoutinePayload = "REXFABRIC_ROUTINE";
+constexpr const char* kDispatcherPayload = "REXFABRIC_DISPATCHER";
+
+// What a variable or dispatcher dropped on the canvas can become, in the order the menu offers them.
+constexpr std::array<const char*, 5> kVariableNodes = {"var.get", "var.set", "var.branch", "var.increment", "var.decrement"};
+constexpr std::array<const char*, 5> kDispatcherNodes = {"dispatch.call", "dispatch.bind", "dispatch.unbind", "dispatch.unbind_all", "event.custom"};
 constexpr const char* kAskPopup = "###ask";
 constexpr const char* kSavePopup = "Unsaved changes###save";
 
@@ -107,16 +133,28 @@ ImU32 PinColor(PinKind kind) {
     case PinKind::kString: return IM_COL32(250, 110, 200, 255);
     case PinKind::kObject: return IM_COL32(80, 160, 255, 255);
     case PinKind::kRegisters: return IM_COL32(255, 170, 60, 255);
+    case PinKind::kDelegate: return IM_COL32(255, 70, 70, 255);
     case PinKind::kAny: return IM_COL32(190, 190, 190, 255);
   }
   return IM_COL32(190, 190, 190, 255);
 }
 
+bool IsRoutineNode(const Node& node) { return node.type == graph::kRoutineEntry || node.type == graph::kRoutineExit || node.type == graph::kRoutineCall; }
+
+// A function's or macro's inputs and outputs, which its graph always keeps.
+bool IsRoutineEnd(const Node& node) { return node.type == graph::kRoutineEntry || node.type == graph::kRoutineExit; }
+
+ImVec4 RoutineColor(RoutineKind kind) { return kind == RoutineKind::kMacro ? kMacroColor : kFunctionColor; }
+
 // Pure nodes take the color of what they give, so a node and its links match; the rest go by what they're about.
-ImVec4 HeaderColor(const NodeDesc* desc, const NodePins& pins) {
+ImVec4 HeaderColor(const Node& node, const NodeDesc* desc, const NodePins& pins, const graph::Graph& graph) {
   if (!desc) return kRejectColor;
-  if (desc->role == NodeRole::kEvent) return ImVec4(1.0f, 0.45f, 0.4f, 1.0f);
-  if (desc->role == NodeRole::kPure && !pins.outputs.empty()) return ImGui::ColorConvertU32ToFloat4(PinColor(pins.outputs.front().type.kind));
+  if (IsRoutineNode(node)) {
+    if (const Routine* routine = graph::RoutineOf(node, graph)) return RoutineColor(routine->kind);
+  }
+  const NodeRole role = graph::RoleOf(node, graph);
+  if (role == NodeRole::kEvent) return ImVec4(1.0f, 0.45f, 0.4f, 1.0f);
+  if (role == NodeRole::kPure && !pins.outputs.empty()) return ImGui::ColorConvertU32ToFloat4(PinColor(pins.outputs.front().type.kind));
   const std::string_view category = desc->category;
   if (category.starts_with("Flow")) return ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
   if (category.starts_with("Hooks")) return ImVec4(1.0f, 0.65f, 0.3f, 1.0f);
@@ -132,7 +170,10 @@ std::string_view PinLabel(const Pin& pin) {
   return pin.name;
 }
 
-PinShape ShapeOf(const Pin& pin) { return pin.type.kind == PinKind::kExec ? PinShape::kArrow : PinShape::kCircle; }
+PinShape ShapeOf(const Pin& pin) {
+  if (pin.type.kind == PinKind::kExec) return PinShape::kArrow;
+  return pin.type.kind == PinKind::kDelegate ? PinShape::kSquare : PinShape::kCircle;
+}
 
 // Whether an output of `from` could go into `to` once its node is linked: a Number becomes whatever its inputs are.
 bool MayFit(const PinType& from, const PinType& to) {
@@ -141,16 +182,28 @@ bool MayFit(const PinType& from, const PinType& to) {
 }
 
 // A node of this type as the add menu would make it, to see its pins before it's added.
-Node Prototype(const NodeDesc& desc, const std::string& setting, const std::string& value) {
+Node Prototype(const NodeDesc& desc, const decltype(Node::settings)& settings) {
   Node node;
   node.type = desc.id;
   for (const graph::SettingDesc& entry : desc.settings) node.settings[entry.name] = entry.initial;
-  if (!setting.empty()) node.settings[setting] = value;
+  for (const auto& [name, value] : settings) node.settings[name] = value;
   return node;
 }
 
+// The setting of a node's description that picks one of the graph's variables or dispatchers, or null.
+const graph::SettingDesc* MemberSetting(const NodeDesc& desc) {
+  const auto found = std::find_if(desc.settings.begin(), desc.settings.end(), [](const graph::SettingDesc& setting) { return setting.kind == graph::SettingKind::kVariable || setting.kind == graph::SettingKind::kDispatcher; });
+  return found != desc.settings.end() ? &*found : nullptr;
+}
+
+// What a menu calls a node picking `member`: "Get Count", "Call Scored", or "Custom Event (Scored)" for a setting
+// that only borrows from it.
+std::string MemberLabel(const NodeDesc& desc, const graph::SettingDesc& setting, const std::string& member) { return setting.optional ? desc.title + " (" + member + ")" : desc.title + " " + member; }
+
 const char* KindLabel(PinKind kind) {
   switch (kind) {
+    case PinKind::kExec: return "Exec";
+    case PinKind::kDelegate: return "Event";
     case PinKind::kBool: return "Bool";
     case PinKind::kInt: return "Int";
     case PinKind::kFloat: return "Float";
@@ -183,6 +236,61 @@ void SyncModifiers(ImGuiIO& io) {
     const bool held = ImGui::IsKeyDown(left) || ImGui::IsKeyDown(right);
     if (held != ImGui::IsKeyDown(modifier)) io.AddKeyEvent(modifier, held);
   }
+}
+
+// The small swatch of color a sidebar row starts with: a variable's type, a function or macro.
+void Swatch(ImU32 color) {
+  const ImVec2 start = ImGui::GetCursorScreenPos();
+  const float size = ImGui::GetTextLineHeight() * 0.6f;
+  ImGui::Dummy(ImVec2(size, ImGui::GetTextLineHeight()));
+  ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(start.x, start.y + size * 0.33f), ImVec2(start.x + size, start.y + size * 1.33f), color, 2.0f);
+  ImGui::SameLine();
+}
+
+// A section of the sidebar: its title, with a round + at its right that adds to it. True when the + is pressed.
+bool SectionHeader(const char* title, const char* add_tooltip, bool can_add) {
+  ImGui::Spacing();
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted(title);
+  const float button = ImGui::GetFrameHeight();
+  ImGui::SameLine(0.0f, 0.0f);
+  ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(ImGui::GetContentRegionAvail().x - button, 0.0f));
+  ImGui::PushID(title);
+  ImGui::BeginDisabled(!can_add);
+  const bool add = glass::Button("##add", glass::kCreate, ImVec2(button, button));
+  // The + is drawn rather than typed, as a font's + doesn't sit in the middle of its box. Whole pixels and an even
+  // thickness, so both bars are the same and crisp.
+  const ImVec2 min = ImGui::GetItemRectMin();
+  const ImVec2 max = ImGui::GetItemRectMax();
+  const ImVec2 center(std::floor((min.x + max.x) * 0.5f), std::floor((min.y + max.y) * 0.5f));
+  const float arm = std::floor(button * 0.24f);
+  const float half = std::max(1.0f, std::floor(button * 0.05f));
+  const ImU32 color = ImGui::GetColorU32(ImGuiCol_Text);
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+  draw->AddRectFilled(ImVec2(center.x - arm, center.y - half), ImVec2(center.x + arm, center.y + half), color);
+  draw->AddRectFilled(ImVec2(center.x - half, center.y - arm), ImVec2(center.x + half, center.y + arm), color);
+  ImGui::EndDisabled();
+  ImGui::SetItemTooltip("%s", add_tooltip);
+  ImGui::PopID();
+  ImGui::Separator();
+  return add;
+}
+
+// "Value", "Value1": a name none of `params` has.
+std::string UniqueParamName(const std::vector<graph::Param>& params, const std::string& base) {
+  const auto taken = [&params](const std::string& name) { return std::any_of(params.begin(), params.end(), [&](const graph::Param& param) { return param.name == name; }); };
+  std::string name = base;
+  for (int suffix = 1; taken(name); ++suffix) name = base + std::to_string(suffix);
+  return name;
+}
+
+// A name a function, macro, variable or dispatcher can take: free, and a Lua name that hides nothing.
+bool CheckName(const graph::Graph& graph, const std::string& name, std::string* reason) {
+  if (graph.NameTaken(name)) {
+    *reason = "Something in this graph is named " + name + " already";
+    return false;
+  }
+  return graph::IsVariableName(name, graph::GameGlobals(), reason);
 }
 
 bool TextValue(const nlohmann::json& value, std::string& text) {
@@ -225,17 +333,27 @@ void NodeEditorWindow::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
   ImGui::SetNextWindowSize(ImVec2(1320.0f, 780.0f), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSizeConstraints(ImVec2(820.0f, 480.0f), ImVec2(FLT_MAX, FLT_MAX));
+  // Glass all over when there's glass: the theme, the window, and the canvas's light behind everything in it.
+  const glass::Theme theme;
   bool open = true;
   const std::string title = document_ ? "Node Editor: " + document_->name() + (document_->dirty() ? " *" : "") + "###rexfabric_node_editor" : std::string("Node Editor###rexfabric_node_editor");
   if (glass::BeginWindow(title.c_str(), &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+    // Under the title bar, to the window's rounded bottom.
+    const ImVec2 window_min = ImGui::GetWindowPos();
+    const ImVec2 window_max(window_min.x + ImGui::GetWindowSize().x, window_min.y + ImGui::GetWindowSize().y);
+    style_.DrawBackdrop(ImVec2(window_min.x, window_min.y + ImGui::GetFrameHeight()), window_max, ImGui::GetStyle().WindowRounding);
+
     Shortcuts();
     DrawToolbar();
-    ImGui::Separator();
+    ImGui::Spacing();
 
     const float font = ImGui::GetFontSize();
-    ImGui::BeginChild("##left", ImVec2(font * kSidebarWidth, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
+    glass::BeginChild("##left", ImVec2(font * kSidebarWidth, 0.0f), ImGuiChildFlags_ResizeX | ImGuiChildFlags_AlwaysUseWindowPadding, 0, kPaneTint);
     DrawGraphs();
+    DrawRoutines(RoutineKind::kFunction);
+    DrawRoutines(RoutineKind::kMacro);
     DrawVariables();
+    DrawDispatchers();
     ImGui::EndChild();
 
     ImGui::SameLine();
@@ -245,6 +363,7 @@ void NodeEditorWindow::OnDraw(ImGuiIO& io) {
       ImGui::TextDisabled(mod_folder_.empty() ? "Pick a mod, or make a new one, to start." : "Make a graph for this mod to start.");
     } else if (ImGui::BeginTabBar("##views")) {
       if (ImGui::BeginTabItem("Graph")) {
+        DrawBreadcrumb();
         DrawCanvas();
         ImGui::EndTabItem();
       }
@@ -257,7 +376,7 @@ void NodeEditorWindow::OnDraw(ImGuiIO& io) {
     ImGui::EndChild();
 
     ImGui::SameLine();
-    ImGui::BeginChild("##details", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders);
+    glass::BeginChild("##details", ImVec2(0.0f, 0.0f), ImGuiChildFlags_AlwaysUseWindowPadding, 0, kPaneTint);
     DrawDetails();
     ImGui::EndChild();
 
@@ -274,18 +393,18 @@ void NodeEditorWindow::DrawToolbar() {
 
   ImGui::SameLine();
   ImGui::BeginDisabled(!document_);
-  if (ImGui::Button("Save")) Save(false);
+  if (glass::Button("Save", glass::kAccent)) Save(false);
   ImGui::SetItemTooltip("Writes the graph and its script (Ctrl+S)");
   ImGui::SameLine();
-  if (ImGui::Button("Save and Reload")) Save(true);
+  if (glass::Button("Save and Reload", glass::kCreate)) Save(true);
   ImGui::SetItemTooltip("Saves, then runs every enabled Lua mod again, this one included");
   ImGui::SameLine();
   ImGui::BeginDisabled(!document_ || !document_->CanUndo());
-  if (ImGui::Button("Undo")) Undo();
+  if (glass::Button("Undo")) Undo();
   ImGui::EndDisabled();
   ImGui::SameLine();
   ImGui::BeginDisabled(!document_ || !document_->CanRedo());
-  if (ImGui::Button("Redo")) Redo();
+  if (glass::Button("Redo")) Redo();
   ImGui::EndDisabled();
   ImGui::EndDisabled();
 
@@ -334,30 +453,86 @@ void NodeEditorWindow::Shortcuts() {
 // Left --------------------------------------------------------------------------------------------------
 
 void NodeEditorWindow::DrawGraphs() {
-  ImGui::SeparatorText("Graphs");
-  ImGui::BeginDisabled(!Mod());
-  if (ImGui::SmallButton("New")) AskFor(Ask::kNewGraph, graphs_.empty() ? "Main" : "Graph" + std::to_string(graphs_.size() + 1));
-  ImGui::EndDisabled();
-  ImGui::SameLine();
-  ImGui::BeginDisabled(!document_);
-  if (ImGui::SmallButton("Rename")) AskFor(Ask::kRenameGraph, document_->name());
-  ImGui::SameLine();
-  if (ImGui::SmallButton("Delete")) AskFor(Ask::kDeleteGraph, document_->name());
-  ImGui::EndDisabled();
+  const std::string next = graphs_.empty() ? "Main" : "Graph" + std::to_string(graphs_.size() + 1);
+  if (SectionHeader("Graphs", "A new graph: a script of its own in this mod", Mod() != nullptr)) AskFor(Ask::kNewGraph, next);
 
   for (const std::string& name : graphs_) {
     const bool open = document_ && document_->name() == name;
-    if (ImGui::Selectable((name + "##graph").c_str(), open) && !open) AfterSaving([this, name] { OpenGraph(name); });
+    if (ImGui::Selectable((name + "##graph").c_str(), open)) {
+      if (open) ShowGraph(0);
+      else AfterSaving([this, name] { OpenGraph(name); });
+    }
+    ImGui::SetItemTooltip("Right click to rename or delete");
+    if (open && ImGui::BeginPopupContextItem()) {
+      if (ImGui::MenuItem("Rename...")) AskFor(Ask::kRenameGraph, name);
+      if (ImGui::MenuItem("Delete...")) AskFor(Ask::kDeleteGraph, name);
+      ImGui::EndPopup();
+    }
+    // The open graph's own event graph, under it, as its functions and macros are below.
+    if (open) {
+      ImGui::Indent();
+      if (ImGui::Selectable("Event Graph", owner_ == 0)) ShowGraph(0);
+      ImGui::Unindent();
+    }
   }
   if (Mod() && graphs_.empty()) ImGui::TextDisabled("None yet");
 }
 
-void NodeEditorWindow::DrawVariables() {
-  ImGui::SeparatorText("Variables");
+void NodeEditorWindow::DrawRoutines(RoutineKind kind) {
+  const bool macro = kind == RoutineKind::kMacro;
+  const char* add_tooltip = macro ? "A new macro: nodes written out wherever it's used, with exec pins of its own if it wants" : "A new function: a graph of its own, called from the event graph or other functions";
+  if (SectionHeader(macro ? "Macros" : "Functions", add_tooltip, document_ != nullptr)) {
+    graph::Graph& graph = document_->graph();
+    Routine& made = graph::CreateRoutine(graph, kind, graph.UniqueRoutineName(macro ? "NewMacro" : "NewFunction"));
+    // A macro starts as flow: in through one exec pin and out through another.
+    if (macro) {
+      made.inputs.push_back({"In", PinKind::kExec});
+      made.outputs.push_back({"Out", PinKind::kExec});
+    }
+    selected_routine_ = made.id;
+    focus_ = Focus::kRoutine;
+    ShowGraph(made.id);
+    Edited();
+  }
   if (!document_) return;
   graph::Graph& graph = document_->graph();
 
-  if (ImGui::SmallButton("+ Variable")) {
+  int removed = 0;
+  bool any = false;
+  for (const Routine& routine : graph.routines()) {
+    if (routine.kind != kind) continue;
+    any = true;
+    ImGui::PushID(routine.id);
+    Swatch(ImGui::ColorConvertFloat4ToU32(RoutineColor(kind)));
+    if (ImGui::Selectable(routine.name.c_str(), owner_ == routine.id || (focus_ == Focus::kRoutine && selected_routine_ == routine.id))) {
+      selected_routine_ = routine.id;
+      focus_ = Focus::kRoutine;
+      ShowGraph(routine.id);
+    }
+    if (ImGui::BeginDragDropSource()) {
+      ImGui::SetDragDropPayload(kRoutinePayload, &routine.id, sizeof(routine.id));
+      ImGui::Text("Use %s", routine.name.c_str());
+      ImGui::EndDragDropSource();
+    }
+    ImGui::SetItemTooltip("%s%sDrag onto a graph to use it", routine.comment.c_str(), routine.comment.empty() ? "" : "\n");
+    if (ImGui::BeginPopupContextItem()) {
+      if (ImGui::MenuItem("Delete")) removed = routine.id;
+      ImGui::EndPopup();
+    }
+    ImGui::PopID();
+  }
+  if (!any) ImGui::TextDisabled("None yet");
+  if (removed) {
+    graph::DeleteRoutine(graph, removed);
+    if (owner_ == removed) ShowGraph(0);
+    if (selected_routine_ == removed) focus_ = Focus::kNone;
+    Edited();
+  }
+}
+
+void NodeEditorWindow::DrawVariables() {
+  if (SectionHeader("Variables", "A new variable: a value kept between events", document_ != nullptr)) {
+    graph::Graph& graph = document_->graph();
     graph::Variable variable;
     variable.name = graph.UniqueVariableName("NewVar");
     variable.type = PinKind::kFloat;
@@ -367,41 +542,105 @@ void NodeEditorWindow::DrawVariables() {
     focus_ = Focus::kVariable;
     Edited();
   }
-  ImGui::SameLine();
-  ImGui::BeginDisabled(!graph.FindVariable(selected_variable_));
-  if (ImGui::SmallButton("Remove")) {
-    // Its Get and Set nodes go with it.
-    const std::string name = selected_variable_;
-    std::vector<int> users;
-    for (const Node& node : graph.nodes()) {
-      if ((node.type == "var.get" || node.type == "var.set") && node.Setting("Variable") == name) users.push_back(node.id);
-    }
-    for (int id : users) graph.RemoveNode(id);
-    std::erase_if(graph.variables(), [&name](const graph::Variable& variable) { return variable.name == name; });
-    selected_variable_.clear();
-    focus_ = Focus::kNone;
-    Edited();
-  }
-  ImGui::EndDisabled();
+  if (!document_) return;
+  graph::Graph& graph = document_->graph();
 
+  std::string removed;
   for (const graph::Variable& variable : graph.variables()) {
     ImGui::PushID(variable.name.c_str());
-    const ImVec2 start = ImGui::GetCursorScreenPos();
-    const float swatch = ImGui::GetTextLineHeight() * 0.6f;
-    ImGui::Dummy(ImVec2(swatch, ImGui::GetTextLineHeight()));
-    ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(start.x, start.y + swatch * 0.33f), ImVec2(start.x + swatch, start.y + swatch * 1.33f), PinColor(variable.type), 2.0f);
-    ImGui::SameLine();
+    Swatch(PinColor(variable.type));
     if (ImGui::Selectable(variable.name.c_str(), focus_ == Focus::kVariable && selected_variable_ == variable.name)) {
       selected_variable_ = variable.name;
       focus_ = Focus::kVariable;
     }
-    ImGui::SetItemTooltip("%s%s%s", KindLabel(variable.type), variable.comment.empty() ? "" : "\n", variable.comment.c_str());
+    if (ImGui::BeginDragDropSource()) {
+      ImGui::SetDragDropPayload(kVariablePayload, variable.name.data(), variable.name.size());
+      ImGui::Text("Get or set %s", variable.name.c_str());
+      ImGui::EndDragDropSource();
+    }
+    ImGui::SetItemTooltip("%s%s%s\nDrag onto the graph to get or set it", KindLabel(variable.type), variable.comment.empty() ? "" : "\n", variable.comment.c_str());
+    if (ImGui::BeginPopupContextItem()) {
+      if (ImGui::MenuItem("Delete")) removed = variable.name;
+      ImGui::EndPopup();
+    }
     ImGui::PopID();
   }
-  if (graph.variables().empty()) ImGui::TextDisabled("None yet. Variables keep values between events.");
+  if (graph.variables().empty()) ImGui::TextDisabled("None yet");
+  if (!removed.empty()) {
+    // The nodes using it go with it.
+    graph::DeleteVariable(graph, removed);
+    if (selected_variable_ == removed) focus_ = Focus::kNone;
+    Edited();
+  }
 }
 
 // Middle: the canvas -------------------------------------------------------------------------------------
+
+void NodeEditorWindow::DrawDispatchers() {
+  if (SectionHeader("Event Dispatchers", "A new event dispatcher: events bound to it run when it's called", document_ != nullptr)) {
+    graph::Graph& graph = document_->graph();
+    graph::Dispatcher dispatcher;
+    dispatcher.name = graph.UniqueDispatcherName("NewDispatcher");
+    graph.dispatchers().push_back(dispatcher);
+    selected_dispatcher_ = dispatcher.name;
+    focus_ = Focus::kDispatcher;
+    Edited();
+  }
+  if (!document_) return;
+  graph::Graph& graph = document_->graph();
+
+  std::string removed;
+  for (const graph::Dispatcher& dispatcher : graph.dispatchers()) {
+    ImGui::PushID(dispatcher.name.c_str());
+    Swatch(PinColor(PinKind::kDelegate));
+    if (ImGui::Selectable(dispatcher.name.c_str(), focus_ == Focus::kDispatcher && selected_dispatcher_ == dispatcher.name)) {
+      selected_dispatcher_ = dispatcher.name;
+      focus_ = Focus::kDispatcher;
+    }
+    if (ImGui::BeginDragDropSource()) {
+      ImGui::SetDragDropPayload(kDispatcherPayload, dispatcher.name.data(), dispatcher.name.size());
+      ImGui::Text("Call or bind to %s", dispatcher.name.c_str());
+      ImGui::EndDragDropSource();
+    }
+    ImGui::SetItemTooltip("%s%sDrag onto the graph to call it, or bind an event to it", dispatcher.comment.c_str(), dispatcher.comment.empty() ? "" : "\n");
+    if (ImGui::BeginPopupContextItem()) {
+      if (ImGui::MenuItem("Delete")) removed = dispatcher.name;
+      ImGui::EndPopup();
+    }
+    ImGui::PopID();
+  }
+  if (graph.dispatchers().empty()) ImGui::TextDisabled("None yet");
+  if (!removed.empty()) {
+    graph::DeleteDispatcher(graph, removed);
+    if (selected_dispatcher_ == removed) focus_ = Focus::kNone;
+    Edited();
+  }
+}
+
+void NodeEditorWindow::DrawBreadcrumb() {
+  const Routine* routine = document_->graph().FindRoutine(owner_);
+  if (glass::SmallButton("Event Graph", routine ? glass::kNeutral : glass::kAccent)) ShowGraph(0);
+  if (!routine) return;
+  ImGui::SameLine();
+  ImGui::TextDisabled(">");
+  ImGui::SameLine();
+  ImGui::TextColored(RoutineColor(routine->kind), "%s %s", routine->kind == RoutineKind::kMacro ? "Macro" : "Function", routine->name.c_str());
+}
+
+void NodeEditorWindow::ShowGraph(int owner) {
+  if (owner == owner_) return;
+  owner_ = owner;
+  if (focus_ == Focus::kNode) focus_ = Focus::kNone;
+  selected_node_ = 0;
+  pending_pin_.reset();
+  place_nodes_ = true;
+  fit_view_ = true;
+  if (canvas_) {
+    ed::SetCurrentEditor(canvas_);
+    ed::ClearSelection();
+    ed::SetCurrentEditor(nullptr);
+  }
+}
 
 void NodeEditorWindow::DrawCanvas() {
   graph::Graph& graph = document_->graph();
@@ -412,11 +651,12 @@ void NodeEditorWindow::DrawCanvas() {
 
   const ImVec2 canvas_min = ImGui::GetCursorScreenPos();
   pin_tooltip_.clear();
-  style_.DrawBackdrop();
   ed::SetCurrentEditor(canvas_);
   ed::Begin("##graph");
 
+  // The graph shown: the event graph's nodes, or one function's or macro's.
   for (Node& node : graph.nodes()) {
+    if (node.owner != owner_) continue;
     if (place_nodes_) ed::SetNodePosition(NodeId(node.id), ImVec2(node.x, node.y));
     DrawNode(node);
   }
@@ -425,7 +665,7 @@ void NodeEditorWindow::DrawCanvas() {
   for (const graph::Link& link : graph.links()) {
     const Node* source = graph.FindNode(link.from.node);
     const Node* target = graph.FindNode(link.to.node);
-    if (!source || !target) continue;
+    if (!source || !target || source->owner != owner_) continue;
     const NodePins source_pins = graph::PinsOf(*source, graph);
     const NodePins target_pins = graph::PinsOf(*target, graph);
     const auto from = std::find_if(source_pins.outputs.begin(), source_pins.outputs.end(), [&](const Pin& pin) { return pin.name == link.from.pin; });
@@ -444,6 +684,7 @@ void NodeEditorWindow::DrawCanvas() {
   }
 
   HandleCreate();
+  HandleDoubleClick();
   HandleDelete();
   HandleClipboard();
 
@@ -452,15 +693,31 @@ void NodeEditorWindow::DrawCanvas() {
     ed::SelectNode(NodeId(navigate_to_));
     ed::NavigateToSelection(false, 0.3f);
     navigate_to_ = 0;
+    // Going to a node in another graph shows that graph at the node, not fitted.
+    fit_view_ = false;
   }
 
   // Popups and tooltips draw in screen space, outside the canvas transform.
   ed::Suspend();
   if (!pin_tooltip_.empty() && !ImGui::IsPopupOpen(kAddMenu)) ImGui::SetTooltip("%s", pin_tooltip_.c_str());
-  if (ed::ShowBackgroundContextMenu()) {
+  ed::NodeId context_node;
+  if (ed::ShowNodeContextMenu(&context_node)) {
+    context_node_ = static_cast<int>(context_node.Get());
+    open_node_menu_ = true;
+  } else if (ed::ShowBackgroundContextMenu()) {
     pending_pin_.reset();
     open_add_menu_ = true;
   }
+  if (open_node_menu_) {
+    open_node_menu_ = false;
+    ImGui::OpenPopup(kNodeMenu);
+  }
+  DrawNodeMenu();
+  if (open_drop_menu_) {
+    open_drop_menu_ = false;
+    ImGui::OpenPopup(kDropMenu);
+  }
+  DrawDropMenu();
   if (open_add_menu_) {
     open_add_menu_ = false;
     const ImVec2 position = ed::ScreenToCanvas(ImGui::GetMousePos());
@@ -474,19 +731,57 @@ void NodeEditorWindow::DrawCanvas() {
 
   SyncFromCanvas();
   if (fit_view_) {
-    ed::NavigateToContent(0.0f);
+    // The graph shown fits the view, zoomed out when it's big but never in past its size, so a small function's graph
+    // isn't blown up to fill the canvas.
+    FitView();
     fit_view_ = false;
   }
   ed::End();
+  // The canvas is the last item now: variables, functions and macros dragged in from the sidebar land on it.
+  if (ImGui::BeginDragDropTarget()) {
+    AcceptDrop(ed::ScreenToCanvas(ImGui::GetMousePos()));
+    ImGui::EndDragDropTarget();
+  }
   ed::SetCurrentEditor(nullptr);
 
-  if (graph.nodes().empty()) ImGui::GetWindowDrawList()->AddText(ImVec2(canvas_min.x + 16.0f, canvas_min.y + 12.0f), IM_COL32(255, 255, 255, 110), "Right click to add a node. Start with an event: On Frame, Key Pressed, Before Function.");
+  const bool empty = std::none_of(graph.nodes().begin(), graph.nodes().end(), [this](const Node& node) { return node.owner == owner_; });
+  if (empty) ImGui::GetWindowDrawList()->AddText(ImVec2(canvas_min.x + 16.0f, canvas_min.y + 12.0f), IM_COL32(255, 255, 255, 110), "Right click to add a node. Start with an event: On Frame, Key Pressed, Before Function.");
+}
+
+void NodeEditorWindow::FitView() {
+  // The bounds of the graph shown, in canvas units, known once its nodes are drawn this frame.
+  ImVec2 min(FLT_MAX, FLT_MAX);
+  ImVec2 max(-FLT_MAX, -FLT_MAX);
+  for (const Node& node : document_->graph().nodes()) {
+    if (node.owner != owner_) continue;
+    const ImVec2 position = ed::GetNodePosition(NodeId(node.id));
+    const ImVec2 size = ed::GetNodeSize(NodeId(node.id));
+    min = ImVec2(std::min(min.x, position.x), std::min(min.y, position.y));
+    max = ImVec2(std::max(max.x, position.x + size.x), std::max(max.y, position.y + size.y));
+  }
+  const ImVec2 screen = ed::GetScreenSize();
+  if (min.x > max.x || screen.x <= 0.0f || screen.y <= 0.0f) return;
+
+  // With a margin, at zoom 1 when that fits, else zoomed out just enough; a canvas unit is a pixel at zoom 1.
+  const float margin = ImGui::GetFontSize() * kFitMargin;
+  const float scale = std::max({1.0f, (max.x - min.x + margin * 2.0f) / screen.x, (max.y - min.y + margin * 2.0f) / screen.y});
+  const ImVec2 center((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
+  const ImVec2 half(screen.x * scale * 0.5f, screen.y * scale * 0.5f);
+  ed::SetViewState({ImVec2(center.x - half.x, center.y - half.y), ImVec2(center.x + half.x, center.y + half.y)});
 }
 
 void NodeEditorWindow::DrawNode(Node& node) {
   const graph::Graph& graph = document_->graph();
   const NodeDesc* desc = graph::FindDesc(node);
   const NodePins pins = graph::PinsOf(node, graph);
+  if (node.type == graph::kReroute) {
+    DrawReroute(node);
+    return;
+  }
+  if (desc && desc->compact) {
+    DrawCompactNode(node, pins);
+    return;
+  }
 
   style_.BeginNode(node.id);
   ed::BeginNode(NodeId(node.id));
@@ -495,7 +790,23 @@ void NodeEditorWindow::DrawNode(Node& node) {
   const float content_x = ImGui::GetCursorPosX();
   ImGui::TextColored(kTitleColor, "%s", graph::TitleOf(node).c_str());
   const float title_width = ImGui::GetItemRectSize().x;
-  const float header_bottom = ImGui::GetItemRectMax().y;
+  float header_bottom = ImGui::GetItemRectMax().y;
+
+  // An event's delegate pin, the last of its outputs, sits in the title's top right corner as in Unreal: at the
+  // node's right edge as it was last frame, or beside the title the first time.
+  const size_t delegate = desc && desc->delegate && !pins.outputs.empty() ? pins.outputs.size() - 1 : pins.outputs.size();
+  if (delegate < pins.outputs.size()) {
+    const Pin& pin = pins.outputs[delegate];
+    const float icon = ImGui::GetTextLineHeight();
+    const float right = ed::GetNodePosition(NodeId(node.id)).x + ed::GetNodeSize(NodeId(node.id)).x - ed::GetStyle().NodePadding.z - icon;
+    ImGui::SameLine();
+    ImGui::SetCursorScreenPos(ImVec2(std::max(ImGui::GetCursorScreenPos().x, right), ImGui::GetCursorScreenPos().y));
+    ed::BeginPin(PinId(node.id, delegate, true), ed::PinKind::Output);
+    node_widgets::PinIcon(graph.HasLinkAt({node.id, pin.name}, true), PinColor(pin.type.kind), ShapeOf(pin));
+    ed::EndPin();
+    if (ImGui::IsItemHovered()) pin_tooltip_ = "Event: link it to Set Timer by Event or Bind Event, and they run this event's chain";
+    header_bottom = std::max(header_bottom, ImGui::GetItemRectMax().y);
+  }
   ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
 
   float inputs_width = 0.0f;
@@ -521,12 +832,15 @@ void NodeEditorWindow::DrawNode(Node& node) {
     inputs_width = ImGui::GetItemRectSize().x;
   }
 
-  if (!pins.outputs.empty()) {
+  if (pins.outputs.size() > (delegate < pins.outputs.size() ? 1u : 0u)) {
     float column_width = 0.0f;
-    for (const Pin& pin : pins.outputs) column_width = std::max(column_width, node_widgets::OutputRowWidth(PinLabel(pin)));
+    for (size_t index = 0; index < pins.outputs.size(); ++index) {
+      if (index != delegate) column_width = std::max(column_width, node_widgets::OutputRowWidth(PinLabel(pins.outputs[index])));
+    }
     const float column_x = node_widgets::PlaceOutputColumn(content_x, title_width, inputs_width, column_width);
     ImGui::BeginGroup();
     for (size_t index = 0; index < pins.outputs.size(); ++index) {
+      if (index == delegate) continue;
       const Pin& pin = pins.outputs[index];
       const std::string_view label = PinLabel(pin);
       // A Number output shows what it resolves to.
@@ -546,7 +860,98 @@ void NodeEditorWindow::DrawNode(Node& node) {
 
   ImGui::PopID();
   ed::EndNode();
-  style_.EndNode(node.id, HeaderColor(desc, pins), header_bottom, problem_nodes_.contains(node.id));
+  style_.EndNode(node.id, HeaderColor(node, desc, pins, graph), header_bottom, problem_nodes_.contains(node.id));
+}
+
+void NodeEditorWindow::DrawReroute(Node& node) {
+  // A dot in the color of what passes through, with a grip either side for links: in on the left, out on the right.
+  // Both links meet at the dot's middle.
+  const graph::Graph& graph = document_->graph();
+  const PinType carried = graph::OutputType(graph, {node.id, std::string(graph::kRerouteOut)});
+  const float dot = ImGui::GetFontSize() * kRerouteDot;
+  const float grip = ImGui::GetFontSize() * kRerouteGrip;
+  const ed::NodeId id = NodeId(node.id);
+
+  ed::PushStyleVar(ed::StyleVar_NodePadding, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+  ed::BeginNode(id);
+  ImGui::PushID(node.id);
+  const ImVec2 start = ImGui::GetCursorScreenPos();
+  const ImVec2 center(start.x + grip + dot * 0.5f, start.y + dot * 0.5f);
+  ed::BeginPin(PinId(node.id, 0, false), ed::PinKind::Input);
+  ed::PinPivotRect(center, center);
+  ImGui::Dummy(ImVec2(grip, dot));
+  ed::EndPin();
+  ImGui::SameLine(0.0f, 0.0f);
+  ImGui::Dummy(ImVec2(dot, dot));
+  ImGui::SameLine(0.0f, 0.0f);
+  ed::BeginPin(PinId(node.id, 0, true), ed::PinKind::Output);
+  ed::PinPivotRect(center, center);
+  ImGui::Dummy(ImVec2(grip, dot));
+  ed::EndPin();
+  if (ImGui::IsItemHovered() || ed::GetHoveredNode() == id) pin_tooltip_ = "Reroute: " + graph::TypeName(carried);
+  ImGui::PopID();
+  ed::EndNode();
+  ed::PopStyleVar();
+
+  // Over the links, which meet under it.
+  ImDrawList* draw = ed::GetNodeBackgroundDrawList(id);
+  if (!draw) return;
+  const bool lit = ed::IsNodeSelected(id) || ed::GetHoveredNode() == id;
+  const bool exec = carried.kind == PinKind::kExec;
+  const float radius = dot * kRerouteDrawn;
+  draw->AddCircleFilled(center, radius, IM_COL32(12, 14, 24, 220));
+  draw->AddCircleFilled(center, radius * (exec ? 0.5f : 0.6f), PinColor(carried.kind));
+  draw->AddCircle(center, radius, lit ? IM_COL32(255, 255, 255, 230) : IM_COL32(255, 255, 255, 90), 0, lit ? 2.0f : 1.0f);
+  if (problem_nodes_.contains(node.id)) draw->AddCircle(center, radius + 2.0f, ImGui::ColorConvertFloat4ToU32(kErrorColor), 0, 1.5f);
+}
+
+void NodeEditorWindow::HandleDoubleClick() {
+  const ed::LinkId clicked = ed::GetDoubleClickedLink();
+  if (!clicked) return;
+  // Between ed::Begin and ed::End the mouse is in canvas units. The reroute is centered on it.
+  const float font = ImGui::GetFontSize();
+  const ImVec2 mouse = ImGui::GetMousePos();
+  const float x = mouse.x - font * (kRerouteGrip + kRerouteDot * 0.5f);
+  const float y = mouse.y - font * kRerouteDot * 0.5f;
+  const int reroute = graph::InsertReroute(document_->graph(), static_cast<int>(clicked.Get() - kLinkBase), x, y);
+  if (!reroute) return;
+  ed::SetNodePosition(NodeId(reroute), ImVec2(x, y));
+  ed::ClearSelection();
+  ed::SelectNode(NodeId(reroute));
+  selected_node_ = reroute;
+  focus_ = Focus::kNode;
+  Edited();
+}
+
+void NodeEditorWindow::DrawCompactNode(Node& node, const NodePins& pins) {
+  // One row and no header: its inputs, its title, its outputs, without their labels. A Get is the variable's name
+  // and its value.
+  const graph::Graph& graph = document_->graph();
+  style_.BeginNode(node.id);
+  ed::BeginNode(NodeId(node.id));
+  ImGui::PushID(node.id);
+  for (size_t index = 0; index < pins.inputs.size(); ++index) {
+    const Pin& pin = pins.inputs[index];
+    ed::BeginPin(PinId(node.id, index, false), ed::PinKind::Input);
+    node_widgets::PinIcon(graph.HasLinkAt({node.id, pin.name}, false), PinColor(pin.type.kind), ShapeOf(pin));
+    ed::EndPin();
+    if (ImGui::IsItemHovered()) pin_tooltip_ = pin.name + ": " + graph::TypeName(pin.type);
+    ImGui::SameLine();
+  }
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextColored(kTitleColor, "%s", graph::TitleOf(node).c_str());
+  for (size_t index = 0; index < pins.outputs.size(); ++index) {
+    const Pin& pin = pins.outputs[index];
+    const PinType carried = pin.type.kind == PinKind::kNumber ? graph::OutputType(graph, {node.id, pin.name}) : pin.type;
+    ImGui::SameLine();
+    ed::BeginPin(PinId(node.id, index, true), ed::PinKind::Output);
+    node_widgets::PinIcon(graph.HasLinkAt({node.id, pin.name}, true), PinColor(carried.kind), ShapeOf(pin));
+    ed::EndPin();
+    if (ImGui::IsItemHovered()) pin_tooltip_ = graph::TypeName(carried);
+  }
+  ImGui::PopID();
+  ed::EndNode();
+  style_.EndNode(node.id, HeaderColor(node, graph::FindDesc(node), pins, graph), NodeGraphStyle::kNoHeader, problem_nodes_.contains(node.id));
 }
 
 void NodeEditorWindow::DrawInlineValue(Node& node, const Pin& pin) {
@@ -648,30 +1053,60 @@ void NodeEditorWindow::HandleDelete() {
   graph::Graph& graph = document_->graph();
   bool changed = false;
 
+  // Links go last: deleting a node deletes its links too, and a reroute's links are needed to join it up again.
+  // Each is kept with the nodes the canvas had it between: link ids are made again when a graph is read back (undo),
+  // so the canvas can report an id that's another link's by now, such as one a reroute just joined up.
+  struct DeletedLink {
+    int id;
+    int from;
+    int to;
+  };
+  std::vector<DeletedLink> links;
   ed::LinkId link_id;
-  while (ed::QueryDeletedLink(&link_id)) {
-    if (ed::AcceptDeletedItem()) {
-      graph.RemoveLink(static_cast<int>(link_id.Get() - kLinkBase));
-      changed = true;
-    }
+  ed::PinId start_id;
+  ed::PinId end_id;
+  while (ed::QueryDeletedLink(&link_id, &start_id, &end_id)) {
+    if (!ed::AcceptDeletedItem()) continue;
+    const std::optional<DecodedPin> start = DecodePin(start_id);
+    const std::optional<DecodedPin> end = DecodePin(end_id);
+    if (start && end) links.push_back({static_cast<int>(link_id.Get() - kLinkBase), start->node, end->node});
   }
   ed::NodeId node_id;
   while (ed::QueryDeletedNode(&node_id)) {
+    const Node* node = graph.FindNode(static_cast<int>(node_id.Get()));
+    if (node && IsRoutineEnd(*node)) {
+      ed::RejectDeletedItem();
+      SetStatus("A function or macro keeps its inputs and outputs");
+      continue;
+    }
     if (ed::AcceptDeletedItem()) {
       const int id = static_cast<int>(node_id.Get());
-      graph.RemoveNode(id);
+      // A reroute deleted on its own joins what came into it to what it went to, so the link stays.
+      if (node && node->type == graph::kReroute) graph::DissolveReroute(graph, id);
+      else graph.RemoveNode(id);
       if (selected_node_ == id) selected_node_ = 0;
       changed = true;
     }
   }
+  // The deleted nodes' links are gone with them already; the links a reroute joined up again are new ones.
+  for (const DeletedLink& deleted : links) {
+    const auto found = std::find_if(graph.links().begin(), graph.links().end(), [&](const graph::Link& link) { return link.id == deleted.id; });
+    if (found != graph.links().end() && found->from.node == deleted.from && found->to.node == deleted.to) graph.RemoveLink(deleted.id);
+  }
+  changed = changed || !links.empty();
   ed::EndDelete();
   if (changed) Edited();
 }
 
 void NodeEditorWindow::HandleClipboard() {
   using node_widgets::ClipboardAction;
-  const node_widgets::ClipboardRequest request = node_widgets::TakeClipboardRequest();
+  node_widgets::ClipboardRequest request = node_widgets::TakeClipboardRequest();
   graph::Graph& graph = document_->graph();
+  // A function's or macro's inputs and outputs are never copied: its graph keeps one of each.
+  std::erase_if(request.nodes, [&graph](int id) {
+    const Node* node = graph.FindNode(id);
+    return node && IsRoutineEnd(*node);
+  });
 
   switch (request.action) {
     case ClipboardAction::kCopy:
@@ -721,7 +1156,9 @@ void NodeEditorWindow::PasteNodes(const std::string& text, float x, float y) {
   std::map<int, int> new_ids;
   std::vector<int> pasted;
   for (const Node& node : copied.nodes()) {
+    if (IsRoutineEnd(node)) continue;
     Node& added = graph.AddNode(node.type, x + node.x - left, y + node.y - top);
+    added.owner = owner_;
     added.settings = node.settings;
     added.values = node.values;
     new_ids[node.id] = added.id;
@@ -747,20 +1184,20 @@ void NodeEditorWindow::DrawAddMenu() {
   ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
   node_widgets::InputString("##search", add_filter_, 0, "Search nodes");
 
-  // Every entry: a node type, with the setting that picks a variable for Get and Set.
+  // Every entry: a node type, with the settings that pick a variable for Get and Set, or a function to call.
   struct Entry {
     std::string label;
     std::string category;
     std::string type;
-    std::string setting;
-    std::string value;
+    Settings settings;
     const std::string* description;
+    const std::string* keywords;
   };
   std::vector<Entry> entries;
-  const auto offer = [&](const NodeDesc& desc, std::string label, std::string setting, std::string value) {
+  const auto offer = [&](const NodeDesc& desc, std::string label, std::string category, Settings settings, const std::string* description) {
     // Dragged from a pin: only nodes with a pin that fits it.
     if (pending_pin_) {
-      const NodePins pins = graph::PinsOf(Prototype(desc, setting, value), graph);
+      const NodePins pins = graph::PinsOf(Prototype(desc, settings), graph);
       const Node* from = graph.FindNode(pending_pin_->ref.node);
       if (!from) return;
       const NodePins from_pins = graph::PinsOf(*from, graph);
@@ -771,14 +1208,33 @@ void NodeEditorWindow::DrawAddMenu() {
       const bool fits = std::any_of(side.begin(), side.end(), [&](const Pin& pin) { return pending_pin_->output ? MayFit(pending_type, pin.type) : MayFit(pin.type, pending_type); });
       if (!fits) return;
     }
-    entries.push_back({std::move(label), desc.category, desc.id, std::move(setting), std::move(value), &desc.description});
+    entries.push_back({std::move(label), std::move(category), desc.id, std::move(settings), description, &desc.keywords});
   };
   for (const std::unique_ptr<NodeDesc>& desc : graph::Library::Get().nodes()) {
-    if (desc->id == "var.get" || desc->id == "var.set") {
-      for (const graph::Variable& variable : graph.variables()) offer(*desc, desc->title + " " + variable.name, "Variable", variable.name);
-      continue;
+    // Nodes without a category are the editor's own to place: a function's inputs, outputs and calls.
+    if (desc->category.empty()) continue;
+    // Events start the event graph's chains; a function or macro starts at its inputs.
+    if (owner_ != 0 && desc->role == NodeRole::kEvent) continue;
+    if (const graph::SettingDesc* member = MemberSetting(*desc)) {
+      if (member->kind == graph::SettingKind::kVariable) {
+        for (const graph::Variable& variable : graph.variables()) {
+          if (graph::AcceptsVariable(*member, variable.type)) offer(*desc, MemberLabel(*desc, *member, variable.name), desc->category, {{member->name, variable.name}}, &desc->description);
+        }
+      } else {
+        for (const graph::Dispatcher& dispatcher : graph.dispatchers()) offer(*desc, MemberLabel(*desc, *member, dispatcher.name), desc->category, {{member->name, dispatcher.name}}, &desc->description);
+      }
+      // A node that may pick none is offered as itself too: a custom event without params.
+      if (!member->optional) continue;
     }
-    offer(*desc, desc->title, {}, {});
+    offer(*desc, desc->title, desc->category, {}, &desc->description);
+  }
+  if (const NodeDesc* call = graph::Library::Get().Find(graph::kRoutineCall)) {
+    for (const Routine& routine : graph.routines()) {
+      // A macro is written out where it's used, so it can't use itself.
+      if (routine.kind == RoutineKind::kMacro && routine.id == owner_) continue;
+      const Settings settings = {{std::string(graph::kRoutineSetting), std::to_string(routine.id)}, {std::string(graph::kRoutineNameSetting), routine.name}};
+      offer(*call, routine.name, routine.kind == RoutineKind::kMacro ? "Macros" : "Functions", settings, routine.comment.empty() ? &call->description : &routine.comment);
+    }
   }
 
   const Entry* chosen = nullptr;
@@ -792,8 +1248,9 @@ void NodeEditorWindow::DrawAddMenu() {
     // A flat list of matches; Enter takes the first.
     bool first = true;
     for (const Entry& entry : entries) {
-      if (!node_widgets::ContainsIgnoringCase(entry.label, add_filter_) && !node_widgets::ContainsIgnoringCase(entry.category, add_filter_)) continue;
-      if (item(entry, entry.label + "##" + entry.type + entry.value) || (first && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
+      const bool matches = node_widgets::ContainsIgnoringCase(entry.label, add_filter_) || node_widgets::ContainsIgnoringCase(entry.category, add_filter_) || node_widgets::ContainsIgnoringCase(*entry.keywords, add_filter_);
+      if (!matches) continue;
+      if (item(entry, entry.label + "##" + entry.type + entry.category) || (first && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
         chosen = &entry;
         break;
       }
@@ -817,7 +1274,7 @@ void NodeEditorWindow::DrawAddMenu() {
       }
       const std::string own = prefix.empty() ? std::string() : prefix.substr(0, prefix.size() - 1);
       for (const Entry& entry : entries) {
-        if (!prefix.empty() && entry.category == own && item(entry, entry.label + "##" + entry.type + entry.value)) chosen = &entry;
+        if (!prefix.empty() && entry.category == own && item(entry, entry.label + "##" + entry.type + entry.category)) chosen = &entry;
       }
     };
     level({});
@@ -825,18 +1282,19 @@ void NodeEditorWindow::DrawAddMenu() {
   }
 
   if (chosen) {
-    AddNode(chosen->type, chosen->setting, chosen->value);
+    AddNode(chosen->type, chosen->settings);
     ImGui::CloseCurrentPopup();
   }
   ImGui::EndPopup();
 }
 
-void NodeEditorWindow::AddNode(const std::string& type, const std::string& setting, const std::string& value) {
+void NodeEditorWindow::AddNode(const std::string& type, const Settings& settings) {
   graph::Graph& graph = document_->graph();
   const NodeDesc* desc = graph::Library::Get().Find(type);
   if (!desc) return;
   Node& node = graph.AddNode(type, add_x_, add_y_);
-  node.settings = Prototype(*desc, setting, value).settings;
+  node.owner = owner_;
+  node.settings = Prototype(*desc, settings).settings;
   const int id = node.id;
   ed::SetNodePosition(NodeId(id), ImVec2(add_x_, add_y_));
 
@@ -858,9 +1316,142 @@ void NodeEditorWindow::AddNode(const std::string& type, const std::string& setti
   Edited();
 }
 
+void NodeEditorWindow::AcceptDrop(const ImVec2& at) {
+  graph::Graph& graph = document_->graph();
+  const ImGuiPayload* variable = ImGui::AcceptDragDropPayload(kVariablePayload);
+  const ImGuiPayload* routine = variable ? nullptr : ImGui::AcceptDragDropPayload(kRoutinePayload);
+  const ImGuiPayload* dispatcher = variable || routine ? nullptr : ImGui::AcceptDragDropPayload(kDispatcherPayload);
+  if (!variable && !routine && !dispatcher) return;
+  add_x_ = at.x;
+  add_y_ = at.y;
+  pending_pin_.reset();
+
+  if (routine) {
+    int id = 0;
+    std::memcpy(&id, routine->Data, sizeof(id));
+    const Routine* found = graph.FindRoutine(id);
+    if (!found) return;
+    if (found->kind == RoutineKind::kMacro && found->id == owner_) {
+      SetStatus("A macro can't use itself", true);
+      return;
+    }
+    AddNode(std::string(graph::kRoutineCall), {{std::string(graph::kRoutineSetting), std::to_string(id)}, {std::string(graph::kRoutineNameSetting), found->name}});
+    return;
+  }
+
+  if (dispatcher) {
+    dropped_member_.assign(static_cast<const char*>(dispatcher->Data), static_cast<size_t>(dispatcher->DataSize));
+    dropped_dispatcher_ = true;
+    open_drop_menu_ = true;
+    return;
+  }
+
+  // As in a blueprint: Ctrl drops a Get, Alt a Set, and otherwise it asks.
+  const std::string name(static_cast<const char*>(variable->Data), static_cast<size_t>(variable->DataSize));
+  const ImGuiIO& io = ImGui::GetIO();
+  if (io.KeyCtrl) AddNode("var.get", {{"Variable", name}});
+  else if (io.KeyAlt) AddNode("var.set", {{"Variable", name}});
+  else {
+    dropped_member_ = name;
+    dropped_dispatcher_ = false;
+    open_drop_menu_ = true;
+  }
+}
+
+void NodeEditorWindow::DrawDropMenu() {
+  if (!ImGui::BeginPopup(kDropMenu)) return;
+  const std::string name = dropped_member_;
+  const graph::Graph& graph = document_->graph();
+  const graph::Variable* variable = dropped_dispatcher_ ? nullptr : graph.FindVariable(name);
+  if (!variable && !(dropped_dispatcher_ && graph.FindDispatcher(name))) {
+    ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+    return;
+  }
+  ImGui::TextDisabled("%s", name.c_str());
+  ImGui::Separator();
+  // Each node that can pick it: Get and Set, a Bool's If, a number's Increment; Call, Bind, a custom event taking
+  // the dispatcher's params.
+  const auto offer = [&](const char* type) {
+    const NodeDesc* desc = graph::Library::Get().Find(type);
+    const graph::SettingDesc* setting = desc ? MemberSetting(*desc) : nullptr;
+    if (!setting || (variable && !graph::AcceptsVariable(*setting, variable->type))) return;
+    const char* shortcut = std::strcmp(type, "var.get") == 0 ? "Ctrl" : std::strcmp(type, "var.set") == 0 ? "Alt" : nullptr;
+    if (ImGui::MenuItem(MemberLabel(*desc, *setting, name).c_str(), shortcut)) AddNode(type, {{setting->name, name}});
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", desc->description.c_str());
+  };
+  if (dropped_dispatcher_) {
+    for (const char* type : kDispatcherNodes) offer(type);
+  } else {
+    for (const char* type : kVariableNodes) offer(type);
+  }
+  ImGui::EndPopup();
+}
+
+void NodeEditorWindow::DrawNodeMenu() {
+  if (!ImGui::BeginPopup(kNodeMenu)) return;
+  graph::Graph& graph = document_->graph();
+  const Node* node = graph.FindNode(context_node_);
+  if (!node) {
+    ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+    return;
+  }
+  const int id = node->id;
+  ImGui::TextDisabled("%s", graph::TitleOf(*node).c_str());
+  ImGui::Separator();
+
+  // A variable's nodes turn into each other: a Bool's Get into its own If, with True and False.
+  const graph::Variable* variable = graph.FindVariable(node->Setting("Variable"));
+  const std::string type = node->type;
+  if (type == "var.get" && variable && variable->type == PinKind::kBool && ImGui::MenuItem("Convert to Branch")) ConvertNode(id, "var.branch");
+  if (type == "var.get" && ImGui::MenuItem("Convert to Set")) ConvertNode(id, "var.set");
+  if ((type == "var.set" || type == "var.branch") && ImGui::MenuItem("Convert to Get")) ConvertNode(id, "var.get");
+
+  // A use of a function or macro opens its graph.
+  const Routine* routine = type == graph::kRoutineCall ? graph::RoutineOf(*node, graph) : nullptr;
+  if (routine && ImGui::MenuItem(routine->kind == RoutineKind::kMacro ? "Open Macro" : "Open Function")) {
+    selected_routine_ = routine->id;
+    focus_ = Focus::kRoutine;
+    ShowGraph(routine->id);
+  }
+
+  if (graph.FindNode(id) && !IsRoutineEnd(*graph.FindNode(id))) {
+    if (ImGui::MenuItem("Duplicate", "Ctrl+D")) {
+      const Node* original = graph.FindNode(id);
+      const int ids[] = {id};
+      PasteNodes(graph::WriteNodes(graph, ids), original->x + kDuplicateOffset, original->y + kDuplicateOffset);
+    }
+    if (ImGui::MenuItem("Delete", "Del")) {
+      // A reroute joins its link up again, as with the Delete key.
+      if (type == graph::kReroute) graph::DissolveReroute(graph, id);
+      else graph.RemoveNode(id);
+      if (selected_node_ == id) selected_node_ = 0;
+      Edited();
+    }
+  } else if (graph.FindNode(id)) {
+    ImGui::TextDisabled("A function or macro keeps its inputs and outputs");
+  }
+  ImGui::EndPopup();
+}
+
+void NodeEditorWindow::ConvertNode(int id, const std::string& type) {
+  graph::Graph& graph = document_->graph();
+  Node* node = graph.FindNode(id);
+  if (!node || !graph::Library::Get().Find(type)) return;
+  node->type = type;
+  node->values.clear();
+  // Links to pins the new type doesn't have go; the exec input stays where both have one.
+  graph::RemoveDanglingLinks(graph);
+  selected_node_ = id;
+  focus_ = Focus::kNode;
+  Edited();
+}
+
 void NodeEditorWindow::SyncFromCanvas() {
   // Positions are kept in the graph. A drag is one undo step, taken when the mouse lets go.
   for (Node& node : document_->graph().nodes()) {
+    if (node.owner != owner_) continue;
     const ImVec2 position = ed::GetNodePosition(NodeId(node.id));
     if (position.x != node.x || position.y != node.y) {
       node.x = position.x;
@@ -885,7 +1476,7 @@ void NodeEditorWindow::SyncFromCanvas() {
 
 void NodeEditorWindow::DrawLua() {
   if (lua_view_ != document_->compiled().lua) lua_view_ = document_->compiled().lua;
-  if (ImGui::SmallButton("Copy")) ImGui::SetClipboardText(lua_view_.c_str());
+  if (glass::SmallButton("Copy", glass::kAccent)) ImGui::SetClipboardText(lua_view_.c_str());
   ImGui::SameLine();
   ImGui::TextDisabled("What the graph saves as scripts/%s.graph.lua", document_->name().c_str());
   node_widgets::InputStringMultiline("##lua", lua_view_, ImGui::GetContentRegionAvail(), ImGuiInputTextFlags_ReadOnly);
@@ -901,7 +1492,13 @@ void NodeEditorWindow::DrawDetails() {
   switch (focus_) {
     case Focus::kNode: DrawNodeDetails(); break;
     case Focus::kVariable: DrawVariableDetails(); break;
-    case Focus::kNone: ImGui::TextDisabled("Select a node or a variable to edit it here."); break;
+    case Focus::kRoutine: DrawRoutineDetails(); break;
+    case Focus::kDispatcher: DrawDispatcherDetails(); break;
+    case Focus::kNone:
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+      ImGui::TextWrapped("Select a node, function, macro, variable or event dispatcher to edit it here.");
+      ImGui::PopStyleColor();
+      break;
   }
   DrawProblems();
 }
@@ -915,13 +1512,22 @@ void NodeEditorWindow::DrawNodeDetails() {
     ImGui::TextColored(kErrorColor, "There's no %s node; the game may not declare it any more.", node->type.c_str());
     return;
   }
-  ImGui::TextWrapped("%s", desc->description.c_str());
+  const Routine* routine = IsRoutineNode(*node) ? graph::RoutineOf(*node, document_->graph()) : nullptr;
+  ImGui::TextWrapped("%s", routine && !routine->comment.empty() ? routine->comment.c_str() : desc->description.c_str());
   ImGui::TextDisabled("n%d in the Lua", node->id);
+  if (routine && glass::Button(routine->kind == RoutineKind::kMacro ? "Edit Macro" : "Edit Function", glass::kAccent)) {
+    selected_routine_ = routine->id;
+    focus_ = Focus::kRoutine;
+    if (node->type == graph::kRoutineCall) ShowGraph(routine->id);
+    return;
+  }
 
   for (const graph::SettingDesc& setting : desc->settings) {
+    if (setting.shown && !setting.shown(*node)) continue;
     ImGui::PushID(setting.name.c_str());
     std::string value = graph::SettingOf(*node, setting.name);
     switch (setting.kind) {
+      case graph::SettingKind::kList: DrawListSetting(*node, setting); break;
       case graph::SettingKind::kAddress:
       case graph::SettingKind::kText:
         if (node_widgets::InputString(setting.name.c_str(), value, 0, setting.kind == graph::SettingKind::kAddress ? "0x82000000" : nullptr)) {
@@ -931,16 +1537,30 @@ void NodeEditorWindow::DrawNodeDetails() {
         if (ImGui::IsItemDeactivatedAfterEdit()) Edited();
         break;
       case graph::SettingKind::kChoice:
-      case graph::SettingKind::kVariable: {
+      case graph::SettingKind::kVariable:
+      case graph::SettingKind::kDispatcher: {
         std::vector<std::string> choices = setting.choices;
         if (setting.kind == graph::SettingKind::kVariable) {
           choices.clear();
-          for (const graph::Variable& variable : document_->graph().variables()) choices.push_back(variable.name);
+          for (const graph::Variable& variable : document_->graph().variables()) {
+            if (graph::AcceptsVariable(setting, variable.type)) choices.push_back(variable.name);
+          }
+        }
+        if (setting.kind == graph::SettingKind::kDispatcher) {
+          choices.clear();
+          for (const graph::Dispatcher& dispatcher : document_->graph().dispatchers()) choices.push_back(dispatcher.name);
         }
         if (ImGui::BeginCombo(setting.name.c_str(), value.empty() ? "None" : value.c_str())) {
+          if (setting.optional && ImGui::Selectable("None", value.empty()) && !value.empty()) {
+            node->settings[setting.name].clear();
+            graph::RemoveDanglingLinks(document_->graph());
+            Edited();
+          }
           for (const std::string& choice : choices) {
             if (ImGui::Selectable(choice.c_str(), choice == value) && choice != value) {
               node->settings[setting.name] = choice;
+              // Pins that came from the old pick go, with their links.
+              graph::RemoveDanglingLinks(document_->graph());
               Edited();
             }
           }
@@ -954,6 +1574,68 @@ void NodeEditorWindow::DrawNodeDetails() {
   }
 }
 
+void NodeEditorWindow::DrawListSetting(Node& node, const graph::SettingDesc& setting) {
+  graph::Graph& graph = document_->graph();
+  std::vector<std::string> entries = graph::ListOf(node, setting.name);
+  const float font = ImGui::GetFontSize();
+  ImGui::SeparatorText(setting.name.c_str());
+
+  int removed = -1;
+  bool changed = false;
+  for (size_t index = 0; index < entries.size(); ++index) {
+    ImGui::PushID(static_cast<int>(index));
+    std::string text = entries[index];
+    ImGui::SetNextItemWidth(font * 10.0f);
+    if (node_widgets::InputString("##entry", text, ImGuiInputTextFlags_EnterReturnsTrue) && text != entries[index]) {
+      // An entry is a pin, so it can't share a name with another of the node's pins.
+      const NodePins pins = graph::PinsOf(node, graph);
+      const bool taken = graph::FindPin(pins.inputs, text) || graph::FindPin(pins.outputs, text);
+      if (text.empty() || text.find('\n') != std::string::npos) {
+        SetStatus("Give it a name", true);
+      } else if (taken) {
+        SetStatus("The node has a pin named " + text + " already", true);
+      } else {
+        // Its pin's links and typed value follow.
+        graph.RenamePin({node.id, entries[index]}, true, text);
+        graph.RenamePin({node.id, entries[index]}, false, text);
+        entries[index] = text;
+        changed = true;
+      }
+    }
+    ImGui::SetItemTooltip("Press Enter to rename");
+    ImGui::SameLine();
+    if (glass::SmallButton("x", glass::kDanger)) removed = static_cast<int>(index);
+    ImGui::SetItemTooltip("Remove it, with its pin's links");
+    ImGui::PopID();
+  }
+  if (removed >= 0) {
+    entries.erase(entries.begin() + removed);
+    changed = true;
+  }
+
+  const std::string add = "Add " + (setting.item.empty() ? std::string("Entry") : setting.item);
+  if (glass::SmallButton(add.c_str(), glass::kCreate)) {
+    // The next number after the largest when they're all numbers, as a switch on an Int's cases are; else a name.
+    long long next = 0;
+    bool numbers = !entries.empty();
+    for (const std::string& entry : entries) {
+      char* end = nullptr;
+      const long long number = std::strtoll(entry.c_str(), &end, 0);
+      if (!end || *end != '\0') numbers = false;
+      else next = std::max(next, number + 1);
+    }
+    std::string name = numbers || entries.empty() ? std::to_string(next) : setting.item + std::to_string(entries.size());
+    for (int suffix = 1; std::find(entries.begin(), entries.end(), name) != entries.end(); ++suffix) name = setting.item + std::to_string(entries.size() + suffix);
+    entries.push_back(name);
+    changed = true;
+  }
+
+  if (!changed) return;
+  node.settings[setting.name] = graph::JoinList(entries);
+  graph::RemoveDanglingLinks(graph);
+  Edited();
+}
+
 void NodeEditorWindow::DrawVariableDetails() {
   graph::Graph& graph = document_->graph();
   graph::Variable* variable = graph.FindVariable(selected_variable_);
@@ -963,21 +1645,16 @@ void NodeEditorWindow::DrawVariableDetails() {
   std::string name = variable->name;
   if (node_widgets::InputString("Name", name, ImGuiInputTextFlags_EnterReturnsTrue) && name != variable->name) {
     std::string reason;
-    if (graph.FindVariable(name)) {
-      SetStatus("There's a variable named " + name + " already", true);
-    } else if (!graph::IsVariableName(name, graph::GameGlobals(), &reason)) {
+    if (!CheckName(graph, name, &reason)) {
       SetStatus(reason, true);
     } else {
-      // Its Get and Set nodes follow.
-      for (Node& node : graph.nodes()) {
-        if ((node.type == "var.get" || node.type == "var.set") && node.Setting("Variable") == variable->name) node.settings["Variable"] = name;
-      }
-      variable->name = name;
+      // The nodes using it follow.
+      graph::RenameVariable(graph, variable->name, name);
       selected_variable_ = name;
       Edited();
     }
   }
-  ImGui::SetItemTooltip("Press Enter to rename. Its Get and Set nodes follow");
+  ImGui::SetItemTooltip("Press Enter to rename. The nodes using it follow");
 
   if (ImGui::BeginCombo("Type", KindLabel(variable->type))) {
     for (PinKind kind : kVariableKinds) {
@@ -1023,6 +1700,180 @@ void NodeEditorWindow::DrawVariableDetails() {
 
   if (node_widgets::InputStringMultiline("Comment", variable->comment, ImVec2(0.0f, ImGui::GetTextLineHeight() * 3.0f))) Edited(false);
   if (ImGui::IsItemDeactivatedAfterEdit()) Edited();
+
+  ImGui::Spacing();
+  if (glass::Button("Delete Variable", glass::kDanger)) {
+    // The nodes using it go with it.
+    graph::DeleteVariable(graph, variable->name);
+    selected_variable_.clear();
+    focus_ = Focus::kNone;
+    Edited();
+  }
+}
+
+void NodeEditorWindow::DrawRoutineDetails() {
+  graph::Graph& graph = document_->graph();
+  Routine* routine = graph.FindRoutine(selected_routine_);
+  if (!routine) return;
+  const bool macro = routine->kind == RoutineKind::kMacro;
+  ImGui::PushStyleColor(ImGuiCol_Text, RoutineColor(routine->kind));
+  ImGui::SeparatorText(macro ? "Macro" : "Function");
+  ImGui::PopStyleColor();
+  ImGui::TextWrapped("%s", macro ? "Written out in full wherever it's used, so its inputs and outputs can be exec pins, like Branch's." : "A graph of its own, called from the event graph and other functions. It becomes a Lua function.");
+
+  std::string name = routine->name;
+  if (node_widgets::InputString("Name", name, ImGuiInputTextFlags_EnterReturnsTrue) && name != routine->name) {
+    std::string reason;
+    if (!CheckName(graph, name, &reason)) {
+      SetStatus(reason, true);
+    } else {
+      // The nodes using it follow.
+      graph::RenameRoutine(graph, routine->id, name);
+      Edited();
+    }
+  }
+  ImGui::SetItemTooltip("Press Enter to rename. The nodes using it follow");
+
+  if (!macro) {
+    bool pure = routine->pure;
+    if (ImGui::Checkbox("Pure", &pure)) {
+      routine->pure = pure;
+      // Its exec pins come or go, and their links with them.
+      graph::RemoveDanglingLinks(graph);
+      Edited();
+    }
+    ImGui::SetItemTooltip("No exec pins: worked out wherever its outputs are read, as Add is");
+  }
+
+  DrawParams(*routine, false);
+  DrawParams(*routine, true);
+
+  ImGui::Spacing();
+  if (node_widgets::InputStringMultiline("Comment", routine->comment, ImVec2(0.0f, ImGui::GetTextLineHeight() * 3.0f))) Edited(false);
+  if (ImGui::IsItemDeactivatedAfterEdit()) Edited();
+
+  ImGui::Spacing();
+  if (owner_ != routine->id && glass::Button(macro ? "Open Macro" : "Open Function", glass::kAccent)) ShowGraph(routine->id);
+  if (owner_ != routine->id) ImGui::SameLine();
+  if (glass::Button(macro ? "Delete Macro" : "Delete Function", glass::kDanger)) {
+    // Its graph and the nodes using it go with it.
+    const int id = routine->id;
+    graph::DeleteRoutine(graph, id);
+    if (owner_ == id) ShowGraph(0);
+    focus_ = Focus::kNone;
+    Edited();
+  }
+}
+
+void NodeEditorWindow::DrawParams(Routine& routine, bool outputs) {
+  graph::Graph& graph = document_->graph();
+  const bool function = routine.kind == RoutineKind::kFunction;
+  const int id = routine.id;
+  const auto refuse = [function](const std::string& name) -> std::string {
+    if (function && (name == graph::kExecIn || name == graph::kExecOut)) return name + " is kept for the function's own exec pins";
+    return {};
+  };
+  // The pins of its inputs node or outputs node, and of its calls, follow with their links.
+  const auto renamed = [&graph, id, outputs](const std::string& from, const std::string& to) { graph::RenameRoutineParam(graph, id, outputs, from, to); };
+  DrawParamList(outputs ? "Outputs" : "Inputs", outputs ? routine.outputs : routine.inputs, graph::ParamKinds(routine.kind), outputs ? "Add Output" : "Add Input", outputs ? "Result" : "Value", refuse, renamed);
+}
+
+void NodeEditorWindow::DrawParamList(const char* title, std::vector<graph::Param>& params, const std::vector<PinKind>& kinds, const char* add_label, const std::string& base, const std::function<std::string(const std::string& name)>& refuse, const std::function<void(const std::string& from, const std::string& to)>& renamed) {
+  graph::Graph& graph = document_->graph();
+  const float font = ImGui::GetFontSize();
+  ImGui::SeparatorText(title);
+  ImGui::PushID(title);
+
+  int removed = -1;
+  for (size_t index = 0; index < params.size(); ++index) {
+    graph::Param& param = params[index];
+    ImGui::PushID(static_cast<int>(index));
+    Swatch(PinColor(param.type));
+
+    std::string name = param.name;
+    ImGui::SetNextItemWidth(font * 7.0f);
+    if (node_widgets::InputString("##name", name, ImGuiInputTextFlags_EnterReturnsTrue) && name != param.name) {
+      const bool taken = std::any_of(params.begin(), params.end(), [&](const graph::Param& other) { return other.name == name; });
+      const std::string refused = name.empty() ? "Give it a name" : taken ? "There's one named " + name + " already" : refuse(name);
+      if (!refused.empty()) {
+        SetStatus(refused, true);
+      } else {
+        renamed(param.name, name);
+        param.name = name;
+        Edited();
+      }
+    }
+    ImGui::SetItemTooltip("Press Enter to rename");
+
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(font * 5.0f);
+    if (ImGui::BeginCombo("##type", KindLabel(param.type))) {
+      for (PinKind kind : kinds) {
+        if (ImGui::Selectable(KindLabel(kind), kind == param.type) && kind != param.type) {
+          param.type = kind;
+          Edited();
+        }
+      }
+      ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (glass::SmallButton("x", glass::kDanger)) removed = static_cast<int>(index);
+    ImGui::SetItemTooltip("Remove it");
+    ImGui::PopID();
+  }
+  if (removed >= 0) {
+    params.erase(params.begin() + removed);
+    graph::RemoveDanglingLinks(graph);
+    Edited();
+  }
+
+  if (glass::SmallButton(add_label, glass::kCreate)) {
+    params.push_back({UniqueParamName(params, base), PinKind::kFloat});
+    Edited();
+  }
+  ImGui::PopID();
+}
+
+void NodeEditorWindow::DrawDispatcherDetails() {
+  graph::Graph& graph = document_->graph();
+  graph::Dispatcher* dispatcher = graph.FindDispatcher(selected_dispatcher_);
+  if (!dispatcher) return;
+  ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(PinColor(PinKind::kDelegate)));
+  ImGui::SeparatorText("Event Dispatcher");
+  ImGui::PopStyleColor();
+  ImGui::TextWrapped("Events bound to it with Bind Event run when it's called, with its params. Drag it onto the graph to call it or bind to it.");
+
+  std::string name = dispatcher->name;
+  if (node_widgets::InputString("Name", name, ImGuiInputTextFlags_EnterReturnsTrue) && name != dispatcher->name) {
+    std::string reason;
+    if (!CheckName(graph, name, &reason)) {
+      SetStatus(reason, true);
+    } else {
+      // The nodes using it follow.
+      graph::RenameDispatcher(graph, dispatcher->name, name);
+      selected_dispatcher_ = name;
+      Edited();
+    }
+  }
+  ImGui::SetItemTooltip("Press Enter to rename. The nodes using it follow");
+
+  // Call's inputs and the outputs of the custom events taking its params follow, with their links.
+  const std::string current = dispatcher->name;
+  const auto renamed = [&graph, current](const std::string& from, const std::string& to) { graph::RenameDispatcherParam(graph, current, from, to); };
+  DrawParamList("Params", dispatcher->params, graph::ParamKinds(RoutineKind::kFunction), "Add Param", "Value", [](const std::string&) { return std::string(); }, renamed);
+
+  ImGui::Spacing();
+  if (node_widgets::InputStringMultiline("Comment", dispatcher->comment, ImVec2(0.0f, ImGui::GetTextLineHeight() * 3.0f))) Edited(false);
+  if (ImGui::IsItemDeactivatedAfterEdit()) Edited();
+
+  ImGui::Spacing();
+  if (glass::Button("Delete Event Dispatcher", glass::kDanger)) {
+    // The nodes using it go with it; custom events taking its params keep going without them.
+    graph::DeleteDispatcher(graph, dispatcher->name);
+    selected_dispatcher_.clear();
+    focus_ = Focus::kNone;
+    Edited();
+  }
 }
 
 void NodeEditorWindow::DrawProblems() {
@@ -1035,11 +1886,16 @@ void NodeEditorWindow::DrawProblems() {
       ImGui::PushStyleColor(ImGuiCol_Text, problem.warning ? kWarningColor : kErrorColor);
       const Node* node = document_->graph().FindNode(problem.node);
       const std::string text = node ? graph::TitleOf(*node) + ": " + problem.message : problem.message;
-      ImGui::PushTextWrapPos(0.0f);
-      if (ImGui::Selectable(text.c_str()) && node) navigate_to_ = node->id;
-      ImGui::PopTextWrapPos();
+      ImGui::TextWrapped("%s", text.c_str());
       ImGui::PopStyleColor();
-      if (node) ImGui::SetItemTooltip("Click to find it on the canvas");
+      if (node) {
+        ImGui::SetItemTooltip("Click to find it on the canvas");
+        // In whichever graph it's in: the event graph or a function's or macro's.
+        if (ImGui::IsItemClicked()) {
+          ShowGraph(node->owner);
+          navigate_to_ = node->id;
+        }
+      }
       ImGui::PopID();
     }
   }
@@ -1077,9 +1933,12 @@ void NodeEditorWindow::OpenGraph(const std::string& name) {
   }
   document_ = std::move(document);
   Last() = {mod_folder_, name};
+  owner_ = 0;
   focus_ = Focus::kNone;
   selected_node_ = 0;
   selected_variable_.clear();
+  selected_routine_ = 0;
+  selected_dispatcher_.clear();
   pending_pin_.reset();
   ResetCanvas();
 }
@@ -1156,6 +2015,7 @@ void NodeEditorWindow::CreateGraph(const std::string& name) {
   }
   document_ = std::make_unique<graph::Document>(mod->dir, name);
   Last() = {mod_folder_, name};
+  owner_ = 0;
   focus_ = Focus::kNone;
   selected_node_ = 0;
   selected_variable_.clear();
@@ -1232,7 +2092,7 @@ void NodeEditorWindow::DrawPopups() {
     bool done = false;
     if (ask_ == Ask::kDeleteGraph) {
       ImGui::TextWrapped("Delete %s and its script? This can't be undone.", ask_text_.c_str());
-      if (ImGui::Button("Delete")) {
+      if (glass::Button("Delete", glass::kDanger)) {
         DeleteGraph();
         done = true;
       }
@@ -1240,7 +2100,7 @@ void NodeEditorWindow::DrawPopups() {
       if (ask_ == Ask::kNewMod) ImGui::TextWrapped("A folder in the mods folder, with a graph to start.");
       if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
       const bool entered = node_widgets::InputString("Name", ask_text_, ImGuiInputTextFlags_EnterReturnsTrue);
-      if (ImGui::Button("OK") || entered) {
+      if (glass::Button("OK", glass::kAccent) || entered) {
         const std::string name = ask_text_;
         if (ask_ == Ask::kNewMod) AfterSaving([this, name] { CreateMod(name); });
         if (ask_ == Ask::kNewGraph) AfterSaving([this, name] { CreateGraph(name); });
@@ -1249,7 +2109,7 @@ void NodeEditorWindow::DrawPopups() {
       }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) done = true;
+    if (glass::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) done = true;
     if (done) {
       ask_ = Ask::kNone;
       ImGui::CloseCurrentPopup();
@@ -1260,18 +2120,18 @@ void NodeEditorWindow::DrawPopups() {
   if (ImGui::BeginPopupModal(kSavePopup, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::Text("Save the changes to %s first?", document_ ? document_->name().c_str() : "the graph");
     std::function<void()> next;
-    if (ImGui::Button("Save")) {
+    if (glass::Button("Save", glass::kAccent)) {
       Save(false);
       if (document_ && !document_->dirty()) next = std::move(after_saving_);
       ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Don't Save")) {
+    if (glass::Button("Don't Save", glass::kDanger)) {
       next = std::move(after_saving_);
       ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+    if (glass::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
       after_saving_ = {};
       ImGui::CloseCurrentPopup();
     }
@@ -1288,16 +2148,23 @@ void NodeEditorWindow::Edited(bool settled) {
 
 void NodeEditorWindow::Undo() {
   if (!document_ || !document_->Undo()) return;
-  place_nodes_ = true;
-  if (!document_->graph().FindNode(selected_node_)) selected_node_ = 0;
-  if (!document_->graph().FindVariable(selected_variable_)) selected_variable_.clear();
+  AfterHistory();
 }
 
 void NodeEditorWindow::Redo() {
   if (!document_ || !document_->Redo()) return;
+  AfterHistory();
+}
+
+void NodeEditorWindow::AfterHistory() {
+  // The graph was replaced: the canvas places its nodes again, and what was shown or selected may be gone.
+  graph::Graph& graph = document_->graph();
   place_nodes_ = true;
-  if (!document_->graph().FindNode(selected_node_)) selected_node_ = 0;
-  if (!document_->graph().FindVariable(selected_variable_)) selected_variable_.clear();
+  if (owner_ != 0 && !graph.FindRoutine(owner_)) ShowGraph(0);
+  if (!graph.FindNode(selected_node_)) selected_node_ = 0;
+  if (!graph.FindVariable(selected_variable_)) selected_variable_.clear();
+  if (!graph.FindRoutine(selected_routine_)) selected_routine_ = 0;
+  if (!graph.FindDispatcher(selected_dispatcher_)) selected_dispatcher_.clear();
 }
 
 void NodeEditorWindow::SetStatus(std::string text, bool error) {
