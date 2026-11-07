@@ -294,8 +294,8 @@ class Namespace {
   // Where the node editor lists declarations whose names start with `prefix` ("parts." or "part_"): `title`, a
   // top-level category of its add menu ("Parts"). The longest matching prefix wins; the rest go under Game.
   Namespace& Category(std::string prefix, std::string title);
-  // What a function's parameters or an event's values are called, in order ("id", "part", "vehicle"): the node
-  // editor's pins, which are otherwise Arg 1, Arg 2... An event named this way has this many values, not three.
+  // The node editor's pins for a function's parameters or an event's values, in order: "id", or "part:Part" for an
+  // address as one of the namespace's types ("->Vehicle" types a result). A named event has that many values, not three.
   Namespace& Args(std::string name, std::vector<std::string> names);
 
   const std::string& name() const { return name_; }

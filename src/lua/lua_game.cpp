@@ -53,7 +53,10 @@ Value CheckValue(lua_State* L, int arg, ValueType type) {
   switch (type) {
     case ValueType::kNone: return {};
     case ValueType::kBool: return Value(lua_toboolean(L, arg) != 0);
-    case ValueType::kInt: return Value(static_cast<int64_t>(luaL_checkinteger(L, arg)));
+    case ValueType::kInt:
+      // An object where an integer goes is its address, for functions that take addresses (Namespace::Args types).
+      if (auto* ud = static_cast<ObjectUD*>(luaL_testudata(L, arg, kObjectMeta))) return Value(static_cast<int64_t>(ud->address));
+      return Value(static_cast<int64_t>(luaL_checkinteger(L, arg)));
     case ValueType::kFloat: return Value(static_cast<double>(luaL_checknumber(L, arg)));
     case ValueType::kString: return Value(std::string(luaL_checkstring(L, arg)));
     case ValueType::kObject: return Value(CheckObject(L, arg));
