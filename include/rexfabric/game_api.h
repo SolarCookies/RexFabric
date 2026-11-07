@@ -294,6 +294,9 @@ class Namespace {
   // Where the node editor lists declarations whose names start with `prefix` ("parts." or "part_"): `title`, a
   // top-level category of its add menu ("Parts"). The longest matching prefix wins; the rest go under Game.
   Namespace& Category(std::string prefix, std::string title);
+  // What a function's parameters or an event's values are called, in order ("id", "part", "vehicle"): the node
+  // editor's pins, which are otherwise Arg 1, Arg 2... An event named this way has this many values, not three.
+  Namespace& Args(std::string name, std::vector<std::string> names);
 
   const std::string& name() const { return name_; }
 
@@ -324,6 +327,7 @@ struct NamespaceDef {
   std::vector<std::string> events;
   std::vector<std::string> lua;  // run in order, after every namespace's declarations
   std::vector<std::pair<std::string, std::string>> categories;  // name prefix (without the namespace), title
+  std::vector<std::pair<std::string, std::vector<std::string>>> args;  // full name, its arguments' names
 };
 
 const std::vector<std::unique_ptr<NamespaceDef>>& Namespaces();

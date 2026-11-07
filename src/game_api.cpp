@@ -140,6 +140,11 @@ Namespace& Namespace::Category(std::string prefix, std::string title) {
   return *this;
 }
 
+Namespace& Namespace::Args(std::string name, std::vector<std::string> names) {
+  FindOrAdd(name_).args.emplace_back(Qualify(name), std::move(names));
+  return *this;
+}
+
 // Lookups -----------------------------------------------------------------------------------------------
 
 const std::vector<std::unique_ptr<NamespaceDef>>& Namespaces() { return GetRegistry().namespaces; }
