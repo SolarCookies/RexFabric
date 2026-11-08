@@ -72,6 +72,8 @@ enum class SettingKind : uint8_t {
   kVariable,    // one of the graph's variables
   kDispatcher,  // one of the graph's event dispatchers
   kList,        // entries added in the details panel, one a line: a switch's cases, a select's options
+  kScript,      // a file in the mod's scripts folder, its code read and edited in the details panel
+  kCode,        // Lua typed into the details panel, several lines
 };
 
 struct SettingDesc {
@@ -155,6 +157,8 @@ class Library {
 
 void AddBuiltinNodes(Library& library);
 void AddGameNodes(Library& library);
+// From the game's Lua API definitions (LuaLS ---@meta files) in lua_api beside its executable (nodes_api.cpp).
+void AddApiNodes(Library& library);
 
 // Pins, for the node descriptions.
 Pin ExecPin(std::string_view name = kExecIn);

@@ -80,6 +80,7 @@ const Library& Library::Get() {
     Library made;
     AddBuiltinNodes(made);
     AddGameNodes(made);
+    AddApiNodes(made);
     return made;
   }();
   return library;

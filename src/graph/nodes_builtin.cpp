@@ -3,6 +3,7 @@
 // they stand for.
 
 #include <algorithm>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -930,6 +931,7 @@ void AddLogic(Library& library) {
   library.Add(Binary("logic.less_equal", "Less Or Equal", logic, "A <= B.", number, boolean, "<="));
   library.Add(Binary("logic.greater", "Greater", logic, "A > B.", number, boolean, ">"));
   library.Add(Binary("logic.greater_equal", "Greater Or Equal", logic, "A >= B.", number, boolean, ">="));
+  library.Add(Keyed(Pure("logic.or_default", "Or Default", logic, "Value, or Default when Value is nil or false.", {DataPin("Value", PinKind::kAny), DataPin("Default", PinKind::kAny, "0")}, DataPin("Result", PinKind::kAny), [](Emitter& emit) { return "(" + emit.Input("Value") + " or " + emit.Input("Default") + ")"; }), "or else fallback coalesce nil"));
   library.Add(Pure("logic.is_set", "Is Set", logic, "True when Value is anything but nil: an object that exists, a cvar that's there.", {DataPin("Value", PinKind::kAny)}, DataPin("Result", boolean), [](Emitter& emit) { return "(" + emit.Input("Value") + " ~= nil)"; }));
 }
 
@@ -942,6 +944,111 @@ void AddText(Library& library) {
   library.Add(Pure("text.hex", "Hex", text, "An integer as eight hex digits, like 82558D28.", {DataPin("Value", PinKind::kInt)}, DataPin("Result", string), [](Emitter& emit) { return "string.format(\"%08X\", " + emit.Input("Value") + ")"; }));
   library.Add(Pure("text.length", "Length", text, "How many bytes the text has.", {DataPin("Text", string)}, DataPin("Result", PinKind::kInt), [](Emitter& emit) { return "#" + emit.Input("Text"); }));
   library.Add(Pure("text.contains", "Contains", text, "True when Part is somewhere in Text.", {DataPin("Text", string), DataPin("Part", string)}, DataPin("Result", PinKind::kBool), [](Emitter& emit) { return "(string.find(" + emit.Input("Text") + ", " + emit.Input("Part") + ", 1, true) ~= nil)"; }));
+  library.Add(Keyed(Pure("text.starts_with", "Starts With", text, "True when Text begins with Start.", {DataPin("Text", string), DataPin("Start", string)}, DataPin("Result", PinKind::kBool), [](Emitter& emit) { const std::string start = emit.Input("Start"); return "(string.sub(" + emit.Input("Text") + ", 1, #" + start + ") == " + start + ")"; }), "prefix begins"));
+  library.Add(Keyed(Pure("text.match", "Match", text, "What Pattern (a Lua pattern) finds in Text: its first capture, or the whole match when it has none. Nil when it doesn't match.", {DataPin("Text", string), DataPin("Pattern", string, "^(.+)$")}, DataPin("Capture", string), [](Emitter& emit) { return "string.match(" + emit.Input("Text") + ", " + emit.Input("Pattern") + ")"; }), "pattern regex find capture"));
+}
+
+// Tables: arrays and maps ---------------------------------------------------------------------------------
+
+const std::vector<std::string>& ItemTypes() {
+  static const std::vector<std::string> types = {"Any", "String", "Int", "Float", "Bool"};
+  return types;
+}
+
+PinKind ItemKind(std::string_view type) {
+  if (type == "String") return PinKind::kString;
+  if (type == "Int") return PinKind::kInt;
+  if (type == "Float") return PinKind::kFloat;
+  if (type == "Bool") return PinKind::kBool;
+  return PinKind::kAny;
+}
+
+// A Make Array's item count: its Size setting as a whole number, 0 when it isn't one.
+int ArraySize(const Node& node) {
+  const std::string text = SettingOf(node, "Size");
+  int size = 0;
+  for (char c : text) {
+    if (c < '0' || c > '9') return 0;
+    size = std::min(size * 10 + (c - '0'), 4096);
+  }
+  return size;
+}
+
+std::string ItemPin(int index) { return "[" + std::to_string(index) + "]"; }
+
+void AddTables(Library& library) {
+  const std::string category = "Tables";
+  const auto type_setting = [](std::string name, std::string tooltip) {
+    return SettingDesc{.name = std::move(name), .kind = SettingKind::kChoice, .initial = "Any", .choices = ItemTypes(), .tooltip = std::move(tooltip)};
+  };
+
+  // As Unreal's Make Array: an input for each item, typed in or linked.
+  library.Add({.id = "table.make_array", .title = "Make Array", .category = category,
+      .description = "A Lua array of its items, in order from [1]. Set how many items it has with Size, and what they are with Of.",
+      .keywords = "list table literal {}",
+      .role = NodeRole::kPure, .pins = {{}, {DataPin("Array", PinKind::kAny)}},
+      .settings = {type_setting("Of", "What the items are"),
+                   {.name = "Size", .kind = SettingKind::kText, .initial = "3", .tooltip = "How many items: a whole number"}},
+      .shape = [](const Node& node, const Graph&, NodePins& pins) {
+        const PinKind kind = ItemKind(SettingOf(node, "Of"));
+        for (int i = 1; i <= ArraySize(node); ++i) pins.inputs.push_back(DataPin(ItemPin(i), kind));
+      },
+      .title_of = [](const Node& node) { return "Make Array (" + std::to_string(ArraySize(node)) + ")"; },
+      .expression = [](Emitter& emit, std::string_view) -> std::string {
+        std::vector<std::string> items;
+        for (int i = 1; i <= ArraySize(emit.node()); ++i) items.push_back(emit.Input(ItemPin(i)));
+        return "{" + Joined(items) + "}";
+      }});
+
+  library.Add(Keyed(Pure("table.get", "Get Item", category, "The value at Key: an array's item by its index from 1, or a map's by its key. Nil when there's none.",
+      {DataPin("Table", PinKind::kAny), DataPin("Key", PinKind::kAny, "1")}, DataPin("Value", PinKind::kAny),
+      [](Emitter& emit) { return "(" + emit.Input("Table") + ")[" + emit.Input("Key") + "]"; }), "index lookup find []"));
+  library.Add(Keyed(Pure("table.length", "Length", category, "How many items an array has.",
+      {DataPin("Array", PinKind::kAny)}, DataPin("Length", PinKind::kInt),
+      [](Emitter& emit) { return "#" + emit.Input("Array"); }), "count size #"));
+  library.Add(Keyed(Pure("table.contains", "Contains Item", category, "True when Item is one of the array's items.",
+      {DataPin("Array", PinKind::kAny), DataPin("Item", PinKind::kAny)}, DataPin("Result", PinKind::kBool),
+      [](Emitter& emit) {
+        return "(function(array, item) for _, value in ipairs(array) do if value == item then return true end end return false end)(" + emit.Input("Array") + ", " + emit.Input("Item") + ")";
+      }), "has find includes"));
+
+  library.Add({.id = "table.set", .title = "Set Item", .category = category,
+      .description = "Sets the value at Key: an array's item by its index, or a map's by its key. Nil removes a map's.",
+      .keywords = "assign put []=",
+      .pins = {{ExecPin(), DataPin("Table", PinKind::kAny), DataPin("Key", PinKind::kAny, "1"), DataPin("Value", PinKind::kAny)}, {ExecPin(kExecOut)}},
+      .emit = [](Emitter& emit) {
+        emit.Line("(" + emit.Input("Table") + ")[" + emit.Input("Key") + "] = " + emit.Input("Value"));
+        emit.Chain(kExecOut);
+      }});
+  library.Add({.id = "table.add", .title = "Add Item", .category = category,
+      .description = "Puts Item at the end of the array.",
+      .keywords = "append push insert",
+      .pins = {{ExecPin(), DataPin("Array", PinKind::kAny), DataPin("Item", PinKind::kAny)}, {ExecPin(kExecOut)}},
+      .emit = [](Emitter& emit) {
+        emit.Line("table.insert(" + emit.Input("Array") + ", " + emit.Input("Item") + ")");
+        emit.Chain(kExecOut);
+      }});
+  library.Add({.id = "table.remove", .title = "Remove Item", .category = category,
+      .description = "Takes out the array's item at Index, moving the ones after it down.",
+      .keywords = "delete pop",
+      .pins = {{ExecPin(), DataPin("Array", PinKind::kAny), DataPin("Index", PinKind::kInt, "1")}, {ExecPin(kExecOut)}},
+      .emit = [](Emitter& emit) {
+        emit.Line("table.remove(" + emit.Input("Array") + ", " + emit.Input("Index") + ")");
+        emit.Chain(kExecOut);
+      }});
+
+  library.Add({.id = "table.for_each", .title = "For Each Item", .category = category,
+      .description = "Runs Body once for each of the array's items in order, then goes on through Completed. Index and Item only exist in Body's chain.",
+      .keywords = "loop ipairs foreach array",
+      .pins = {{ExecPin(), DataPin("Array", PinKind::kAny)}, {ExecPin("Body"), DataPin("Index", PinKind::kInt), DataPin("Item", PinKind::kAny), ExecPin("Completed")}},
+      .emit = [](Emitter& emit) {
+        emit.Line("for " + emit.Param("Index") + ", " + emit.Param("Item") + " in ipairs(" + emit.Input("Array") + ") do");
+        emit.Indent();
+        emit.Chain("Body");
+        emit.Dedent();
+        emit.Line("end");
+        emit.Chain("Completed");
+      }});
 }
 
 // The host: logging, time, input, cvars and switches -------------------------------------------------------
@@ -1077,9 +1184,72 @@ void AddHost(Library& library) {
       .emit = [](Emitter& emit) { emit.Line("rex.switch.set(" + NamedSetting(emit, "Name") + ", " + emit.Input("Value") + ")"); }});
 }
 
+// Mod -------------------------------------------------------------------------------------------------
+
+// One of the mod's own Lua scripts, as a node: the file runs on its own like every script of the mod, so the graph
+// shows it and edits its code without writing it into the graph's script again.
+void AddScripts(Library& library) {
+  library.Add({.id = "mod.script", .title = "Script File", .category = "Mod",
+      .description = "One of the mod's Lua scripts (scripts/<File>). It runs on its own, as every script of the mod does. Select the node to read and edit its code in the details panel.",
+      .role = NodeRole::kEvent, .pins = {{}, {}},
+      .settings = {{.name = "File", .kind = SettingKind::kScript, .tooltip = "The script's file in the mod's scripts folder, like main.lua"}},
+      .title_of = [](const Node& node) { return Titled(node, "Script ", "File"); },
+      .emit = [](Emitter& emit) {
+        const std::string file = emit.Setting("File");
+        if (file.empty()) emit.Error("Needs a script file");
+        if (file.ends_with(".graph.lua")) emit.Error("A graph's own script is written by the graph");
+        emit.Line("-- scripts/" + file + " runs on its own");
+      }});
+}
+
+// Lua as written, for what nodes don't say: helpers and tables the whole script shares, statements in a chain, and a
+// value worked out from the node's inputs.
+void AddLua(Library& library) {
+  const std::string category = "Lua";
+  library.Add({.id = "lua.chunk", .title = "Lua Chunk", .category = category,
+      .description = "Lua the whole script shares, written at its top before every event: local helper functions and tables the other nodes' Lua uses.",
+      .role = NodeRole::kEvent, .pins = {{}, {}},
+      .settings = {{.name = "Name", .kind = SettingKind::kText, .initial = "Helpers", .tooltip = "What the chunk is called on the canvas"},
+                   {.name = "Code", .kind = SettingKind::kCode}},
+      .title_of = [](const Node& node) { return Titled(node, "", "Name"); },
+      .emit = [](Emitter& emit) { emit.Helper("chunk:" + std::to_string(emit.node().id), emit.Setting("Code")); }});
+
+  // $A to $D in the Lua are the inputs.
+  auto withInputs = [](Emitter& emit, std::string code) {
+    for (const char* pin : {"A", "B", "C", "D"}) {
+      const std::string mark = std::string("$") + pin;
+      if (code.find(mark) == std::string::npos) continue;
+      const std::string value = emit.Input(pin);
+      for (size_t at = code.find(mark); at != std::string::npos; at = code.find(mark, at + value.size())) code.replace(at, mark.size(), value);
+    }
+    return code;
+  };
+  const std::vector<Pin> inputs = {DataPin("A", PinKind::kAny), DataPin("B", PinKind::kAny), DataPin("C", PinKind::kAny), DataPin("D", PinKind::kAny)};
+
+  std::vector<Pin> code_in = {ExecPin()};
+  code_in.insert(code_in.end(), inputs.begin(), inputs.end());
+  library.Add({.id = "lua.code", .title = "Lua Code", .category = category,
+      .description = "Statements run where the chain reaches it. $A to $D are the inputs.",
+      .pins = {code_in, {ExecPin(kExecOut)}},
+      .settings = {{.name = "Code", .kind = SettingKind::kCode}},
+      .emit = [withInputs](Emitter& emit) {
+        std::istringstream lines(withInputs(emit, emit.Setting("Code")));
+        for (std::string line; std::getline(lines, line);) emit.Line(line);
+        emit.Chain(kExecOut);
+      }});
+
+  library.Add({.id = "lua.expression", .title = "Lua Expression", .category = category,
+      .description = "A value worked out by a Lua expression. $A to $D are the inputs.",
+      .role = NodeRole::kPure, .pins = {inputs, {DataPin("Value", PinKind::kAny)}},
+      .settings = {{.name = "Expression", .kind = SettingKind::kText, .initial = "$A"}},
+      .expression = [withInputs](Emitter& emit, std::string_view) { return "(" + withInputs(emit, emit.Setting("Expression")) + ")"; }});
+}
+
 }  // namespace
 
 void AddBuiltinNodes(Library& library) {
+  AddScripts(library);
+  AddLua(library);
   AddEvents(library);
   AddCustomEvent(library);
   AddFlow(library);
@@ -1093,6 +1263,7 @@ void AddBuiltinNodes(Library& library) {
   AddMath(library);
   AddLogic(library);
   AddText(library);
+  AddTables(library);
   AddHost(library);
 }
 

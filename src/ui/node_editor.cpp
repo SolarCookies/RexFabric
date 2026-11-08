@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 
@@ -1609,6 +1610,15 @@ void NodeEditorWindow::DrawNodeDetails() {
     std::string value = graph::SettingOf(*node, setting.name);
     switch (setting.kind) {
       case graph::SettingKind::kList: DrawListSetting(*node, setting); break;
+      case graph::SettingKind::kScript: DrawScriptSetting(*node, setting); break;
+      case graph::SettingKind::kCode:
+        ImGui::TextUnformatted(setting.name.c_str());
+        if (node_widgets::InputStringMultiline("##code", value, ImVec2(-FLT_MIN, ImGui::GetFontSize() * 16.0f), ImGuiInputTextFlags_AllowTabInput)) {
+          node->settings[setting.name] = value;
+          Edited(false);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) Edited();
+        break;
       case graph::SettingKind::kAddress:
       case graph::SettingKind::kText:
         if (node_widgets::InputString(setting.name.c_str(), value, 0, setting.kind == graph::SettingKind::kAddress ? "0x82000000" : nullptr)) {
@@ -1653,6 +1663,50 @@ void NodeEditorWindow::DrawNodeDetails() {
     if (!setting.tooltip.empty()) ImGui::SetItemTooltip("%s", setting.tooltip.c_str());
     ImGui::PopID();
   }
+}
+
+void NodeEditorWindow::DrawScriptSetting(Node& node, const graph::SettingDesc& setting) {
+  std::string value = graph::SettingOf(node, setting.name);
+  if (node_widgets::InputString(setting.name.c_str(), value, 0, "main.lua")) {
+    node.settings[setting.name] = value;
+    Edited(false);
+  }
+  if (ImGui::IsItemDeactivatedAfterEdit()) Edited();
+  if (value.empty()) return;
+
+  // The file's code, read again when the node names another one; saved on its own, apart from the graph.
+  const std::filesystem::path file = document_->mod_dir() / "scripts" / value;
+  if (file != script_file_) {
+    script_file_ = file;
+    script_text_.clear();
+    std::ifstream in(file, std::ios::binary);
+    script_exists_ = static_cast<bool>(in);
+    if (in) script_text_.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    script_saved_ = script_text_;
+  }
+  ImGui::SeparatorText("Code");
+  const bool changed = script_text_ != script_saved_;
+  ImGui::BeginDisabled(!changed);
+  if (glass::SmallButton("Save Script", glass::kAccent)) {
+    std::error_code code;
+    std::filesystem::create_directories(file.parent_path(), code);
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    if (out) out << script_text_;
+    if (out) {
+      script_saved_ = script_text_;
+      script_exists_ = true;
+      SetStatus("Saved scripts/" + value + "; Save and Reload runs it");
+    } else {
+      SetStatus("Couldn't write " + file.string(), true);
+    }
+  }
+  ImGui::SameLine();
+  if (glass::SmallButton("Revert")) script_text_ = script_saved_;
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  const std::string state = !script_exists_ ? "No such file yet: saving makes it" : changed ? "Unsaved changes" : "scripts/" + value;
+  ImGui::TextDisabled("%s", state.c_str());
+  node_widgets::InputStringMultiline("##code", script_text_, ImGui::GetContentRegionAvail(), ImGuiInputTextFlags_AllowTabInput);
 }
 
 void NodeEditorWindow::DrawListSetting(Node& node, const graph::SettingDesc& setting) {

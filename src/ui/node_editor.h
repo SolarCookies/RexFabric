@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -119,6 +120,8 @@ class NodeEditorWindow : public rex::ui::ImGuiDialog {
   // A kList setting's entries: a switch's cases, a select's options. They're pins of the node, so renaming one takes
   // its links along.
   void DrawListSetting(graph::Node& node, const graph::SettingDesc& setting);
+  // A kScript setting: the file's name, and its code to read, edit and save apart from the graph.
+  void DrawScriptSetting(graph::Node& node, const graph::SettingDesc& setting);
   // A list of params, each with its name, type and a remove button, and a button adding one. `refuse` says why a new
   // name can't be taken, or nothing; `renamed` makes the pins using a param follow its new name.
   void DrawParamList(const char* title, std::vector<graph::Param>& params, const std::vector<graph::PinKind>& kinds, const char* add_label, const std::string& base, const std::function<std::string(const std::string& name)>& refuse, const std::function<void(const std::string& from, const std::string& to)>& renamed);
@@ -204,6 +207,12 @@ class NodeEditorWindow : public rex::ui::ImGuiDialog {
   bool status_error_ = false;
   double status_time_ = 0.0;
   std::string lua_view_;
+
+  // The script file a Script File node shows (DrawScriptSetting): its code as edited and as last read or saved.
+  std::filesystem::path script_file_;
+  std::string script_text_;
+  std::string script_saved_;
+  bool script_exists_ = false;
 };
 
 }  // namespace rexfabric::ui
