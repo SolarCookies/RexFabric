@@ -408,12 +408,17 @@ std::string Emitter::ValueOf(const PinRef& output) {
         return "nil";
       }
       return LocalName(instance, source->id, output.pin);
-    case NodeRole::kAction:
-      if (functions_.empty() || !functions_.back().ran.contains(Key(instance, source->id))) {
+    case NodeRole::kAction: {
+      // It ran earlier here or in a function this one is written inside (a callback sees its caller's locals), or
+      // this is its callback (Open records the node), whose parameters its outputs are.
+      bool seen = false;
+      for (const Function& function : functions_) seen = seen || function.ran.contains(Key(instance, source->id)) || function.event == source->id;
+      if (!seen) {
         Error("Reads " + output.pin + " of " + TitleOf(*source) + " before it runs; it has to come earlier in the same event's chain");
         return "nil";
       }
       return LocalName(instance, source->id, output.pin);
+    }
   }
   return "nil";
 }

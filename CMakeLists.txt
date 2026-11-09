@@ -138,7 +138,7 @@ function(rexfabric_attach target)
   endif()
   if(arg_WITH_NODE_EDITOR)
     list(APPEND sources
-      src/graph/graph.cpp src/graph/graph_document.cpp src/graph/graph_file.cpp src/graph/lua_compiler.cpp src/graph/node_library.cpp src/graph/nodes_builtin.cpp src/graph/nodes_game.cpp
+      src/graph/graph.cpp src/graph/graph_document.cpp src/graph/graph_file.cpp src/graph/lua_compiler.cpp src/graph/node_library.cpp src/graph/nodes_builtin.cpp src/graph/nodes_game.cpp src/graph/nodes_api.cpp
       src/ui/node_editor.cpp src/ui/node_graph_style.cpp src/ui/node_graph_widgets.cpp
     )
     rexfabric_link_imgui_node_editor(${target})
