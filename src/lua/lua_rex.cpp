@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -654,6 +655,127 @@ int ScreenText(lua_State* L) {
   return 0;
 }
 
+// rex.draw: shapes anywhere on the screen, positions and sizes as fractions of it (0-1), options in a table.
+
+float OptionNumber(lua_State* L, int options, const char* name, float fallback) {
+  if (!lua_istable(L, options)) return fallback;
+  lua_getfield(L, options, name);
+  const float value = lua_isnumber(L, -1) ? static_cast<float>(lua_tonumber(L, -1)) : fallback;
+  lua_pop(L, 1);
+  return std::isfinite(value) ? value : fallback;
+}
+
+bool OptionBool(lua_State* L, int options, const char* name, bool fallback) {
+  if (!lua_istable(L, options)) return fallback;
+  lua_getfield(L, options, name);
+  const bool value = lua_isnil(L, -1) ? fallback : lua_toboolean(L, -1) != 0;
+  lua_pop(L, 1);
+  return value;
+}
+
+std::string OptionString(lua_State* L, int options, const char* name) {
+  if (!lua_istable(L, options)) return {};
+  lua_getfield(L, options, name);
+  std::string value;
+  if (!lua_isnil(L, -1)) {
+    value = luaL_tolstring(L, -1, nullptr);
+    lua_pop(L, 1);
+  }
+  lua_pop(L, 1);
+  return value;
+}
+
+uint32_t OptionRgb(lua_State* L, int options) {
+  if (!lua_istable(L, options)) return 0xFFFFFF;
+  lua_getfield(L, options, "rgb");
+  const uint32_t rgb = lua_isinteger(L, -1) ? static_cast<uint32_t>(lua_tointeger(L, -1)) & 0xFFFFFF : 0xFFFFFF;
+  lua_pop(L, 1);
+  return rgb;
+}
+
+float CheckFraction(lua_State* L, int index) {
+  const double value = luaL_checknumber(L, index);
+  if (!std::isfinite(value)) luaL_argerror(L, index, "not a finite number");
+  return static_cast<float>(value);
+}
+
+// The options every shape takes: key, rgb (0xRRGGBB), alpha (0-1), seconds, thickness (pixels), filled.
+ui::ScreenShape ShapeOf(lua_State* L, int options, ui::ScreenShape::Kind kind) {
+  if (!lua_isnoneornil(L, options)) luaL_checktype(L, options, LUA_TTABLE);
+  ui::ScreenShape shape;
+  shape.kind = kind;
+  shape.key = OptionString(L, options, "key");
+  shape.rgb = OptionRgb(L, options);
+  shape.alpha = OptionNumber(L, options, "alpha", 1.0f);
+  shape.seconds = OptionNumber(L, options, "seconds", 0.0f);
+  shape.thickness = OptionNumber(L, options, "thickness", 2.0f);
+  shape.filled = OptionBool(L, options, "filled", true);
+  return shape;
+}
+
+// rex.draw.text(text, x, y, options): size (of the screen's height, 0.03), align ("left", "center", "right"), background.
+int ShapeText(lua_State* L) {
+  ui::ScreenShape shape = ShapeOf(L, 4, ui::ScreenShape::Kind::kText);
+  shape.text = luaL_tolstring(L, 1, nullptr);
+  lua_pop(L, 1);
+  shape.x = CheckFraction(L, 2);
+  shape.y = CheckFraction(L, 3);
+  shape.size = OptionNumber(L, 4, "size", 0.03f);
+  const std::string align = OptionString(L, 4, "align");
+  shape.align = align == "left" ? -1 : align == "right" ? 1 : 0;
+  shape.background = OptionBool(L, 4, "background", false);
+  ui::DrawOnScreen(std::move(shape));
+  return 0;
+}
+
+// rex.draw.rect(x, y, width, height, options): filled unless filled = false; rounding (of the screen's height).
+int ShapeRect(lua_State* L) {
+  ui::ScreenShape shape = ShapeOf(L, 5, ui::ScreenShape::Kind::kRect);
+  shape.x = CheckFraction(L, 1);
+  shape.y = CheckFraction(L, 2);
+  shape.x2 = CheckFraction(L, 3);
+  shape.y2 = CheckFraction(L, 4);
+  shape.rounding = OptionNumber(L, 5, "rounding", 0.0f);
+  ui::DrawOnScreen(std::move(shape));
+  return 0;
+}
+
+// rex.draw.line(x1, y1, x2, y2, options).
+int ShapeLine(lua_State* L) {
+  ui::ScreenShape shape = ShapeOf(L, 5, ui::ScreenShape::Kind::kLine);
+  shape.x = CheckFraction(L, 1);
+  shape.y = CheckFraction(L, 2);
+  shape.x2 = CheckFraction(L, 3);
+  shape.y2 = CheckFraction(L, 4);
+  ui::DrawOnScreen(std::move(shape));
+  return 0;
+}
+
+// rex.draw.circle(x, y, radius, options): the radius a fraction of the screen's height.
+int ShapeCircle(lua_State* L) {
+  ui::ScreenShape shape = ShapeOf(L, 4, ui::ScreenShape::Kind::kCircle);
+  shape.x = CheckFraction(L, 1);
+  shape.y = CheckFraction(L, 2);
+  shape.size = CheckFraction(L, 3);
+  ui::DrawOnScreen(std::move(shape));
+  return 0;
+}
+
+int ShapeRemove(lua_State* L) {
+  ui::RemoveFromScreen(luaL_checkstring(L, 1));
+  return 0;
+}
+
+int ShapeClear(lua_State* L) {
+  ui::ClearScreen(luaL_optstring(L, 1, ""));
+  return 0;
+}
+
+constexpr luaL_Reg kDrawFuncs[] = {
+    {"text", ShapeText}, {"rect", ShapeRect}, {"line", ShapeLine}, {"circle", ShapeCircle}, {"remove", ShapeRemove}, {"clear", ShapeClear},
+    {nullptr, nullptr},
+};
+
 // Monotonic seconds. Only differences mean anything.
 int Now(lua_State* L) {
   lua_pushnumber(L, std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -676,6 +798,8 @@ void OpenRex(lua_State* L) {
   lua_setfield(L, -2, "mem");
   luaL_newlib(L, kCvarFuncs);
   lua_setfield(L, -2, "cvar");
+  luaL_newlib(L, kDrawFuncs);
+  lua_setfield(L, -2, "draw");
 
   luaL_newmetatable(L, kContextMeta);
   luaL_newlib(L, kContextMethods);
