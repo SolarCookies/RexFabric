@@ -6,23 +6,28 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
-#include <rex/cvar.h>
-#include <rex/ppc/func.h>
-#include <rex/system/thread_state.h>
+#include <rex/kernel/title_runtime.h>
+#include <rex/ppc/call.h>
+#include <rex/settings_registry.h>
 #include <rex/version.h>
+#include <rexfabric/rexfabric.h>
 
 #include "../events.h"
 #include "../guest.h"
 #include "../hooks.h"
 #include "../log.h"
+#include "../settings.h"
 #include "../ui/screen_text.h"
 #include "lua_vm.h"
 
@@ -215,24 +220,14 @@ constexpr luaL_Reg kMemFuncs[] = {
 // Cvars a script defines stay registered for the life of the process, so a reload keeps their values and a
 // mod reading another mod's cvar never sees it vanish.
 
-struct ScriptCvar {
-  bool b = false;
-  int64_t i = 0;
-  double d = 0.0;
-  std::string s;
-};
-
-std::unordered_map<std::string, std::shared_ptr<ScriptCvar>>& ScriptCvars() {
-  static std::unordered_map<std::string, std::shared_ptr<ScriptCvar>> cvars;
-  return cvars;
-}
-
-// Cvars whose watchers owe a call, drained on the frame event. The cvar registry calls change callbacks
-// holding its own lock, which rex.cvar.set takes while holding the VM's, so Lua can't run from there.
+// Cvars whose watchers owe a call, drained on the frame event. A setting calls its watchers on the thread that
+// changed it, which rex.cvar.set does holding the VM's lock, so Lua can't run from there.
 struct PendingChanges {
   std::mutex mutex;
   std::vector<std::string> names;
   std::set<std::string> bridged;  // cvars with a change callback in the registry, kept across reloads
+  // The watches on the settings, never freed: the settings outlive the process's statics.
+  std::vector<rex::ScopeGuard>* watches = new std::vector<rex::ScopeGuard>();
 };
 
 PendingChanges& Pending() {
@@ -240,26 +235,33 @@ PendingChanges& Pending() {
   return pending;
 }
 
-void PushCvar(lua_State* L, const rex::cvar::FlagEntry& info) {
-  using rex::cvar::FlagType;
-  switch (info.type) {
-    case FlagType::Boolean: lua_pushboolean(L, rex::cvar::Query<bool>(info.name)); return;
-    case FlagType::Int32: lua_pushinteger(L, rex::cvar::Query<int32_t>(info.name)); return;
-    case FlagType::Int64: lua_pushinteger(L, rex::cvar::Query<int64_t>(info.name)); return;
-    case FlagType::Uint32: lua_pushinteger(L, rex::cvar::Query<uint32_t>(info.name)); return;
-    case FlagType::Uint64: lua_pushinteger(L, static_cast<lua_Integer>(rex::cvar::Query<uint64_t>(info.name))); return;
-    case FlagType::Double: lua_pushnumber(L, rex::cvar::Query<double>(info.name)); return;
-    case FlagType::String: lua_pushstring(L, rex::cvar::Query<std::string>(info.name).c_str()); return;
-    case FlagType::Command: break;
+template <typename T>
+T SettingValue(const rex::SettingBase& setting) {
+  return static_cast<const rex::Setting<T>&>(setting).Get();
+}
+
+void PushCvar(lua_State* L, const rex::SettingBase& setting) {
+  switch (setting.GetType()) {
+    case rex::SettingType::kBool: lua_pushboolean(L, SettingValue<bool>(setting)); return;
+    case rex::SettingType::kI32: lua_pushinteger(L, SettingValue<rex::i32>(setting)); return;
+    case rex::SettingType::kI64: lua_pushinteger(L, SettingValue<rex::i64>(setting)); return;
+    case rex::SettingType::kU32: lua_pushinteger(L, SettingValue<rex::u32>(setting)); return;
+    case rex::SettingType::kU64: lua_pushinteger(L, static_cast<lua_Integer>(SettingValue<rex::u64>(setting))); return;
+    case rex::SettingType::kF64: lua_pushnumber(L, SettingValue<rex::f64>(setting)); return;
+    case rex::SettingType::kString: lua_pushstring(L, SettingValue<std::string>(setting).c_str()); return;
+    case rex::SettingType::kPath: {
+      const std::u8string path = SettingValue<std::filesystem::path>(setting).u8string();
+      lua_pushlstring(L, reinterpret_cast<const char*>(path.data()), path.size());
+      return;
+    }
   }
   lua_pushnil(L);
 }
 
 int CvarGet(lua_State* L) {
   const char* name = luaL_checkstring(L, 1);
-  const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(name);
-  if (info) {
-    PushCvar(L, *info);
+  if (const rex::SettingBase* setting = FindSetting(name)) {
+    PushCvar(L, *setting);
     return 1;
   }
   if (lua_gettop(L) < 2) return luaL_error(L, "unknown cvar '%s'", name);
@@ -281,18 +283,28 @@ std::string CvarText(lua_State* L, int index) {
 int CvarSet(lua_State* L) {
   const char* name = luaL_checkstring(L, 1);
   const std::string value = CvarText(L, 2);
-  if (!rex::cvar::SetFlagByName(name, value)) return luaL_error(L, "could not set cvar '%s' to '%s'", name, value.c_str());
+  const rex::SettingBase* setting = FindSetting(name);
+  if (!setting || !REX_SETTINGS().SetText(setting->GetName(), value)) return luaL_error(L, "could not set cvar '%s' to '%s'", name, value.c_str());
   return 0;
 }
 
 int CvarExists(lua_State* L) {
-  lua_pushboolean(L, rex::cvar::GetFlagInfo(luaL_checkstring(L, 1)) != nullptr);
+  lua_pushboolean(L, FindSetting(luaL_checkstring(L, 1)) != nullptr);
   return 1;
 }
 
+// With a category: the mods' settings in it, then the settings under a scope of that name.
 int CvarList(lua_State* L) {
   const char* category = luaL_optstring(L, 1, nullptr);
-  const std::vector<std::string> names = category ? rex::cvar::ListFlagsByCategory(category) : rex::cvar::ListFlags();
+  std::vector<std::string> names;
+  if (category) {
+    for (const ModSetting& setting : ModSettings()) {
+      if (setting.category == category) names.push_back(setting.name);
+    }
+  }
+  for (const rex::SettingBase* setting : REX_SETTINGS().Enumerate(category ? category : "")) {
+    if (!category || std::find(names.begin(), names.end(), setting->GetName()) == names.end()) names.push_back(setting->GetName());
+  }
   lua_createtable(L, static_cast<int>(names.size()), 0);
   for (size_t i = 0; i < names.size(); ++i) {
     lua_pushstring(L, names[i].c_str());
@@ -302,56 +314,49 @@ int CvarList(lua_State* L) {
 }
 
 // rex.cvar.boolean, int32, int64, uint32, uint64, number and string: (name, default, category, description).
-template <rex::cvar::FlagType kType>
+template <typename T>
 int CvarDefine(lua_State* L) {
-  using rex::cvar::FlagType;
   const char* name = luaL_checkstring(L, 1);
   // Already registered: a native cvar of the same name, or this one again after a reload. Its value stands.
-  if (rex::cvar::GetFlagInfo(name)) {
+  if (FindSetting(name)) {
     lua_settop(L, 1);
     return CvarGet(L);
   }
-  auto& storage = ScriptCvars()[name];
-  if (!storage) storage = std::make_shared<ScriptCvar>();
-  std::shared_ptr<ScriptCvar> cvar = storage;
-
-  rex::cvar::FlagEntry entry;
-  entry.name = name;
-  entry.type = kType;
-  entry.category = luaL_optstring(L, 3, "Scripts");
-  entry.description = luaL_optstring(L, 4, "");
-  entry.lifecycle = rex::cvar::Lifecycle::kHotReload;
-  entry.command_callback = [](std::string_view) {};
-  if constexpr (kType == FlagType::Boolean) {
-    cvar->b = lua_toboolean(L, 2) != 0;
-    entry.default_value = cvar->b ? "true" : "false";
-    entry.setter = [cvar](std::string_view v) { cvar->b = v == "true" || v == "1" || v == "yes"; return true; };
-    entry.getter = [cvar] { return std::string(cvar->b ? "true" : "false"); };
-  } else if constexpr (kType == FlagType::String) {
-    cvar->s = luaL_optstring(L, 2, "");
-    entry.default_value = cvar->s;
-    entry.setter = [cvar](std::string_view v) { cvar->s.assign(v); return true; };
-    entry.getter = [cvar] { return cvar->s; };
-  } else if constexpr (kType == FlagType::Double) {
-    cvar->d = luaL_optnumber(L, 2, 0.0);
-    entry.default_value = std::to_string(cvar->d);
-    entry.setter = [cvar](std::string_view v) { return rex::cvar::ParseDouble(v, cvar->d); };
-    entry.getter = [cvar] { return std::to_string(cvar->d); };
-  } else {
-    cvar->i = luaL_optinteger(L, 2, 0);
-    entry.default_value = std::to_string(cvar->i);
-    entry.setter = [cvar](std::string_view v) {
-      int64_t parsed = 0;
-      const auto [end, error] = std::from_chars(v.data(), v.data() + v.size(), parsed);
-      if (error != std::errc()) return false;
-      cvar->i = parsed;
-      return true;
-    };
-    entry.getter = [cvar] { return std::to_string(cvar->i); };
-  }
-  if (!rex::cvar::RegisterFlag(std::move(entry))) return luaL_error(L, "could not register cvar '%s'", name);
+  T value{};
+  if constexpr (std::is_same_v<T, bool>) value = lua_toboolean(L, 2) != 0;
+  else if constexpr (std::is_same_v<T, std::string>) value = luaL_optstring(L, 2, "");
+  else if constexpr (std::is_same_v<T, rex::f64>) value = luaL_optnumber(L, 2, 0.0);
+  else value = static_cast<T>(luaL_optinteger(L, 2, 0));
+  std::string category = luaL_optstring(L, 3, "Scripts");
+  const char* help = luaL_optstring(L, 4, "");
+  if (!AddModSetting<T>(name, value, help, std::move(category), CallerMod(L))) return luaL_error(L, "could not register cvar '%s'", name);
   lua_settop(L, 1);
   return CvarGet(L);
+}
+
+void QueueChange(const std::string& name) {
+  PendingChanges& pending = Pending();
+  std::lock_guard lock(pending.mutex);
+  if (std::find(pending.names.begin(), pending.names.end(), name) == pending.names.end()) pending.names.push_back(name);
+}
+
+template <typename T>
+rex::ScopeGuard WatchAs(rex::SettingBase& setting, std::string name) {
+  return static_cast<rex::Setting<T>&>(setting).OnChange([name = std::move(name)](const T&) { QueueChange(name); });
+}
+
+rex::ScopeGuard Watch(rex::SettingBase& setting, std::string name) {
+  switch (setting.GetType()) {
+    case rex::SettingType::kBool: return WatchAs<bool>(setting, std::move(name));
+    case rex::SettingType::kI32: return WatchAs<rex::i32>(setting, std::move(name));
+    case rex::SettingType::kI64: return WatchAs<rex::i64>(setting, std::move(name));
+    case rex::SettingType::kU32: return WatchAs<rex::u32>(setting, std::move(name));
+    case rex::SettingType::kU64: return WatchAs<rex::u64>(setting, std::move(name));
+    case rex::SettingType::kF64: return WatchAs<rex::f64>(setting, std::move(name));
+    case rex::SettingType::kString: return WatchAs<std::string>(setting, std::move(name));
+    case rex::SettingType::kPath: return WatchAs<std::filesystem::path>(setting, std::move(name));
+  }
+  return {};
 }
 
 int CvarOnChange(lua_State* L) {
@@ -369,23 +374,19 @@ int CvarOnChange(lua_State* L) {
   lua_rawseti(L, -2, static_cast<lua_Integer>(lua_rawlen(L, -2)) + 1);
   lua_pop(L, 2);
 
+  rex::SettingBase* setting = FindSetting(name);
+  if (!setting) return 0;
   PendingChanges& pending = Pending();
   std::lock_guard lock(pending.mutex);
-  if (pending.bridged.insert(name).second) {
-    rex::cvar::RegisterChangeCallback(name, [owned = std::string(name)](std::string_view, std::string_view) {
-      PendingChanges& pending = Pending();
-      std::lock_guard lock(pending.mutex);
-      if (std::find(pending.names.begin(), pending.names.end(), owned) == pending.names.end()) pending.names.push_back(owned);
-    });
-  }
+  if (pending.bridged.insert(name).second) pending.watches->push_back(Watch(*setting, name));
   return 0;
 }
 
 constexpr luaL_Reg kCvarFuncs[] = {
     {"get", CvarGet}, {"set", CvarSet}, {"exists", CvarExists}, {"list", CvarList}, {"on_change", CvarOnChange},
-    {"boolean", CvarDefine<rex::cvar::FlagType::Boolean>}, {"int32", CvarDefine<rex::cvar::FlagType::Int32>}, {"int64", CvarDefine<rex::cvar::FlagType::Int64>},
-    {"uint32", CvarDefine<rex::cvar::FlagType::Uint32>}, {"uint64", CvarDefine<rex::cvar::FlagType::Uint64>}, {"number", CvarDefine<rex::cvar::FlagType::Double>},
-    {"string", CvarDefine<rex::cvar::FlagType::String>},
+    {"boolean", CvarDefine<bool>}, {"int32", CvarDefine<rex::i32>}, {"int64", CvarDefine<rex::i64>},
+    {"uint32", CvarDefine<rex::u32>}, {"uint64", CvarDefine<rex::u64>}, {"number", CvarDefine<rex::f64>},
+    {"string", CvarDefine<std::string>},
     {nullptr, nullptr},
 };
 
@@ -542,23 +543,28 @@ int Hookable(lua_State* L) {
 // guest thread, below its stack, so it has to be called from a hook or an event a guest thread fires.
 int Call(lua_State* L) {
   const uint32_t address = CheckAddress(L, 1);
-  rex::runtime::ThreadState* thread = rex::runtime::ThreadState::Get();
-  if (!thread) return luaL_error(L, "rex.call must run on a guest thread (call it from inside a hook, not from a frame event)");
-  PPCFunc* function = rex::runtime::ResolveIndirectFunction(address);
-  if (!function) return luaL_error(L, "no guest function at 0x%08X", address);
+  const rex::ppc::BoundThread thread = rex::ppc::GetBoundThread();
+  if (!thread.ctx) return luaL_error(L, "rex.call must run on a guest thread (call it from inside a hook, not from a frame event)");
+  rex::kernel::TitleRuntime* runtime = REX_RUNTIME();
+  rex::Result<PPCFunc*> function = runtime ? runtime->FindFunction(address) : rex::Result<PPCFunc*>(nullptr);
+  if (!function || !*function) return luaL_error(L, "no guest function at 0x%08X", address);
   const int argc = lua_gettop(L) - 1;
   if (argc > 8) return luaL_error(L, "rex.call supports at most 8 register arguments (got %d)", argc);
+  uint64_t args[8] = {};
+  for (int i = 0; i < argc; ++i) args[i] = static_cast<uint64_t>(luaL_checkinteger(L, 2 + i));
 
-  PPCContext* parent = Vm().ctx ? Vm().ctx : thread->context();
-  PPCContext ctx{};
-  ctx.r1 = parent->r1;
-  ctx.r1.u32 -= 0x70;  // the PowerPC minimum frame: linkage area and parameter save area
-  ctx.r13 = parent->r13;
-  ctx.fpscr = parent->fpscr;
-  for (int i = 0; i < argc; ++i) (ctx.*guest::kGprs[3 + i]).u64 = static_cast<uint64_t>(luaL_checkinteger(L, 2 + i));
-  function(ctx, Vm().base ? Vm().base : CheckMemory(L, 0));
-  parent->fpscr = ctx.fpscr;
-  lua_pushinteger(L, ctx.r3.u32);
+  // On the thread's own registers, as its hooks expect, under its stack; all but the float status go back after.
+  PPCContext& ctx = Vm().ctx ? *Vm().ctx : *thread.ctx;
+  uint8_t* base = Vm().base ? Vm().base : thread.base;
+  const PPCContext saved = ctx;
+  rex::ppc::OpenCallFrame(ctx, base, 0);
+  for (int i = 0; i < argc; ++i) (ctx.*guest::kGprs[3 + i]).u64 = args[i];
+  (**function)(ctx, base);
+  const uint32_t result = ctx.r3.u32;
+  const PPCFPSCRRegister fpscr = ctx.fpscr;
+  ctx = saved;
+  ctx.fpscr = fpscr;
+  lua_pushinteger(L, result);
   return 1;
 }
 
@@ -833,7 +839,7 @@ void DrainCvarChanges(lua_State* L) {
   for (const std::string& name : names) {
     lua_getfield(L, -1, name.c_str());
     if (lua_istable(L, -1)) {
-      const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(name);
+      const rex::SettingBase* info = FindSetting(name);
       const lua_Integer count = static_cast<lua_Integer>(lua_rawlen(L, -1));
       for (lua_Integer i = 1; i <= count; ++i) {
         lua_rawgeti(L, -1, i);

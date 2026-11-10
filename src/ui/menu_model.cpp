@@ -3,15 +3,14 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <utility>
 
-#include <rex/logging.h>
-#include <rex/ui/image_decode.h>
-#include <rex/ui/immediate_drawer.h>
 #include <rexfabric/rexfabric.h>
 
 #include "../log.h"
 #include "../platform.h"
 #include "../lua/lua_scripts.h"
+#include "image_decode.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -64,7 +63,7 @@ bool Relaunch() {
 
 }  // namespace
 
-MenuModel::MenuModel(std::filesystem::path mods_dir, const std::string& community, rex::ui::ImmediateDrawer* images) : mods_(mods_dir), images_(images) {
+MenuModel::MenuModel(std::filesystem::path mods_dir, const std::string& community, Images images) : mods_(mods_dir), images_(std::move(images)) {
   if (!community.empty()) thunderstore_ = std::make_unique<net::Thunderstore>(community, mods_dir);
   mods_.Scan();
   seen_revision_ = ModsRevision();
@@ -115,7 +114,7 @@ bool MenuModel::Restart() {
     RF_ERROR("couldn't restart; restart the game to apply mod changes");
     return false;
   }
-  rex::FlushLogging();
+  rex::log::Flush();
   std::_Exit(0);
 }
 
@@ -124,38 +123,44 @@ void MenuModel::ReloadScripts() {
   lua::Reload(enabled);
 }
 
-std::unique_ptr<rex::ui::ImmediateTexture> MenuModel::Texture(const std::vector<uint8_t>& encoded) {
-  if (!images_ || encoded.empty()) return nullptr;
+MenuModel::Texture::~Texture() {
+  if (id_ != ImTextureID_Invalid && images_.destroy) images_.destroy(id_);
+}
+
+std::unique_ptr<MenuModel::Texture> MenuModel::MakeTexture(const std::vector<uint8_t>& encoded) {
+  if (!images_.create || encoded.empty()) return nullptr;
   int width = 0;
   int height = 0;
-  const std::vector<uint8_t> rgba = rex::ui::DecodeImageRGBA(encoded.data(), encoded.size(), width, height);
+  const std::vector<uint8_t> rgba = DecodeImageRGBA(encoded.data(), encoded.size(), width, height);
   if (rgba.empty() || width <= 0 || height <= 0) return nullptr;
-  return images_->CreateTexture(static_cast<uint32_t>(width), static_cast<uint32_t>(height), rex::ui::ImmediateTextureFilter::kLinear, false, rgba.data());
+  const ImTextureID id = images_.create(static_cast<uint32_t>(width), static_cast<uint32_t>(height), rgba.data());
+  if (id == ImTextureID_Invalid) return nullptr;
+  return std::make_unique<Texture>(images_, id);
 }
 
-rex::ui::ImmediateTexture* MenuModel::ModIcon(const ModInfo& mod) {
+ImTextureID MenuModel::ModIcon(const ModInfo& mod) {
   auto [it, added] = mod_icons_.try_emplace(mod.folder);
   // Made once per scan, failed or not, so a missing icon isn't looked for every frame.
-  if (added) it->second.texture = Texture(ReadFile(mod.dir / "icon.png"));
-  return it->second.texture.get();
+  if (added) it->second.texture = MakeTexture(ReadFile(mod.dir / "icon.png"));
+  return it->second.texture ? it->second.texture->id() : ImTextureID_Invalid;
 }
 
-rex::ui::ImmediateTexture* MenuModel::PackageIcon(const net::Package& package, bool* loading) {
-  if (!thunderstore_ || package.icon_url.empty()) return nullptr;
+ImTextureID MenuModel::PackageIcon(const net::Package& package, bool* loading) {
+  if (!thunderstore_ || package.icon_url.empty()) return ImTextureID_Invalid;
   if (auto it = package_icons_.find(package.icon_url); it != package_icons_.end()) {
     it->second.used = frame_;
-    return it->second.texture.get();
+    return it->second.texture ? it->second.texture->id() : ImTextureID_Invalid;
   }
   thunderstore_->RequestIcon(package.icon_url);
   std::vector<uint8_t> encoded;
   if (!thunderstore_->TakeIcon(package.icon_url, encoded)) {
     if (loading) *loading = thunderstore_->IconLoading(package.icon_url);
-    return nullptr;
+    return ImTextureID_Invalid;
   }
   if (package_icons_.size() >= kMaxPackageIcons) PrunePackageIcons();
   CachedIcon& icon = package_icons_[package.icon_url];
-  icon = {Texture(encoded), frame_};
-  return icon.texture.get();
+  icon = {MakeTexture(encoded), frame_};
+  return icon.texture ? icon.texture->id() : ImTextureID_Invalid;
 }
 
 void MenuModel::PrunePackageIcons() {

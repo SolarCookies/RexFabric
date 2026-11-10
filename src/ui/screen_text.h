@@ -11,16 +11,16 @@
 #include <string>
 
 namespace rex::ui {
-class ImGuiDrawer;
+class IUISystem;
 }
 
 namespace rexfabric::ui {
 
 // Shows `text` for `seconds` in `rgb` (0xRRGGBB), `size` pixels tall (0: the default). A line with a `key` replaces
-// the shown line with the same key, where it is. Before SetScreenTextDrawer, or without a UI, it's dropped.
+// the shown line with the same key, where it is. Before SetScreenTextUI, or without a UI, it's dropped.
 void PrintToScreen(std::string text, double seconds, uint32_t rgb, float size = 0.0f, std::string key = {});
 // Where the lines are drawn. Set once, from CreateMenus.
-void SetScreenTextDrawer(rex::ui::ImGuiDrawer* drawer);
+void SetScreenTextUI(rex::ui::IUISystem& ui);
 
 // A shape drawn anywhere on the screen, under the lines (rex.draw). Positions and sizes are fractions of the
 // screen's height and width, so it looks the same at any resolution.
@@ -42,7 +42,7 @@ struct ScreenShape {
   double seconds = 0.0;      // how long it stays: 0 until removed with a key, else a tenth of a second
 };
 
-// Thread safe: draws `shape` from the next frame. Before SetScreenTextDrawer, or without a UI, it's dropped.
+// Thread safe: draws `shape` from the next frame. Before SetScreenTextUI, or without a UI, it's dropped.
 void DrawOnScreen(ScreenShape shape);
 // Removes the shape with `key`; ClearScreen removes those whose keys start with `prefix` (every one for "").
 void RemoveFromScreen(const std::string& key);

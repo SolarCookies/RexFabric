@@ -50,7 +50,7 @@ void ModPage(Menu& menu, const std::string& folder) {
     menu.Back();
     return;
   }
-  if (rex::ui::ImmediateTexture* icon = model->ModIcon(*mod)) menu.Image(icon, 1.0f, 200.0f);
+  if (const ImTextureID icon = model->ModIcon(*mod); icon != ImTextureID_Invalid) menu.Image(icon, 1.0f, 200.0f);
   menu.Text(Detail(*mod), Menu::Tone::kDim);
   menu.Text(mod->description);
   RestartRow(menu);
@@ -82,7 +82,7 @@ void PackagePage(Menu& menu, const net::Package& package) {
   net::Thunderstore& store = *model->thunderstore();
   const net::Thunderstore::Details& details = store.GetDetails(package);
   const bool ready = details.status == net::Status::kReady;
-  if (rex::ui::ImmediateTexture* icon = model->PackageIcon(package)) menu.Image(icon, 1.0f, 200.0f);
+  if (const ImTextureID icon = model->PackageIcon(package); icon != ImTextureID_Invalid) menu.Image(icon, 1.0f, 200.0f);
   menu.Text("by " + package.owner, Menu::Tone::kDim);
   menu.Text(std::to_string(package.downloads) + " downloads, " + std::to_string(package.likes) + " likes", Menu::Tone::kDim);
   if (ready && !details.version.empty()) menu.Text("Version " + details.version + (details.updated.empty() ? "" : ", updated " + details.updated), Menu::Tone::kDim);
