@@ -67,6 +67,7 @@ Screen& Get() {
 class Overlay final : public rex::ui::ImGuiDialog {
  public:
   explicit Overlay(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
+  
 
  protected:
   void OnDraw(ImGuiIO& io) override {
@@ -88,7 +89,9 @@ class Overlay final : public rex::ui::ImGuiDialog {
     const bool shown = ImGui::Begin("##rexfabric_screen_text", nullptr, kFlags);
     ImGui::PopStyleVar(2);
     if (shown) {
-      ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+      //ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+      // Through GetCurrentContext: the runtime exports ImGui's functions but not GImGui, which GetCurrentWindow reads.
+      ImGui::BringWindowToDisplayFront(ImGui::GetCurrentContext()->CurrentWindow);
       DrawShapes(screen, io);
       DrawLines(screen, io, now);
     }
