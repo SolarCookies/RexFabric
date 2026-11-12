@@ -7,8 +7,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include <rex/cvar.h>
-#include <rex/ppc/func.h>
+#include <rex/kernel/title_runtime.h>
+#include <rex/ppc/call.h>
+#include <rex/settings_registry.h>
 #include <rexfabric/game_api.h>
 #include <rexfabric/midasm.h>
 #include <rexfabric/rexfabric.h>
@@ -19,6 +20,7 @@
 #include "hooks.h"
 #include "log.h"
 #include "mod.h"
+#include "settings.h"
 
 // What a RexFabricMidasm points at while a native handler runs.
 struct RexFabricMidasm {
@@ -67,17 +69,22 @@ double GetFpr(const RexFabricCall* call, uint32_t index) { return index < 32 ? (
 void SetFpr(RexFabricCall* call, uint32_t index, double value) { if (index < 32) (call->ctx->*guest::kFprs[index]).f64 = value; }
 
 uint64_t CallGuest(RexFabricCall* call, uint32_t address, const uint64_t* args, uint32_t count) {
-  PPCFunc* function = rex::runtime::ResolveIndirectFunction(address);
-  if (!function) {
+  rex::kernel::TitleRuntime* runtime = REX_RUNTIME();
+  rex::Result<PPCFunc*> function = runtime ? runtime->FindFunction(address) : rex::Result<PPCFunc*>(nullptr);
+  if (!function || !*function) {
     RF_WARN("call_guest: no function at {:08X}", address);
     return 0;
   }
-  // A copy, so the hooked call's registers survive. The stack pointer is the hooked call's, whose own frame
-  // isn't live before call_next or after it returns.
-  PPCContext ctx = *call->ctx;
+  // On the hooked call's own registers, as the thread's hooks expect, put back after so the hooked call's
+  // registers survive. The frame goes under the hooked call's stack pointer.
+  PPCContext& ctx = *call->ctx;
+  const PPCContext saved = ctx;
+  rex::ppc::OpenCallFrame(ctx, call->base, 0);
   for (uint32_t i = 0; i < count && i < 8; ++i) (ctx.*guest::kGprs[3 + i]).u64 = args[i];
-  function(ctx, call->base);
-  return ctx.r3.u64;
+  (**function)(ctx, call->base);
+  const uint64_t result = ctx.r3.u64;
+  ctx = saved;
+  return result;
 }
 
 void* GuestPointer(uint32_t address) { return guest::Translate(address); }
@@ -221,8 +228,9 @@ int32_t GetSwitchC(const char* name) { return name ? GetSwitch(name) : 0; }
 void SetSwitchC(const char* name, int32_t value) { if (name) SetSwitch(name, value); }
 
 int32_t GetCvar(const char* name, char* buffer, uint32_t size) {
-  if (!name || !rex::cvar::GetFlagInfo(name)) return -1;
-  const std::string value = rex::cvar::GetFlagByName(name);
+  const rex::SettingBase* setting = name ? FindSetting(name) : nullptr;
+  if (!setting) return -1;
+  const std::string value = setting->GetText();
   if (buffer && size) {
     const size_t copied = std::min<size_t>(value.size(), size - 1);
     std::memcpy(buffer, value.data(), copied);
@@ -231,7 +239,10 @@ int32_t GetCvar(const char* name, char* buffer, uint32_t size) {
   return static_cast<int32_t>(value.size());
 }
 
-int SetCvar(const char* name, const char* value) { return name && value && rex::cvar::SetFlagByName(name, value); }
+int SetCvar(const char* name, const char* value) {
+  const rex::SettingBase* setting = name && value ? FindSetting(name) : nullptr;
+  return setting && REX_SETTINGS().SetText(setting->GetName(), value).has_value();
+}
 
 constexpr RexFabricApi kApi = {
     .version = REXFABRIC_API_VERSION,

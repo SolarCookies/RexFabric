@@ -14,9 +14,7 @@
 #include <imgui.h>
 #include <imgui_node_editor.h>
 
-#include <rex/input/input_system.h>
-#include <rex/runtime.h>
-#include <rex/system/kernel_state.h>
+#include <rex/hid/input_system.h>
 #include <rexfabric/rexfabric.h>
 
 #include "../graph/graph_file.h"
@@ -123,11 +121,7 @@ std::optional<DecodedPin> DecodePin(ed::PinId id) {
   return DecodedPin{static_cast<int>(local / kPinsPerNode), static_cast<size_t>(output ? slot - kOutputOffset : slot), output};
 }
 
-rex::input::InputSystem* GuestInput() {
-  auto* kernel = rex::system::kernel_state();
-  auto* runtime = kernel ? kernel->emulator() : nullptr;
-  return runtime ? static_cast<rex::input::InputSystem*>(runtime->input_system()) : nullptr;
-}
+rex::hid::IInputSystem* GuestInput() { return REX_INTERFACE(rex::hid::IInputSystem); }
 
 ImU32 PinColor(PinKind kind) {
   switch (kind) {
@@ -308,8 +302,8 @@ bool TextValue(const nlohmann::json& value, std::string& text) {
 
 }  // namespace
 
-NodeEditorWindow::NodeEditorWindow(rex::ui::ImGuiDrawer* drawer, MenuModel& model, std::function<void()> closed) : ImGuiDialog(drawer), model_(model), closed_(std::move(closed)) {
-  if (auto* input = GuestInput()) input->AddUIInputBlocker();
+NodeEditorWindow::NodeEditorWindow(MenuModel& model, std::function<void()> closed) : model_(model), closed_(std::move(closed)) {
+  if (auto* input = GuestInput()) input->AcquireUIBlock();
   // Where the window was last time, or else the first mod with graphs, as that's likely the one being worked on.
   const LastOpen last = Last();
   if (model_.mods().Find(last.mod)) {
@@ -325,12 +319,18 @@ NodeEditorWindow::NodeEditorWindow(rex::ui::ImGuiDrawer* drawer, MenuModel& mode
 
 NodeEditorWindow::~NodeEditorWindow() {
   if (canvas_) ed::DestroyEditor(canvas_);
-  if (auto* input = GuestInput()) input->RemoveUIInputBlocker();
+  if (auto* input = GuestInput()) input->ReleaseUIBlock();
   if (closed_) closed_();
 }
 
 void NodeEditorWindow::Hide() {
-  AfterSaving([this] { Close(); });
+  AfterSaving([this] { closing_ = true; });
+}
+
+bool NodeEditorWindow::Draw(ImGuiIO& io) {
+  if (closing_) return false;
+  OnDraw(io);
+  return !closing_;
 }
 
 void NodeEditorWindow::OnDraw(ImGuiIO& io) {

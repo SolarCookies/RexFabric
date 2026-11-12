@@ -7,10 +7,7 @@
 
 #include <imgui.h>
 
-#include <rex/input/input_system.h>
-#include <rex/runtime.h>
-#include <rex/system/kernel_state.h>
-#include <rex/ui/immediate_drawer.h>
+#include <rex/hid/input_system.h>
 #include <rexfabric/rexfabric.h>
 
 #include "../platform.h"
@@ -29,11 +26,7 @@ constexpr int kGridSize = kGridColumns * kGridRows;
 // A search per keystroke would be a request per character.
 constexpr double kSearchDelay = 0.45;
 
-rex::input::InputSystem* GuestInput() {
-  auto* kernel = rex::system::kernel_state();
-  auto* runtime = kernel ? kernel->emulator() : nullptr;
-  return runtime ? static_cast<rex::input::InputSystem*>(runtime->input_system()) : nullptr;
-}
+rex::hid::IInputSystem* GuestInput() { return REX_INTERFACE(rex::hid::IInputSystem); }
 
 std::string Clip(const std::string& text, float width) {
   if (text.empty() || width <= 0.0f || ImGui::CalcTextSize(text.c_str()).x <= width) return text;
@@ -60,9 +53,9 @@ void Centered(const char* text) {
   ImGui::TextUnformatted(text);
 }
 
-void Icon(rex::ui::ImmediateTexture* texture, float size) {
-  if (texture) {
-    ImGui::Image(reinterpret_cast<ImTextureID>(texture), ImVec2(size, size));
+void Icon(ImTextureID texture, float size) {
+  if (texture != ImTextureID_Invalid) {
+    ImGui::Image(texture, ImVec2(size, size));
     return;
   }
   const ImVec2 corner = ImGui::GetCursorScreenPos();
@@ -74,13 +67,19 @@ float ButtonWidth(const char* label) { return ImGui::CalcTextSize(label).x + ImG
 
 }  // namespace
 
-ModsWindow::ModsWindow(rex::ui::ImGuiDrawer* drawer, MenuModel& model, std::function<void()> closed) : ImGuiDialog(drawer), model_(model), closed_(std::move(closed)) {
-  if (auto* input = GuestInput()) input->AddUIInputBlocker();
+ModsWindow::ModsWindow(MenuModel& model, std::function<void()> closed) : model_(model), closed_(std::move(closed)) {
+  if (auto* input = GuestInput()) input->AcquireUIBlock();
 }
 
 ModsWindow::~ModsWindow() {
-  if (auto* input = GuestInput()) input->RemoveUIInputBlocker();
+  if (auto* input = GuestInput()) input->ReleaseUIBlock();
   if (closed_) closed_();
+}
+
+bool ModsWindow::Draw(ImGuiIO& io) {
+  if (closing_) return false;
+  OnDraw(io);
+  return !closing_;
 }
 
 void ModsWindow::OnDraw(ImGuiIO& io) {
@@ -93,7 +92,7 @@ void ModsWindow::OnDraw(ImGuiIO& io) {
   ImGui::End();
   if (browser_open_) DrawBrowser();
   if (pending_) std::exchange(pending_, {})();
-  if (!open) Close();
+  if (!open) Hide();
 }
 
 // The mod list ------------------------------------------------------------------------------------------

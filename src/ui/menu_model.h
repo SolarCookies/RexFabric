@@ -7,19 +7,17 @@
 #include <string>
 #include <unordered_map>
 
+#include <imgui.h>
+#include <rexfabric/rexfabric.h>
+
 #include "../mods.h"
 #include "../net/thunderstore.h"
-
-namespace rex::ui {
-class ImmediateDrawer;
-class ImmediateTexture;
-}  // namespace rex::ui
 
 namespace rexfabric::ui {
 
 class MenuModel {
  public:
-  MenuModel(std::filesystem::path mods_dir, const std::string& community, rex::ui::ImmediateDrawer* images);
+  MenuModel(std::filesystem::path mods_dir, const std::string& community, Images images);
   ~MenuModel();
 
   // Once per frame, before anything is drawn: picks up finished installs, which rescans the list and so
@@ -45,24 +43,38 @@ class MenuModel {
   bool Restart();
   void ReloadScripts();
 
-  // Null while loading (PackageIcon then sets *loading), or when there's no image.
-  rex::ui::ImmediateTexture* ModIcon(const ModInfo& mod);
-  rex::ui::ImmediateTexture* PackageIcon(const net::Package& package, bool* loading = nullptr);
+  // ImTextureID_Invalid while loading (PackageIcon then sets *loading), or when there's no image.
+  ImTextureID ModIcon(const ModInfo& mod);
+  ImTextureID PackageIcon(const net::Package& package, bool* loading = nullptr);
   void OpenModsFolder() const;
 
  private:
-  std::unique_ptr<rex::ui::ImmediateTexture> Texture(const std::vector<uint8_t>& encoded);
+  // An uploaded icon, freed through Images::destroy when it goes.
+  class Texture {
+   public:
+    Texture(const Images& images, ImTextureID id) : images_(images), id_(id) {}
+    ~Texture();
+    Texture(const Texture&) = delete;
+    Texture& operator=(const Texture&) = delete;
+    ImTextureID id() const { return id_; }
+
+   private:
+    const Images& images_;
+    ImTextureID id_;
+  };
+
+  std::unique_ptr<Texture> MakeTexture(const std::vector<uint8_t>& encoded);
   void PrunePackageIcons();
 
   struct CachedIcon {
-    std::unique_ptr<rex::ui::ImmediateTexture> texture;
+    std::unique_ptr<Texture> texture;
     uint64_t used = 0;
   };
 
   ModList mods_;
   std::unique_ptr<net::Thunderstore> thunderstore_;
   net::Query query_;
-  rex::ui::ImmediateDrawer* images_;
+  Images images_;
   std::unordered_map<std::string, CachedIcon> mod_icons_;
   std::unordered_map<std::string, CachedIcon> package_icons_;
   std::vector<net::Thunderstore::Failure> failures_;

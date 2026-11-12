@@ -12,7 +12,7 @@
   REX_EXTERN(__imp__##name); \
   __attribute__((weak, noinline)) extern "C" REX_FUNC(name) { \
     if (rexfabric_slot_##name.chain.load(std::memory_order_relaxed)) [[unlikely]] return rexfabric::Dispatch(rexfabric_slot_##name, __imp__##name, ctx, base); \
-    [[clang::musttail]] return __imp__##name(ctx, base); \
+    REX_MUSTTAIL return __imp__##name(ctx, base); \
   } \
-  REX_EXTERN(__imp__##name)
+  REX_RECOMPILED_CODE_SECTION REX_EXTERN(__imp__##name)
 
