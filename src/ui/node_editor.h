@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 
-#include <rex/ui/imgui_dialog.h>
+#include <rex/ui/ui_system.h>
 
 #include "../graph/graph_document.h"
 #include "menu_model.h"
@@ -43,19 +43,20 @@ struct EditorContext;
 
 namespace rexfabric::ui {
 
-class NodeEditorWindow : public rex::ui::ImGuiDialog {
+class NodeEditorWindow : public rex::ui::DialogBase {
  public:
   // `closed` runs as the window goes.
-  NodeEditorWindow(rex::ui::ImGuiDrawer* drawer, MenuModel& model, std::function<void()> closed);
+  NodeEditorWindow(MenuModel& model, std::function<void()> closed);
   ~NodeEditorWindow() override;
 
   // Closes the window, once unsaved changes are saved or let go.
   void Hide();
 
- protected:
-  void OnDraw(ImGuiIO& io) override;
+  bool Draw(ImGuiIO& io) override;
 
  private:
+  void OnDraw(ImGuiIO& io);
+
   enum class Focus { kNone, kNode, kVariable, kRoutine, kDispatcher };
   using Settings = decltype(graph::Node::settings);
   // The names the window asks for in a popup.
@@ -153,6 +154,8 @@ class NodeEditorWindow : public rex::ui::ImGuiDialog {
 
   MenuModel& model_;
   std::function<void()> closed_;
+  // The UI drops the window on the next Draw.
+  bool closing_ = false;
 
   std::string mod_folder_;
   std::vector<std::string> graphs_;
@@ -202,6 +205,9 @@ class NodeEditorWindow : public rex::ui::ImGuiDialog {
   std::string ask_text_;
   std::function<void()> after_saving_;
   bool open_save_prompt_ = false;
+
+  // A variable's starting value is being typed into; the edit settles once nothing is active.
+  bool initial_editing_ = false;
 
   std::string status_;
   bool status_error_ = false;

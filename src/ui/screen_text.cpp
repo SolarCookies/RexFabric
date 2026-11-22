@@ -5,12 +5,13 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <memory>
 #include <mutex>
 
 #include <imgui.h>
 #include <imgui_internal.h>
 
-#include <rex/ui/imgui_dialog.h>
+#include <rex/ui/ui_system.h>
 
 namespace rexfabric::ui {
 namespace {
@@ -53,7 +54,6 @@ struct Screen {
   std::mutex mutex;
   std::deque<Line> lines;  // newest first
   std::deque<Shape> shapes;  // oldest first, drawn in order
-  rex::ui::ImGuiDrawer* drawer = nullptr;
   // Made with the menus, on the UI thread, and kept: prints come from wherever the scripts run.
   bool overlay = false;
 };
@@ -64,13 +64,15 @@ Screen& Get() {
 }
 
 // Draws the lines over everything; nothing while there are none.
-class Overlay final : public rex::ui::ImGuiDialog {
+class Overlay final : public rex::ui::DialogBase {
  public:
-  explicit Overlay(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
-  
+  bool Draw(ImGuiIO& io) override {
+    OnDraw(io);
+    return true;
+  }
 
- protected:
-  void OnDraw(ImGuiIO& io) override {
+ private:
+  void OnDraw(ImGuiIO& io) {
     Screen& screen = Get();
     std::lock_guard lock(screen.mutex);
     const Clock::time_point now = Clock::now();
@@ -98,7 +100,6 @@ class Overlay final : public rex::ui::ImGuiDialog {
     ImGui::End();
   }
 
- private:
   static ImU32 Color(const ScreenShape& shape, float alpha = 1.0f) {
     const int a = static_cast<int>(255.0f * std::clamp(shape.alpha * alpha, 0.0f, 1.0f));
     return IM_COL32((shape.rgb >> 16) & 0xFF, (shape.rgb >> 8) & 0xFF, shape.rgb & 0xFF, a);
@@ -217,16 +218,15 @@ void ClearScreen(const std::string& prefix) {
   std::erase_if(screen.shapes, [&prefix](const Shape& shape) { return shape.shape.key.compare(0, prefix.size(), prefix) == 0; });
 }
 
-void SetScreenTextDrawer(rex::ui::ImGuiDrawer* drawer) {
+void SetScreenTextUI(rex::ui::IUISystem& ui) {
   Screen& screen = Get();
   {
     std::lock_guard lock(screen.mutex);
-    screen.drawer = drawer;
-    if (!drawer || screen.overlay) return;
+    if (screen.overlay) return;
     screen.overlay = true;
   }
   // CreateMenus runs on the UI thread, where dialogs are made. Unlocked: a dialog may draw as it's made.
-  new Overlay(drawer);
+  ui.AddDialog(std::make_unique<Overlay>());
 }
 
 }  // namespace rexfabric::ui

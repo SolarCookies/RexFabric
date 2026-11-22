@@ -7,7 +7,7 @@
 #
 # WITH_GUIDE puts the mods menu in RexLiveless's Guide; attach RexLiveless to the target first. Without it the
 # menu is plain ImGui windows. WITH_TEXTURES adds texture packs (rexfabric/textures.h), for a game whose renderer
-# looks textures up in them. WITH_NODE_EDITOR adds the node editor, which makes Lua mods from node graphs in game.
+# looks textures up in them; it isn't available with this SDK. WITH_NODE_EDITOR adds the node editor, which makes Lua mods from node graphs in game.
 #
 # With RexGlass attached to the same target (before or after), the menus and the node editor are glass.
 #
@@ -67,9 +67,20 @@ function(_rexfabric_node_editor_library)
   set(dir ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/thirdparty/imgui-node-editor)
   add_library(rexfabric_node_editor STATIC ${dir}/imgui_node_editor.cpp ${dir}/imgui_node_editor_api.cpp ${dir}/imgui_canvas.cpp ${dir}/crude_json.cpp)
   target_include_directories(rexfabric_node_editor PUBLIC ${dir})
-  target_link_libraries(rexfabric_node_editor PRIVATE rex::runtime)
+  target_link_libraries(rexfabric_node_editor PRIVATE rex::sdk)
   target_compile_definitions(rexfabric_node_editor PRIVATE IMGUI_DEFINE_MATH_OPERATORS "GImGui=ImGui::GetCurrentContext()")
   target_compile_options(rexfabric_node_editor PRIVATE -w)
+endfunction()
+
+# ImGuizmo (Cedric Guillemet, MIT, commit 105e4fd of 2026-10-10), the Avatar editor's gizmos, built against the SDK's
+# ImGui as imgui-node-editor is: GImGui read through GetCurrentContext.
+function(_rexfabric_imguizmo_library)
+  set(dir ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/thirdparty/imguizmo)
+  add_library(rexfabric_imguizmo STATIC ${dir}/ImGuizmo.cpp)
+  target_include_directories(rexfabric_imguizmo PUBLIC ${dir})
+  target_link_libraries(rexfabric_imguizmo PRIVATE rex::sdk)
+  target_compile_definitions(rexfabric_imguizmo PRIVATE "GImGui=ImGui::GetCurrentContext()")
+  target_compile_options(rexfabric_imguizmo PRIVATE -w)
 endfunction()
 
 # The manifest's template_dir, or a fatal error saying how to add it.
@@ -84,6 +95,18 @@ function(_rexfabric_template_dir out_var)
     message(FATAL_ERROR "RexFabric: ${manifests} has no template_dir. Add this under [entrypoint]:\n  template_dir = \"generated/templates\"")
   endif()
   set(${out_var} "${CMAKE_SOURCE_DIR}/${CMAKE_MATCH_1}" PARENT_SCOPE)
+endfunction()
+
+# The SDK's own copies of toml++ (mod.toml) and stb_image (mod icons), which its installed package doesn't carry.
+function(_rexfabric_sdk_thirdparty out_var)
+  _rexfabric_sdk_templates(templates)
+  cmake_path(GET templates PARENT_PATH resources)
+  cmake_path(GET resources PARENT_PATH root)
+  set(dir "${root}/thirdparty")
+  if(NOT EXISTS "${dir}/tomlplusplus/include/toml++/toml.hpp" OR NOT EXISTS "${dir}/stb/stb_image.h")
+    message(FATAL_ERROR "RexFabric: can't find toml++ and stb_image in the SDK's thirdparty folder (${dir}).")
+  endif()
+  set(${out_var} "${dir}" PARENT_SCOPE)
 endfunction()
 
 function(_rexfabric_sdk_templates out_var)
@@ -123,22 +146,21 @@ function(rexfabric_attach target)
 
   set(dir ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
   set(sources
-    src/api.cpp src/events.cpp src/game_api.cpp src/guest_hooks.cpp src/hooks.cpp src/host_input.cpp src/library.cpp src/midasm.cpp src/mods.cpp src/native_loader.cpp src/platform.cpp src/rexfabric.cpp src/switches.cpp
-    src/lua/lua_game.cpp src/lua/lua_host.cpp src/lua/lua_rex.cpp src/lua/lua_timers.cpp src/lua/lua_vm.cpp
-    src/net/http.cpp src/net/thunderstore.cpp
-    src/ui/imgui_menu.cpp src/ui/menu_model.cpp src/ui/screen_text.cpp
+    src/api.cpp src/content/assets.cpp src/content/avatars.cpp src/content/classes.cpp src/content/components.cpp src/content/game_texts.cpp src/content/localisation.cpp src/content/map_edits.cpp src/content/material_graph.cpp src/content/material_nodes.cpp src/content/materials.cpp src/content/packets.cpp src/content/tables.cpp src/content/types.cpp src/content/values.cpp src/content/viewport.cpp src/content/world_saves.cpp src/content/world_view.cpp src/events.cpp src/game_api.cpp src/guest_hooks.cpp src/hooks.cpp src/host_input.cpp src/library.cpp src/midasm.cpp src/mods.cpp src/native_loader.cpp src/platform.cpp src/rexfabric.cpp src/settings.cpp src/switches.cpp
+    src/lua/lua_console.cpp src/lua/lua_content.cpp src/lua/lua_definitions.cpp src/lua/lua_game.cpp src/lua/lua_host.cpp src/lua/lua_rex.cpp src/lua/lua_timers.cpp src/lua/lua_vm.cpp src/lua/lua_world_data.cpp
+    src/net/http.cpp src/net/mod_channel.cpp src/net/thunderstore.cpp
+    src/ui/asset_editors.cpp src/ui/avatar_viewport.cpp src/ui/editor_parts.cpp src/ui/material_graph_editor.cpp src/ui/content_browser.cpp src/ui/file_picker.cpp src/ui/image_decode.cpp src/ui/imgui_menu.cpp src/ui/lua_console_window.cpp src/ui/map_edit_world.cpp src/ui/menu_model.cpp src/ui/screen_text.cpp src/ui/value_widgets.cpp src/ui/widgets.cpp src/ui/world_mesh_editors.cpp
   )
   if(arg_WITH_GUIDE)
     list(APPEND sources src/ui/guide_menu.cpp)
     target_compile_definitions(${target} PRIVATE REXFABRIC_WITH_GUIDE=1)
   endif()
   if(arg_WITH_TEXTURES)
-    list(APPEND sources src/content/textures.cpp)
-    target_link_libraries(${target} PRIVATE rex::xxhash)
+    message(FATAL_ERROR "RexFabric: WITH_TEXTURES needs the SDK's Xenos texture code and xxHash, which this SDK doesn't offer.")
   endif()
   if(arg_WITH_NODE_EDITOR)
     list(APPEND sources
-      src/graph/graph.cpp src/graph/graph_document.cpp src/graph/graph_file.cpp src/graph/lua_compiler.cpp src/graph/node_library.cpp src/graph/nodes_builtin.cpp src/graph/nodes_game.cpp src/graph/nodes_api.cpp
+      src/graph/graph.cpp src/graph/graph_document.cpp src/graph/graph_file.cpp src/graph/lua_compiler.cpp src/graph/node_library.cpp src/graph/nodes_builtin.cpp src/graph/nodes_content.cpp src/graph/nodes_game.cpp src/graph/nodes_api.cpp
       src/ui/node_editor.cpp src/ui/node_graph_style.cpp src/ui/node_graph_widgets.cpp
     )
     rexfabric_link_imgui_node_editor(${target})
@@ -146,12 +168,18 @@ function(rexfabric_attach target)
   endif()
   list(TRANSFORM sources PREPEND ${dir}/)
   target_sources(${target} PRIVATE ${sources})
-  target_include_directories(${target} PRIVATE ${dir}/include ${dir}/thirdparty)
-  target_link_libraries(${target} PRIVATE rexfabric_lua rexfabric_miniz)
-  # The generated code includes rexfabric/hook_slot.h, and rexglue_setup_target compiles it in its own target.
-  if(TARGET ${target}_recomp)
-    target_include_directories(${target}_recomp PRIVATE ${dir}/include)
+  _rexfabric_sdk_thirdparty(sdk_thirdparty)
+  target_include_directories(${target} PRIVATE ${dir}/include ${dir}/thirdparty ${sdk_thirdparty}/tomlplusplus/include ${sdk_thirdparty}/stb)
+  if(NOT TARGET rexfabric_imguizmo)
+    _rexfabric_imguizmo_library()
   endif()
+  target_link_libraries(${target} PRIVATE rexfabric_lua rexfabric_miniz rexfabric_imguizmo)
+  # The generated code includes rexfabric/hook_slot.h, and rexglue_setup_target compiles it in its own target.
+  foreach(recompiled ${target}_recompiled ${target}_recomp)
+    if(TARGET ${recompiled})
+      target_include_directories(${recompiled} PRIVATE ${dir}/include)
+    endif()
+  endforeach()
   if(WIN32)
     target_link_libraries(${target} PRIVATE winhttp shell32)
   else()

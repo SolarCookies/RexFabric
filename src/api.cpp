@@ -2,13 +2,15 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
-#include <rex/cvar.h>
-#include <rex/ppc/func.h>
+#include <rex/kernel/title_runtime.h>
+#include <rex/ppc/call.h>
+#include <rex/settings_registry.h>
 #include <rexfabric/game_api.h>
 #include <rexfabric/midasm.h>
 #include <rexfabric/rexfabric.h>
@@ -19,6 +21,7 @@
 #include "hooks.h"
 #include "log.h"
 #include "mod.h"
+#include "settings.h"
 
 // What a RexFabricMidasm points at while a native handler runs.
 struct RexFabricMidasm {
@@ -67,17 +70,22 @@ double GetFpr(const RexFabricCall* call, uint32_t index) { return index < 32 ? (
 void SetFpr(RexFabricCall* call, uint32_t index, double value) { if (index < 32) (call->ctx->*guest::kFprs[index]).f64 = value; }
 
 uint64_t CallGuest(RexFabricCall* call, uint32_t address, const uint64_t* args, uint32_t count) {
-  PPCFunc* function = rex::runtime::ResolveIndirectFunction(address);
-  if (!function) {
+  rex::kernel::TitleRuntime* runtime = REX_RUNTIME();
+  rex::Result<PPCFunc*> function = runtime ? runtime->FindFunction(address) : rex::Result<PPCFunc*>(nullptr);
+  if (!function || !*function) {
     RF_WARN("call_guest: no function at {:08X}", address);
     return 0;
   }
-  // A copy, so the hooked call's registers survive. The stack pointer is the hooked call's, whose own frame
-  // isn't live before call_next or after it returns.
-  PPCContext ctx = *call->ctx;
+  // On the hooked call's own registers, as the thread's hooks expect, put back after so the hooked call's
+  // registers survive. The frame goes under the hooked call's stack pointer.
+  PPCContext& ctx = *call->ctx;
+  const PPCContext saved = ctx;
+  rex::ppc::OpenCallFrame(ctx, call->base, 0);
   for (uint32_t i = 0; i < count && i < 8; ++i) (ctx.*guest::kGprs[3 + i]).u64 = args[i];
-  function(ctx, call->base);
-  return ctx.r3.u64;
+  (**function)(ctx, call->base);
+  const uint64_t result = ctx.r3.u64;
+  ctx = saved;
+  return result;
 }
 
 void* GuestPointer(uint32_t address) { return guest::Translate(address); }
@@ -96,6 +104,26 @@ const RexFabricType* AsHandle(const TypeDef* type) { return reinterpret_cast<con
 // Strings a result points at, until this thread's next call.
 thread_local std::string result_text;
 
+// Native mods see objects by address. An object of a type held by handle is resolved on the way out, and an address
+// held on the way back in; a refusal, or a gone object, is no object.
+uint32_t NativeAddress(const Object& object) {
+  if (!object.type || !object.type->held()) return object.address;
+  try {
+    return object.type->Resolve(object.address);
+  } catch (const std::exception&) {
+    return 0;
+  }
+}
+
+uint32_t GameHandle(uint32_t address, const TypeDef* type) {
+  if (!type || !type->held() || !address) return address;
+  try {
+    return type->Hold(address);
+  } catch (const std::exception&) {
+    return 0;
+  }
+}
+
 RexFabricValue ToNative(const Value& value) {
   RexFabricValue out{static_cast<uint32_t>(TypeOf(value))};
   switch (TypeOf(value)) {
@@ -105,7 +133,7 @@ RexFabricValue ToNative(const Value& value) {
     case ValueType::kFloat: out.f = std::get<double>(value); break;
     case ValueType::kString: out.s = std::get<std::string>(value).c_str(); break;
     case ValueType::kObject:
-      out.address = std::get<Object>(value).address;
+      out.address = NativeAddress(std::get<Object>(value));
       out.object_type = AsHandle(std::get<Object>(value).type);
       break;
   }
@@ -120,12 +148,16 @@ bool FromNative(const RexFabricValue& in, ValueType want, Value& out) {
     case ValueType::kInt: out = in.i; return in.type == REXFABRIC_VALUE_INT || in.type == REXFABRIC_VALUE_BOOL;
     case ValueType::kFloat: out = in.type == REXFABRIC_VALUE_INT ? static_cast<double>(in.i) : in.f; return in.type == REXFABRIC_VALUE_FLOAT || in.type == REXFABRIC_VALUE_INT;
     case ValueType::kString: out = std::string(in.s ? in.s : ""); return in.type == REXFABRIC_VALUE_STRING && in.s;
-    case ValueType::kObject:
-      out = Object{in.type == REXFABRIC_VALUE_INT ? static_cast<uint32_t>(in.i) : in.address, AsType(in.object_type)};
+    case ValueType::kObject: {
+      const TypeDef* type = AsType(in.object_type);
+      out = Object{GameHandle(in.type == REXFABRIC_VALUE_INT ? static_cast<uint32_t>(in.i) : in.address, type), type};
       return in.type == REXFABRIC_VALUE_OBJECT || in.type == REXFABRIC_VALUE_INT || in.type == REXFABRIC_VALUE_NONE;
+    }
   }
   return false;
 }
+
+uint32_t FindGuestFunctionC(const char* name) { return name ? FindGuestFunction(name) : 0; }
 
 const RexFabricFunction* FindFunctionC(const char* name) { return reinterpret_cast<const RexFabricFunction*>(name ? FindFunction(name) : nullptr); }
 
@@ -221,8 +253,9 @@ int32_t GetSwitchC(const char* name) { return name ? GetSwitch(name) : 0; }
 void SetSwitchC(const char* name, int32_t value) { if (name) SetSwitch(name, value); }
 
 int32_t GetCvar(const char* name, char* buffer, uint32_t size) {
-  if (!name || !rex::cvar::GetFlagInfo(name)) return -1;
-  const std::string value = rex::cvar::GetFlagByName(name);
+  const rex::SettingBase* setting = name ? FindSetting(name) : nullptr;
+  if (!setting) return -1;
+  const std::string value = setting->GetText();
   if (buffer && size) {
     const size_t copied = std::min<size_t>(value.size(), size - 1);
     std::memcpy(buffer, value.data(), copied);
@@ -231,7 +264,10 @@ int32_t GetCvar(const char* name, char* buffer, uint32_t size) {
   return static_cast<int32_t>(value.size());
 }
 
-int SetCvar(const char* name, const char* value) { return name && value && rex::cvar::SetFlagByName(name, value); }
+int SetCvar(const char* name, const char* value) {
+  const rex::SettingBase* setting = name && value ? FindSetting(name) : nullptr;
+  return setting && REX_SETTINGS().SetText(setting->GetName(), value).has_value();
+}
 
 constexpr RexFabricApi kApi = {
     .version = REXFABRIC_API_VERSION,
@@ -277,6 +313,7 @@ constexpr RexFabricApi kApi = {
     .set_switch = SetSwitchC,
     .get_cvar = GetCvar,
     .set_cvar = SetCvar,
+    .find_guest_function = FindGuestFunctionC,
 };
 
 }  // namespace

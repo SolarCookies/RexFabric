@@ -17,7 +17,7 @@
 #include <string_view>
 #include <vector>
 
-#include <rex/filesystem.h>
+#include <rex/platform/file.h>
 
 #include "lua_compiler.h"
 #include "node_library.h"
@@ -656,7 +656,7 @@ bool AddEvents(Library& library, const Api& api, const FunctionDef& def) {
 void AddApiNodes(Library& library) {
   Api api;
   std::error_code error;
-  const std::filesystem::path folder = rex::filesystem::GetExecutableFolder() / "lua_api";
+  const std::filesystem::path folder = rex::platform::GetExecutableFolder() / "lua_api";
   for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
     if (entry.is_regular_file(error) && entry.path().extension() == ".lua") ReadFile(entry.path(), api);
   }

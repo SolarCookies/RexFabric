@@ -1,12 +1,12 @@
 // The hook slot every recompiled function checks on entry. Generated code includes this through
-// RexFabric's codegen templates (templates/pch_hooks.inja), so it pulls in nothing but rex/ppc/func.h.
+// RexFabric's codegen templates (templates/pch_hooks.inja), so it pulls in nothing but rex/ppc/recompiled_code.h.
 
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 
-#include <rex/ppc/func.h>
+#include <rex/ppc/recompiled_code.h>
 
 namespace rexfabric {
 

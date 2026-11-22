@@ -6,7 +6,7 @@
 #include <functional>
 #include <string>
 
-#include <rex/ui/imgui_dialog.h>
+#include <rex/ui/ui_system.h>
 
 #include "menu_model.h"
 
@@ -14,18 +14,19 @@ struct ImVec2;
 
 namespace rexfabric::ui {
 
-class ModsWindow : public rex::ui::ImGuiDialog {
+class ModsWindow : public rex::ui::DialogBase {
  public:
   // `closed` runs as the window goes, whether its own close button or the menu key closed it.
-  ModsWindow(rex::ui::ImGuiDrawer* drawer, MenuModel& model, std::function<void()> closed);
+  ModsWindow(MenuModel& model, std::function<void()> closed);
   ~ModsWindow() override;
 
-  void Hide() { Close(); }
+  void Hide() { closing_ = true; }
 
- protected:
-  void OnDraw(ImGuiIO& io) override;
+  bool Draw(ImGuiIO& io) override;
 
  private:
+  void OnDraw(ImGuiIO& io);
+
   void DrawMods();
   void DrawColumn(const char* id, bool enabled, float width, float height);
   void DrawRow(size_t index, bool enabled_column);
@@ -38,6 +39,8 @@ class ModsWindow : public rex::ui::ImGuiDialog {
 
   MenuModel& model_;
   std::function<void()> closed_;
+  // The UI drops the window on the next Draw.
+  bool closing_ = false;
   // One change per frame, made once the frame's rows are drawn.
   std::function<void()> pending_;
 

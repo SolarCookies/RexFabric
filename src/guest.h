@@ -6,8 +6,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include <rex/kernel/title_runtime.h>
 #include <rex/ppc/context.h>
-#include <rex/system/kernel_state.h>
 
 namespace rexfabric::guest {
 
@@ -18,8 +18,10 @@ inline constexpr Register kFprs[32] = {&PPCContext::f0, &PPCContext::f1, &PPCCon
 
 // Null until the runtime has guest memory.
 inline uint8_t* Translate(uint32_t address) {
-  auto* kernel = rex::system::kernel_state();
-  return kernel && kernel->memory() ? kernel->memory()->TranslateVirtual(address) : nullptr;
+  rex::kernel::TitleRuntime* runtime = REX_RUNTIME();
+  if (!runtime) return nullptr;
+  const rex::memory::GuestMembase membase = runtime->GetMembase();
+  return membase.GetBase() ? membase.TranslateVirtual(address) : nullptr;
 }
 
 template <typename T>

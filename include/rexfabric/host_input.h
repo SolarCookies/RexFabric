@@ -5,7 +5,7 @@
 // installed rex.input reports no input, so a mod's hotkeys stay quiet rather than erroring.
 //
 //   rexfabric::HostInput input;
-//   input.resolve_key = [](std::string_view name) { return uint16_t(rex::ui::ParseVirtualKey(name)); };
+//   input.resolve_key = [](std::string_view name) { return uint16_t(REX_INTERFACE(rex::hid::IInputSystem)->ParseVirtualKey(name)); };
 //   input.key_down = [](uint16_t key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
 //   input.accepts_input = [] { return WindowFocused() && !MenuOpen(); };
 //   rexfabric::SetHostInput(std::move(input));

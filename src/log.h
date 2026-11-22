@@ -2,15 +2,13 @@
 
 #pragma once
 
-#include <rex/logging.h>
+#include <rex/logging/log_category.h>
+#include <rex/logging/logger.h>
 
-namespace rexfabric {
+REXLOG_CATEGORY(rexfabric, "RexFabric mods")
+REXLOG_TABLE(kRexFabricLog, rexfabric)
 
-rex::LogCategoryId LogCategory();
-
-}  // namespace rexfabric
-
-#define RF_DEBUG(...) REXLOG_CAT_DEBUG(::rexfabric::LogCategory(), __VA_ARGS__)
-#define RF_INFO(...) REXLOG_CAT_INFO(::rexfabric::LogCategory(), __VA_ARGS__)
-#define RF_WARN(...) REXLOG_CAT_WARN(::rexfabric::LogCategory(), __VA_ARGS__)
-#define RF_ERROR(...) REXLOG_CAT_ERROR(::rexfabric::LogCategory(), __VA_ARGS__)
+#define RF_DEBUG(...) REXLOG_CAT_DEBUG(::rex::log::rexfabric, __VA_ARGS__)
+#define RF_INFO(...) REXLOG_CAT_INFO(::rex::log::rexfabric, __VA_ARGS__)
+#define RF_WARN(...) REXLOG_CAT_WARN(::rex::log::rexfabric, __VA_ARGS__)
+#define RF_ERROR(...) REXLOG_CAT_ERROR(::rex::log::rexfabric, __VA_ARGS__)
