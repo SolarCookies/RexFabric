@@ -31,6 +31,8 @@ struct Class {
   // A mod's avatar class's: the backing it names, empty to keep its parent's, and the components it adds.
   std::string backing;
   std::vector<Component> components;
+  // A game class's: the game events its avatars' class graphs can start with (ClassDecl::events).
+  std::vector<ClassEventDecl> events;
 };
 
 // Loads every enum, struct, table and class asset of these mods (the ones that can load, in load order), after
@@ -47,6 +49,8 @@ std::optional<Class> FindClass(std::string_view path);
 std::vector<std::string> ClassPaths();
 // Whether `path` is `base` or comes from it.
 bool IsA(std::string_view path, std::string_view base);
+// The class and each class it comes from, nearest first, by path; empty for no class.
+std::vector<std::string> AncestryOf(std::string_view path);
 // Every property the class has, its ancestors' first, each with the class's value for it.
 std::vector<Property> Properties(std::string_view path);
 // The class's value of a property, from itself or the nearest ancestor that sets it; none for an unknown property.
@@ -59,6 +63,19 @@ std::string BackingOf(std::string_view path);
 std::vector<Component> ComponentsOf(std::string_view path);
 // The classes the mod `from` may spawn avatars of, as MayReference allows.
 std::vector<std::string> AvatarClassPaths(std::string_view from);
+
+// Class graphs (docs/content_and_classes.md, Class graphs). The game events an avatar of the class can start its class
+// graph with (ClassDecl::events), its ancestors' first; RexFabric's own (content.h, kAvatarSpawned) aren't among them.
+std::vector<ClassEventDecl> ClassEventsOf(std::string_view path);
+// A game event some game class declares for its avatars: the class and its declaration; none for any other event.
+struct DeclaredClassEvent {
+  std::string for_class;
+  ClassEventDecl decl;
+};
+std::optional<DeclaredClassEvent> FindClassEvent(std::string_view event);
+// Whether an event is fired with an avatar's id first, which Lua gets as the avatar: RexFabric's own avatar events, and
+// every class event a game class declares.
+bool IsAvatarEvent(std::string_view event);
 
 // Whether the mod `from` may use what `path` names: a path of RexFabric or the game, of `from` itself, or of a mod
 // it depends on. `from` empty (the game, a native caller) may use anything. Otherwise `why` says which dependency

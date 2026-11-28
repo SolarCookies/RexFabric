@@ -230,7 +230,7 @@ void AddEvents(Library& library) {
 // An event that only runs when something runs it: a timer, a dispatcher it's bound to. Its params are a dispatcher's
 // when it picks one, so it can be bound to that dispatcher and get what Call gives.
 void AddCustomEvent(Library& library) {
-  library.Add({.id = "event.custom", .title = "Custom Event", .category = "Events",
+  library.Add({.id = std::string(kCustomEvent), .title = "Custom Event", .category = "Events",
       .description = "Runs when a timer or an event dispatcher runs it. Link its top right pin to Set Timer by Event, or to a dispatcher's Bind Event. With Params From set, it has that dispatcher's params.",
       .role = NodeRole::kEvent, .delegate = true, .pins = {{}, {ExecPin(kExecOut)}},
       .settings = {{.name = "Name", .kind = SettingKind::kText, .initial = "CustomEvent", .tooltip = "What the event is called on the canvas"},
@@ -435,14 +435,14 @@ PinType VariableTypeOf(const Node& node, const Graph& graph) {
   return variable ? VariableType(*variable) : PinType{PinKind::kAny};
 }
 
-// The variable's name, or an error when the graph has no such variable.
+// The variable as Lua reaches it (Emitter::Member), or an error when the graph has no such variable.
 std::string VariableName(Emitter& emit) {
   const std::string name = emit.Setting("Variable");
   if (!emit.graph().FindVariable(name)) {
     emit.Error(name.empty() ? "Pick a variable" : "There's no variable named " + name);
     return "nil";
   }
-  return name;
+  return emit.Member(name);
 }
 
 void AddVariables(Library& library) {
@@ -497,8 +497,8 @@ void AddVariables(Library& library) {
         .emit = [op](Emitter& emit) {
           const std::string name = VariableName(emit);
           if (name == "nil") return;
-          const Variable* variable = emit.graph().FindVariable(name);
-          if (variable->type != PinKind::kInt && variable->type != PinKind::kFloat) emit.Error(name + " isn't a number");
+          const Variable* variable = emit.graph().FindVariable(emit.Setting("Variable"));
+          if (variable->type != PinKind::kInt && variable->type != PinKind::kFloat) emit.Error(variable->name + " isn't a number");
           emit.Line(name + " = " + name + " " + op + " 1");
           if (emit.Linked("Value")) emit.Line(emit.Output("Value") + " = " + name);
         }});
@@ -542,8 +542,10 @@ NodeRole CallRole(const Node& node, const Graph& graph) {
 }
 
 // `name(args)` for a call to a function.
+// A call of one of the graph's functions; in a class graph, for the avatar the chain runs for.
 std::string FunctionCall(Emitter& emit, const Routine& routine) {
   std::vector<std::string> args;
+  if (emit.ClassGraph()) args.push_back("Self");
   for (const Param& param : routine.inputs) args.push_back(emit.Input(param.name));
   return routine.name + "(" + Joined(args) + ")";
 }
@@ -771,6 +773,8 @@ void AddTimers(Library& library) {
         emit.Line("rex.after(" + emit.Input("Duration") + ", function()");
         emit.Indent();
         emit.Line(waiting + " = false");
+        // An avatar removed while it waited goes no further, as a destroyed actor's Delay doesn't.
+        if (emit.ClassGraph()) emit.Line("if not Self.valid then return end");
         emit.Chain("Completed");
         emit.Dedent();
         emit.Line("end)");
@@ -801,14 +805,14 @@ void AddTimers(Library& library) {
 
 // Event dispatchers ---------------------------------------------------------------------------------------
 
-// The dispatcher's table, or an error when the graph has no such dispatcher.
+// The dispatcher's table as Lua reaches it (Emitter::Member), or an error when the graph has no such dispatcher.
 std::string DispatcherName(Emitter& emit) {
   const std::string name = emit.Setting("Dispatcher");
   if (!emit.graph().FindDispatcher(name)) {
     emit.Error(name.empty() ? "Pick an event dispatcher" : "There's no event dispatcher named " + name);
     return {};
   }
-  return name;
+  return emit.Member(name);
 }
 
 constexpr std::string_view kBindHelper = "local function rf_bind(list, run)\n  for _, bound in ipairs(list) do if bound == run then return end end\n  list[#list + 1] = run\nend";
@@ -833,7 +837,7 @@ void AddDispatchers(Library& library) {
         const std::string name = DispatcherName(emit);
         if (name.empty()) return;
         std::vector<std::string> args;
-        for (const Param& param : emit.graph().FindDispatcher(name)->params) args.push_back(emit.Input(param.name));
+        for (const Param& param : emit.graph().FindDispatcher(emit.Setting("Dispatcher"))->params) args.push_back(emit.Input(param.name));
         // Over a copy, so an event unbinding itself as it runs doesn't make the next one skipped.
         emit.Line("for _, run in ipairs({table.unpack(" + name + ")}) do run(" + Joined(args) + ") end");
       }});

@@ -54,6 +54,9 @@ std::string EntryKey(const std::string& key, const nlohmann::json& map_key);
 // texts inside its structs, arrays and maps. A struct field the value lacks, or has as the struct has it, is its
 // default, keyed by the struct.
 void WalkTexts(const TypeLookup& types, const ValueType& type, const nlohmann::json& value, const std::string& key, const std::function<void(const std::string& key, const std::string& text)>& visit);
+// Translates every text in `value`, of `type`, into the language the game shows (Translate), keyed as WalkTexts keys
+// them. A struct's field must be in the value to be translated: fit the value first (FitValue) for its defaults.
+void TranslateTexts(const TypeLookup& types, const ValueType& type, nlohmann::json& value, const std::string& key);
 
 // A text of a mod, as its files have it: its key, the asset it's in, where there (for the editor) and its source.
 struct TextEntry {

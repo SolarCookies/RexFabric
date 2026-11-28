@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <deque>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -17,6 +18,7 @@
 #include <rexfabric/game_api.h>
 
 #include "../content/classes.h"
+#include "../content/game_assets.h"
 #include "lua_compiler.h"
 #include "node_library.h"
 
@@ -295,7 +297,8 @@ void AddType(Library& library, const std::string& category, const std::string& s
   }
 
   for (const auto& [name, function] : type.methods()) {
-    NodeDesc method{.id = "game.method:" + type.name() + ":" + name, .title = short_name + ":" + name, .category = type_category, .description = "Calls " + short_name + "'s " + name + " on Target."};
+    // Titled as a blueprint's nodes are ("Start Romance Maze"), its type in its category and in what finds it.
+    NodeDesc method{.id = "game.method:" + type.name() + ":" + name, .title = TitleCase(name), .category = type_category, .description = "Calls " + short_name + "'s " + name + " on Target.", .keywords = short_name + " " + name};
     method.pins.inputs = {ExecPin(), ObjectPin("Target", type.name())};
     for (Pin& pin : ArgPins(function, 1)) method.pins.inputs.push_back(std::move(pin));
     method.pins.outputs = {ExecPin(kExecOut)};
@@ -332,27 +335,90 @@ void AddClassCast(Library& library, const content::Class& game_class) {
   library.Add(std::move(cast));
 }
 
+// Turns each address the game fires an event with, from argument `first` on, into its type's object (nil for none)
+// before anything reads it.
+void ConvertArgs(Emitter& emit, const NamedArgs* named, size_t first, size_t count) {
+  for (size_t i = first; i < count; ++i) {
+    const std::string type = ArgType(named, i);
+    if (!type.empty()) emit.Line(emit.Param(ArgName(named, i)) + " = " + LuaPath(type) + "(" + emit.Param(ArgName(named, i)) + ")");
+  }
+}
+
+// A field event (node_library.h, IsFieldEvent) runs only when the values after the asset are its match, in order. Each
+// is compared as text, so a number the game fires matches the text of it.
+void EmitMatchGuard(Emitter& emit, const NamedArgs* named, size_t count, const std::vector<std::string>& match) {
+  if (match.empty()) return;
+  if (match.size() >= count) {
+    emit.Error("It matches " + std::to_string(match.size()) + " values after the asset, but the event has " + std::to_string(count - 1));
+    return;
+  }
+  std::string differs;
+  for (size_t i = 0; i < match.size(); ++i) differs += (i > 0 ? " or " : "") + std::string("tostring(") + emit.Param(ArgName(named, i + 1)) + ") ~= " + LuaQuote(match[i]);
+  emit.Line("if " + differs + " then return end");
+}
+
+// An event's handler: rex.on with the values the game fires it with, each address made its type's object. For an
+// asset's own graph, `own` returns at once when the first value, the asset fired for, isn't the graph's asset, or for a
+// field event when the values after it aren't its match. An avatar event's first value comes as the avatar already
+// (content::IsAvatarEvent), so it's left as it is.
+void EmitEventHandler(Emitter& emit, const std::string& event, const NamedArgs* named, size_t count, bool own, bool avatar_first) {
+  std::string params;
+  for (size_t i = 0; i < count; ++i) params += (i > 0 ? ", " : "") + emit.Param(ArgName(named, i));
+  emit.Line("rex.on(" + LuaQuote(event) + ", function(" + params + ")");
+  emit.Open();
+  if (own) {
+    // The asset is the script's own as it's loaded, so a renamed or copied asset's graph needs no compiling again.
+    if (emit.options().asset.empty()) emit.Error("This event only runs on a game asset's own graph");
+    const std::string asset = emit.State("Asset", "rex.content.script_asset()");
+    emit.Line("if " + emit.Param(ArgName(named, 0)) + " ~= " + asset + " then return end");
+    // Before the values are made objects, so the match reads them as the game fired them.
+    EmitMatchGuard(emit, named, count, MatchOf(emit.node()));
+  }
+  ConvertArgs(emit, named, own || avatar_first ? 1 : 0, count);
+  emit.Chain(kExecOut);
+  emit.Close();
+  emit.Line("end)");
+}
+
 void AddEvent(Library& library, const std::string& category, const std::string& title, const std::string& event, const NamedArgs* named) {
   NodeDesc desc{.id = "game.event:" + event, .title = title, .category = category, .description = "Runs when the game fires " + event + ", with whatever it fires it with.", .role = NodeRole::kEvent, .delegate = true};
   // As many values as the game named, or kEventArgs.
   const size_t count = named ? named->args.size() : static_cast<size_t>(kEventArgs);
+  // A game class's event of its avatars (ClassDecl::events) comes with the avatar first, as an avatar of that class.
+  const std::optional<content::DeclaredClassEvent> for_avatars = content::FindClassEvent(event);
   desc.pins.outputs = {ExecPin(kExecOut)};
-  for (size_t i = 0; i < count; ++i) desc.pins.outputs.push_back(ArgPin(named, i, {PinKind::kAny}));
-  desc.emit = [event, named, count](Emitter& emit) {
-    std::string params;
-    for (size_t i = 0; i < count; ++i) params += (i > 0 ? ", " : "") + emit.Param(ArgName(named, i));
-    emit.Line("rex.on(" + LuaQuote(event) + ", function(" + params + ")");
-    emit.Open();
-    // An address the game fires with becomes its type's object (nil for none) before anything reads it.
-    for (size_t i = 0; i < count; ++i) {
-      const std::string type = ArgType(named, i);
-      if (!type.empty()) emit.Line(emit.Param(ArgName(named, i)) + " = " + LuaPath(type) + "(" + emit.Param(ArgName(named, i)) + ")");
-    }
-    emit.Chain(kExecOut);
-    emit.Close();
-    emit.Line("end)");
-  };
+  for (size_t i = 0; i < count; ++i) desc.pins.outputs.push_back(i == 0 && for_avatars ? ObjectPin(ArgName(named, 0), for_avatars->for_class) : ArgPin(named, i, {PinKind::kAny}));
+  desc.emit = [event, named, count, avatar_first = for_avatars.has_value()](Emitter& emit) { EmitEventHandler(emit, event, named, count, false, avatar_first); };
   library.Add(std::move(desc));
+
+  // The same event on an avatar class's own graph (docs/content_and_classes.md, Class graphs): the avatar it's fired for
+  // is Self, so the node leaves it out. Not in the add menu: a new class graph starts with one of each.
+  if (for_avatars) {
+    NodeDesc avatars{.id = ClassEventNode(event), .title = for_avatars->decl.title.empty() ? title : for_avatars->decl.title, .description = "Runs when the game fires " + event + " for an avatar of this class, as Self.", .role = NodeRole::kEvent, .delegate = true};
+    avatars.pins.outputs = {ExecPin(kExecOut)};
+    for (size_t i = 1; i < count; ++i) avatars.pins.outputs.push_back(ArgPin(named, i, {PinKind::kAny}));
+    avatars.emit = [event, named, count](Emitter& emit) {
+      std::vector<std::string> params;
+      for (size_t i = 1; i < count; ++i) params.push_back(emit.Param(ArgName(named, i)));
+      EmitClassEvent(emit, event, params, [&] { ConvertArgs(emit, named, 1, count); });
+    };
+    library.Add(std::move(avatars));
+  }
+
+  // The same event on a game asset's own graph (content.h, AssetTypeDecl::events): its first value is the asset the
+  // game fires it for, which the node leaves out and checks, so the graph runs for its own asset alone. Not in the add
+  // menu: a new asset graph starts with one of each. A field event (AssetTypeDecl::asset_events) is one of these with
+  // its own title and the values after the asset it runs for.
+  const std::string own_title = content::AssetEventTitle(event);
+  NodeDesc own{.id = AssetEventNode(event), .title = own_title.empty() ? title : own_title, .description = "Runs when the game fires " + event + " for this asset.", .role = NodeRole::kEvent, .delegate = true};
+  own.title_of = [title = own.title](const Node& node) {
+    std::string titled = node.Setting(kTitleSetting);
+    return titled.empty() ? title : titled;
+  };
+  own.pins.outputs = {ExecPin(kExecOut)};
+  for (size_t i = 1; i < count; ++i) own.pins.outputs.push_back(ArgPin(named, i, {PinKind::kAny}));
+  own.emit = [event, named, count](Emitter& emit) { EmitEventHandler(emit, event, named, count, true, false); };
+  library.Add(std::move(own));
 }
 
 }  // namespace

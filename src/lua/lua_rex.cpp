@@ -23,6 +23,8 @@
 #include <rex/version.h>
 #include <rexfabric/rexfabric.h>
 
+#include "../content/avatars.h"
+#include "../content/classes.h"
 #include "../events.h"
 #include "../guest.h"
 #include "../hooks.h"
@@ -599,7 +601,20 @@ std::set<std::string>& Listened() {
   return names;
 }
 
-void DispatchEvent(const std::string& name, std::span<const Value> args) {
+// The avatar an avatar event (content::IsAvatarEvent) is fired for: its id, the event's first value, while it's there;
+// 0 for none.
+uint32_t FiredFor(std::span<const Value> args) {
+  const int64_t* id = args.empty() ? nullptr : std::get_if<int64_t>(&args.front());
+  if (!id || *id <= 0 || *id > UINT32_MAX) return 0;
+  const uint32_t avatar = static_cast<uint32_t>(*id);
+  return content::ClassOfAvatar(avatar).empty() ? 0 : avatar;
+}
+
+// Runs the event's Lua listeners. An avatar event's first value, the avatar's id, comes to them as the avatar itself;
+// fired for an avatar that isn't there, it reaches none of them.
+void DispatchEvent(const std::string& name, std::span<const Value> args, bool avatar_event) {
+  const uint32_t avatar = avatar_event ? FiredFor(args) : 0;
+  if (avatar_event && avatar == 0) return;
   VM& vm = Vm();
   std::lock_guard lock(vm.mutex);
   if (!vm.L) return;
@@ -610,7 +625,10 @@ void DispatchEvent(const std::string& name, std::span<const Value> args) {
     const lua_Integer count = static_cast<lua_Integer>(lua_rawlen(L, -1));
     for (lua_Integer i = 1; i <= count; ++i) {
       lua_rawgeti(L, -1, i);
-      for (const Value& arg : args) PushValue(L, arg);
+      for (size_t at = 0; at < args.size(); ++at) {
+        if (at == 0 && avatar_event) PushAvatar(L, avatar);
+        else PushValue(L, args[at]);
+      }
       CallProtected(L, static_cast<int>(args.size()), 0, name.c_str());
     }
   }
@@ -632,7 +650,7 @@ int On(lua_State* L) {
   lua_pushvalue(L, 2);
   lua_rawseti(L, -2, static_cast<lua_Integer>(lua_rawlen(L, -2)) + 1);
   lua_pop(L, 2);
-  if (Listened().insert(name).second) events::Listen(name, Vm().owner, [event = std::string(name)](std::span<const Value> args) { DispatchEvent(event, args); });
+  if (Listened().insert(name).second) events::Listen(name, Vm().owner, [event = std::string(name), avatar = content::IsAvatarEvent(name)](std::span<const Value> args) { DispatchEvent(event, args, avatar); });
   return 0;
 }
 

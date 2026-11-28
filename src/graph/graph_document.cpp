@@ -33,9 +33,10 @@ bool WriteText(const fs::path& file, const std::string& text, std::string* error
 
 std::string GraphSource(std::string_view name) { return std::string(kGraphsFolder) + "/" + std::string(name) + ".json"; }
 
-CompileOptions Options(std::string_view name) {
+CompileOptions Options(const Location& location) {
   CompileOptions options;
-  options.source = GraphSource(name);
+  options.source = location.source;
+  options.asset = location.asset;
   options.hookable = [](uint32_t address) { return Hooks::Get().IsHookable(address); };
   options.globals = GameGlobals();
   return options;
@@ -94,18 +95,36 @@ bool RenameGraph(const fs::path& mod_dir, std::string_view from, std::string_vie
   return true;
 }
 
-Document::Document(fs::path mod_dir, std::string name) : mod_dir_(std::move(mod_dir)), name_(std::move(name)) {
+Location AssetGraphLocation(const fs::path& mod_dir, const fs::path& asset_file, std::string asset) {
+  fs::path graph = asset_file;
+  graph.replace_extension(".graph.json");
+  fs::path script = asset_file;
+  script.replace_extension(kScriptExtension);
+  return {.graph = graph, .script = script, .source = graph.lexically_relative(mod_dir).generic_string(), .asset = std::move(asset)};
+}
+
+Location ClassGraphLocation(const fs::path& mod_dir, const fs::path& class_file, std::string avatar_class) {
+  Location location = AssetGraphLocation(mod_dir, class_file, {});
+  location.avatar_class = std::move(avatar_class);
+  return location;
+}
+
+Document::Document(fs::path mod_dir, std::string name) : Document(mod_dir, name, Location{.graph = GraphFile(mod_dir, name), .script = ScriptFile(mod_dir, name), .source = GraphSource(name)}) {}
+
+Document::Document(fs::path mod_dir, std::string name, Location location) : mod_dir_(std::move(mod_dir)), name_(std::move(name)), location_(std::move(location)) {
+  Adopt();
   history_.push_back(Write(graph_));
   saved_ = history_.front();
   Recompile();
 }
 
 bool Document::Load(std::string* error) {
-  std::ifstream in(GraphFile(mod_dir_, name_), std::ios::binary);
+  std::ifstream in(location_.graph, std::ios::binary);
   if (in) {
     std::ostringstream text;
     text << in.rdbuf();
     if (!Read(text.str(), graph_, error)) return false;
+    Adopt();
   }
   history_ = {Write(graph_)};
   at_ = 0;
@@ -116,15 +135,15 @@ bool Document::Load(std::string* error) {
 
 bool Document::Save(std::string* error) {
   const std::string snapshot = Write(graph_);
-  if (!WriteText(GraphFile(mod_dir_, name_), snapshot, error)) return false;
+  if (!WriteText(location_.graph, snapshot, error)) return false;
 
   std::string script = compiled_.lua;
   if (!compiled_.ok()) {
-    script = "-- Made with the RexFabric node editor from " + GraphSource(name_) + ".\n";
+    script = "-- Made with the RexFabric node editor from " + location_.source + ".\n";
     script += "-- The graph has problems, so it doesn't run until they're fixed in the node editor.\n\n";
-    script += "rex.error(" + LuaQuote(GraphSource(name_) + " has problems, so it doesn't run; open it in the node editor to see them") + ")\n";
+    script += "rex.error(" + LuaQuote(location_.source + " has problems, so it doesn't run; open it in its editor to see them") + ")\n";
   }
-  if (!WriteText(ScriptFile(mod_dir_, name_), script, error)) return false;
+  if (!WriteText(location_.script, script, error)) return false;
   saved_ = snapshot;
   return true;
 }
@@ -153,10 +172,24 @@ bool Document::Redo() {
   return true;
 }
 
-void Document::Recompile() { compiled_ = Compile(graph_, Options(name_)); }
+std::string Document::Text() const { return Write(graph_); }
+
+bool Document::Reset(const std::string& text, std::string* error) {
+  Graph read;
+  if (!Read(text, read, error)) return false;
+  graph_ = std::move(read);
+  Adopt();
+  history_ = {Write(graph_)};
+  at_ = 0;
+  Recompile();
+  return true;
+}
+
+void Document::Recompile() { compiled_ = Compile(graph_, Options(location_)); }
 
 void Document::Restore(const std::string& snapshot) {
   Read(snapshot, graph_);
+  Adopt();
   Recompile();
 }
 

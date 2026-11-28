@@ -6,6 +6,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <utility>
 #include <unordered_set>
 
 #include "../log.h"
@@ -44,6 +46,8 @@ struct Avatar {
   std::vector<Property> properties;
   bool saved = false;
   bool removed = false;
+  // Its removed event has started: a remove from inside it does nothing more.
+  bool leaving = false;
   // Only on the game's thread.
   std::vector<Part> parts;
 };
@@ -56,6 +60,10 @@ struct Registry {
   // The avatars forgotten because their backing went with its world. Ids are never used twice.
   std::unordered_set<uint32_t> went_with_world;
   uint32_t next_id = 1;
+  // Told once an avatar is gone for good (OnAvatarGone).
+  std::function<void(uint32_t id)> gone;
+  // The avatars that fire their spawned event again on the next tick (AnnounceAvatars).
+  std::vector<uint32_t> announce;
 
   std::shared_ptr<Avatar> Find(uint32_t id) const {
     const auto found = std::find_if(avatars.begin(), avatars.end(), [id](const auto& avatar) { return avatar->id == id; });
@@ -75,6 +83,18 @@ struct Registry {
 Registry& Get() {
   static auto* registry = new Registry();
   return *registry;
+}
+
+// RexFabric's own avatar events (content.h), each fired with the avatar's id first.
+struct AvatarEvents {
+  Event spawned{kAvatarSpawned};
+  Event tick{kAvatarTick};
+  Event removed{kAvatarRemoved};
+};
+
+const AvatarEvents& Events() {
+  static const AvatarEvents events;
+  return events;
 }
 
 AvatarValues ValuesOf(const std::vector<Property>& properties) {
@@ -140,6 +160,36 @@ void Dispose(Avatar& avatar) {
   Guarded(avatar, "removing its backing", [&] { avatar.backing->remove(avatar.handle); });
 }
 
+// Fires one of its events, with its id first and then `more`. A listener that throws is logged.
+void Fire(const Avatar& avatar, const Event& event, std::span<const Value> more = {}) {
+  if (!event.HasListeners()) return;
+  std::vector<Value> args{Value(static_cast<int64_t>(avatar.id))};
+  args.insert(args.end(), more.begin(), more.end());
+  Guarded(avatar, "its " + event.name() + " event", [&] { event.Fire(std::span<const Value>(args)); });
+}
+
+// Starts an avatar's leaving: its removed event, fired while it's still there to be read. False when it has started
+// already, as for a remove from inside its own removed event.
+bool StartLeaving(Avatar& avatar) {
+  {
+    std::lock_guard lock(Get().mutex);
+    if (avatar.leaving) return false;
+    avatar.leaving = true;
+  }
+  Fire(avatar, Events().removed);
+  return true;
+}
+
+// Tells whoever keeps something for each avatar that this one is gone for good.
+void Forget(uint32_t id) {
+  std::function<void(uint32_t)> gone;
+  {
+    std::lock_guard lock(Get().mutex);
+    gone = Get().gone;
+  }
+  if (gone) gone(id);
+}
+
 }  // namespace
 
 uint32_t SpawnAvatar(std::string_view path, const Transform& at, std::string* why) {
@@ -177,18 +227,25 @@ uint32_t SpawnAvatar(std::string_view path, const Transform& at, std::string* wh
   }
   const std::vector<Transform> world = PartPlaces(*avatar, at);
   for (size_t i = 0; i < avatar->parts.size() && !avatar->removed; ++i) RunPart(*avatar, i, world, 0.0, avatar->parts[i].type->attach, "attach");
+  if (!avatar->removed) Fire(*avatar, Events().spawned);
   return avatar->id;
 }
 
 bool RemoveAvatar(uint32_t id) {
+  Registry& registry = Get();
   std::shared_ptr<Avatar> avatar;
   {
-    Registry& registry = Get();
     std::lock_guard lock(registry.mutex);
-    avatar = registry.Take(id);
+    avatar = registry.Find(id);
   }
-  if (!avatar) return false;
+  if (!avatar || !StartLeaving(*avatar)) return false;
+  {
+    std::lock_guard lock(registry.mutex);
+    // A reload while its event ran took it already, to dispose of on the next tick.
+    if (!registry.Take(id)) return true;
+  }
   Dispose(*avatar);
+  Forget(id);
   return true;
 }
 
@@ -223,6 +280,13 @@ bool MoveAvatar(uint32_t id, const Transform& to, std::string* why) {
   return true;
 }
 
+uint32_t AvatarOfBacking(std::string_view backing, uint64_t handle) {
+  Registry& registry = Get();
+  std::lock_guard lock(registry.mutex);
+  const auto made = std::find_if(registry.avatars.begin(), registry.avatars.end(), [&](const auto& avatar) { return avatar->handle == handle && Lower(avatar->backing->path) == Lower(backing); });
+  return made != registry.avatars.end() ? (*made)->id : 0;
+}
+
 std::optional<AvatarView> FindAvatar(uint32_t id) {
   std::shared_ptr<Avatar> avatar;
   AvatarView view;
@@ -235,6 +299,13 @@ std::optional<AvatarView> FindAvatar(uint32_t id) {
   }
   if (avatar->backing->object) Guarded(*avatar, "its object", [&] { view.object = avatar->backing->object(avatar->handle); });
   return view;
+}
+
+std::string ClassOfAvatar(uint32_t id) {
+  Registry& registry = Get();
+  std::lock_guard lock(registry.mutex);
+  const std::shared_ptr<Avatar> avatar = registry.Find(id);
+  return avatar ? avatar->path : std::string();
 }
 
 std::vector<uint32_t> AvatarsOf(std::string_view path) {
@@ -348,22 +419,44 @@ std::vector<SavedAvatar> SavedAvatars() {
   return saved;
 }
 
+void OnAvatarGone(std::function<void(uint32_t id)> listener) {
+  std::lock_guard lock(Get().mutex);
+  Get().gone = std::move(listener);
+}
+
+void AnnounceAvatars() {
+  Registry& registry = Get();
+  std::lock_guard lock(registry.mutex);
+  registry.announce.clear();
+  for (const auto& avatar : registry.avatars) registry.announce.push_back(avatar->id);
+}
+
 void TickAvatars(double seconds) {
   std::vector<std::shared_ptr<Avatar>> all;
   std::vector<std::shared_ptr<Avatar>> leaving;
+  std::vector<uint32_t> announce;
   {
     Registry& registry = Get();
     std::lock_guard lock(registry.mutex);
     all = registry.avatars;
     leaving.swap(registry.leaving);
+    announce.swap(registry.announce);
   }
-  for (auto it = leaving.rbegin(); it != leaving.rend(); ++it) Dispose(**it);
+  for (auto it = leaving.rbegin(); it != leaving.rend(); ++it) {
+    Dispose(**it);
+    Forget((*it)->id);
+  }
+  for (const auto& avatar : all) {
+    if (!avatar->removed && std::find(announce.begin(), announce.end(), avatar->id) != announce.end()) Fire(*avatar, Events().spawned);
+  }
+  const Value elapsed[] = {Value(seconds)};
   for (const auto& avatar : all) {
     Transform now;
     bool there = false;
     if (!Guarded(*avatar, "where it is", [&] { there = avatar->backing->where(avatar->handle, now); })) there = false;
     if (!there) {
-      // Gone with its world: its parts go, and the backing is the game's to clean up.
+      // Gone with its world: its removed event, then its parts go, and the backing is the game's to clean up.
+      if (!StartLeaving(*avatar)) continue;
       {
         Registry& registry = Get();
         std::lock_guard lock(registry.mutex);
@@ -371,6 +464,7 @@ void TickAvatars(double seconds) {
         registry.went_with_world.insert(avatar->id);
       }
       Detach(*avatar);
+      Forget(avatar->id);
       continue;
     }
     {
@@ -382,6 +476,7 @@ void TickAvatars(double seconds) {
     for (size_t i = 0; i < avatar->parts.size() && !avatar->removed; ++i) {
       if (avatar->parts[i].ticking) RunPart(*avatar, i, world, seconds, avatar->parts[i].type->tick, "tick");
     }
+    if (!avatar->removed) Fire(*avatar, Events().tick, elapsed);
   }
 }
 

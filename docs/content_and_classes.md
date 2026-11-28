@@ -72,9 +72,9 @@ Like the node editor, it is hidden while `rexfabric.show_editors` is off.
 | Tree | Every mod, an off one dimmed, with the folders of its content below it. Opens down to the folder shown |
 | Path | All Mods, the mod, then each folder, above the grid; each part goes there |
 | Grid | The folder's content as tiles: at a mod's root its metadata first, in red, then folders, then assets. At All Mods, the mods with their icons |
-| Tiles | A class is a cube, blue when its objects are of a game type (below `TiP/Avatar`, say), teal for a data class. Its second line is its parent; its tooltip is its whole chain |
+| Tiles | A class is a cube, blue when its objects are of a game type (below `TiP/Avatar`, say), teal for a data class. Its second line is its parent; its tooltip is its whole chain. A class or a game asset with a thumbnail shows it in place of its icon (Thumbnails, below) |
 | Search and class filter | List every asset below the folder shown (every mod's, from All Mods) whose name has the text and that is of the class or below it |
-| Add, or a right click on empty space | New Folder, New Class (named, with its parent picked from the classes the mod may use), New Mod (its folder, `mod.toml` and `content`, turned on at the end of the load order) |
+| Add, or a right click on empty space | One menu for both (`DrawNewItems`): New Folder; then submenus by category, Basic (New Class, named with its parent picked from the classes the mod may use, New Enum, New Struct, New Data Table, New Language), Advanced (New Map Edit, New World, New Material, where the game has worlds and material types), each category the game's asset types name (Game asset types), and Other for the types naming none; then Import Image and Import Mesh. Add also has New Mod (its folder, `mod.toml` and `content`, turned on at the end of the load order) |
 | A tile's right click | Open, New Subclass, Rename, Duplicate, Copy Path, Delete |
 | Dragging a tile | Onto a folder in the grid, the tree or the path: moves it there, within its own mod |
 | Keys | Enter opens the tile picked, Delete asks to delete it |
@@ -90,8 +90,80 @@ see a new class as soon as it's saved. An open editor of an asset a rename chang
 unsaved changes stops the rename until it's saved or closed. Closing the browser closes its editors, asking first
 about unsaved changes.
 
-Not yet: renaming a class doesn't rename it in graphs that use it as a type, moving between mods, more than one tile
-picked at once, and thumbnails (nothing makes pictures assets until `Texture`).
+Not yet: renaming a class doesn't rename it in graphs that use it as a type, moving between mods, and more than one
+tile picked at once.
+
+### Thumbnails
+
+A tile shows a picture of its asset where it has one, as Unreal's content browser does, and its kind's icon where it
+has none. Classes and game assets have thumbnails (`src/ui/thumbnails.cpp`); a texture's tile shows its own picture,
+as it always has. A tile shows the first of these its asset has:
+
+| | Where it comes from | Which assets |
+|---|---|---|
+| 1 | A picture of its own: a Texture asset, set by hand. A class's is its `thumbnail` property (Object's, so every class has it, and a subclass inherits its parent's); a game asset's is its `thumbnail` field, which RexFabric adds to every game asset type, shown as Thumbnail last in its field table and left out of its file while it's empty | Any class or game asset |
+| 2 | Its type's 2D preview (`AssetTypeDecl::preview`), drawn from its layers in the tile as its editor draws them: nothing is rendered | A game asset of a type with a preview (a star leaf) |
+| 3 | A picture the game's viewport renderer makes of its viewport (`ViewportRenderer::capture`), framed as its Capture Thumbnail framing says, or the default way: the camera Reset View gives, and for an asset viewport a second of play first, so an effect's particles are out | An avatar class (one with a backing or components, as the Avatar editor has a viewport for), and a game asset of a type with a `viewport` (an FX Emitter) |
+| 4 | Its icon, as before; also while its picture is being made | The rest |
+
+The made pictures (3) are kept outside the mods, so a mod never ships them and they never go in a repository: under
+`thumbnails` beside the executable, as `thumbnails/<mod>/<path in the mod>.png`, 256 pixels square, with
+`thumbnails/<mod>/index.json` saying what each was made from:
+
+```
+thumbnails/MyMod/Garden/Rock.png
+thumbnails/MyMod/index.json
+{"thumbnails": {"garden/rock": "9c41e0d2b7a35f18"}, "empty": {}}
+```
+
+The hash is of everything making the picture look as it does: the asset's file (its framing in it too), for a class
+each mod ancestor's file, and the picture files of the Texture assets those files name (by when they were written and
+how large they are). A thumbnail whose hash changed (a save, a refresh, a changed texture) is made again; the old one
+shows until the new one is there. A picture that came back with nothing in it (an avatar class whose backing shows
+nothing of the game's) is noted under `empty`, and its tile keeps the icon until its hash changes. Deleting the
+`thumbnails` folder makes them all again.
+
+They're made lazily, only for tiles scrolled into view (and the editors showing them), in the order they're asked for
+and one at a time: the next is asked for once the last came back, and a tile scrolled away before its turn is left
+out. The renderer has 30 seconds for each. A made picture not shown for a while is let go, and read again from its
+PNG when it's next shown.
+
+#### Capture Thumbnail
+
+An avatar class's viewport and an asset viewport have Capture Thumbnail on their toolbar: it keeps the camera as it is
+now (yaw, pitch, zoom), and for an asset viewport how long it has played, as the asset's thumbnail framing, so the
+picture made of it looks the same on anyone's machine. Clear goes back to the default framing. It's an edit as any
+other (undone, redone, saved with the rest), and the tile shows the new picture once the asset is saved and its
+picture made again. The framing is a key at the top level of the asset's own file, beside its other keys, in a class
+file and a game asset's alike, never a property (`src/content/thumbnail_view.h`):
+
+```
+"thumbnail_view": {"yaw": 40.0, "pitch": 18.0, "zoom": 1.6, "time": 1.25}
+```
+
+A class's editor shows the thumbnail its class gets under its Help, and a game asset's editor under its Thumbnail field,
+both as last saved.
+
+#### Making a picture
+
+A game makes the pictures through its viewport renderer (The viewport): `capture` is optional, and without it every
+tile that would get one keeps its icon.
+
+```cpp
+rexfabric::content::SetViewportRenderer({.show = Show, .close = Close, .capture = Capture});
+
+void Capture(uint64_t viewport, const ViewportView& view, double seconds, std::function<void(ViewportCapture)> done);
+```
+
+| Part | What it is |
+|---|---|
+| `viewport` | A number of its own for the picture, as a viewport's: `close` with it means it's no longer wanted (the browser closed), and a `done` after that is ignored |
+| `view` | What to draw, as `show` is asked, 256 by 256: a class's view as its editor gives it, or an asset viewport's, with the framing's camera, `playing` on and `replays` 0 |
+| `seconds` | How long its time runs on the stage's clock before the picture is taken: the framing's time, else 0 for a class (as soon as its avatar shows) and 1 for an asset |
+| `done` | Called once, on any thread, a few frames later, with a `ViewportCapture`: RGBA8 pixels, rows top first, tightly packed, their alpha straight, what the stage left clear see through (the tile's card shows behind it); or no pixels and a `message` saying why. Never waited for: the call returns at once and the game draws on its own time |
+
+RexFabric asks for one picture at a time and writes it to the cache as it comes back. Trouble in Paradise draws each on
+a stage of its own and reads it back from its native frame (DeTiP's docs/modding.md, The avatar viewport).
 
 ## The mod's metadata
 
@@ -195,9 +267,10 @@ Each property in an editor can be reset to its parent's value.
 
 | Property | Type | Meaning |
 |---|---|---|
-| `thumbnail` | texture reference | What the content browser shows for the asset; the class's icon when unset |
+| `thumbnail` | texture reference | A picture the content browser shows for the asset in place of the one it makes (an avatar class's) or of its icon; none for that one |
 
-Thumbnails are never made automatically: an asset shows its class's default icon until someone sets an image.
+Thumbnails are made automatically where an asset has a viewport, and this picture, when set, is shown in their place
+(The content browser, Thumbnails).
 
 ### Data classes
 
@@ -213,7 +286,7 @@ reference it. A data class opens in the properties editor, a plain list of its p
 | `text` | a string the player sees, translatable |
 | `enum` | one of a declared list, or of an enum the game declares |
 | `vector`, `rotation`, `colour` | three or four numbers |
-| `asset` | a reference to an asset of a given class (a texture, a data class, another avatar class). Its picker offers the textures for an asset of `Texture`, the materials for `Material`, the map edits for `MapEdit`, the meshes for `Mesh`, the mods' worlds for `World`, the game's and the mods' packets for `Packet`, and the classes for any other class: what the mod may use, its own and its dependencies' |
+| `asset` | a reference to an asset of a given class (a texture, a data class, another avatar class). Its picker offers the textures for an asset of `Texture`, the materials for `Material`, the map edits for `MapEdit`, the meshes for `Mesh`, the mods' worlds for `World`, the game's and the mods' assets of a game asset type for its class (Game asset types), and the classes for any other class: what the mod may use, its own and its dependencies' |
 | `string` from a table | a string that's one of a data table's row names, picked from them in the editor or typed: a game's table of what it has (Trouble in Paradise's `TiP/Effects`, its effects), so a property names one of the game's things by picking it rather than spelling it. The type's `of` names the table |
 | a colour | a `string` holding `#RRGGBB`: the editor shows a swatch beside it that opens a colour picker. Any string written so gets one; a game's colour properties take this form |
 | `tag` | a game identifier, for games that have them (in Trouble in Paradise, a tag such as a species or an item) |
@@ -389,6 +462,14 @@ A game table's rows are made when it is first read and made again when the game 
 price, the randomizer moved a requirement), so a table always shows the game as it is now. A game table also helps in
 the editor: a `tag` property can offer the rows of `TiP/Pinatas` as a picker instead of a number.
 
+### String lists
+
+A string property's picker can also offer a game's string list (`content::DeclareStringList`): a list the game makes
+each time a picker opens, named by the property's `of` just as a table is. Unlike a table it has no rows of a struct,
+so it can mix things no single table holds. Trouble in Paradise's `TiP/AnyEffect` lists the loaded FX Emitter assets by
+path first, then the game's effects by name, and the `TiP/FxEmitter` component picks its effect from it.
+`content::StringChoices(of)` gives what a string of `of` is picked from: the list's strings, or the table's row names.
+
 ### What is built
 
 The registry is `src/content/tables.cpp`; mods' tables load after the enums and structs, as their rows use them.
@@ -406,7 +487,9 @@ A game declares a table with a function filling its rows (`TableDecl::rows`) thr
 `Set` sets a field (a struct field's own fields as `field.inner`), `Add` adds to an array and `Put` puts under a map's
 key. RexFabric calls it when the table is read and its rows are out of date, on whatever thread reads it; it says no
 when it can't now (off the thread the game's data lives on, or before that data is there), and the game makes the rows
-later with `FillTable`. `TableChanged` marks them out of date. Rows a game gives are checked as a mod's are.
+later with `FillTable`. `TableChanged` marks them out of date. Rows a game gives are checked as a mod's are. The game
+reads one row back with `FindTableRow(table, row)`, its fields as JSON text (none while its table hasn't the row or
+hasn't been made): Trouble in Paradise finds a variant requirement's species' tag in its `TiP/Pinatas` row.
 
 A rename of a struct, an enum value or a struct field reaches tables' rows as it reaches classes. Not yet: row names
 aren't picked from a table in property editors (a `tag` property is still a number), and renaming a row doesn't
@@ -487,7 +570,7 @@ duplicate or a delete takes it along.
 | The tile | The picture itself, as large as the tile allows |
 | Texture editor | The picture as large as the window allows, its file and size, what it's for, and Replace, which takes another picture in its place at once (dropping the old one in another format) |
 | Properties | A property of type asset of `Texture` picks from the textures the mod may use: its own and its dependencies' |
-| For the game | `LoadTextureImage(path)` (`rexfabric/content.h`): a loaded mod's texture's picture as RGBA8, with a version that changes when its file does |
+| For the game | `LoadTextureImage(path)` (`rexfabric/content.h`): a loaded mod's texture's picture as RGBA8, with a version that changes when its file does. `TextureImageVersion(path)` gives that version without reading the picture, for a game keeping what it made of one |
 
 What a game does with one is its own: Trouble in Paradise makes it one of its textures (DeTiP's docs/modding.md,
 Mods' pictures), which a signpost shows.
@@ -535,12 +618,17 @@ mods/MyMod/content/TownGarden.json   {"asset": "world", "base": "TiP/Garden", "h
 Worlds are read with the map edits (`LoadMapEdits`), before them; one whose bases don't come down to a world of the
 game's is logged.
 
-## Packets
+## Game asset types
 
-A packet is a kind of ground a player buys and pours on a world, made by a game that has them (Trouble in Paradise's
-grass, long grass, sand and snow packets). A mod's packet is a variant of one of the game's own, its base: it pours,
-grows and counts exactly as its base does, and looks and sells as it says. It's an asset of the built in class `Packet`
-(below `Object`), made with New Packet in the content browser, which asks for the base it pours as.
+RexFabric's own kinds of asset (classes, enums, structs, tables, languages, textures, meshes, materials, worlds and map
+edits) are what any game needs. Anything that only one game has is the game's to declare: a game asset type is a kind
+of asset the game adds beside them, with `DeclareAssetType` (`rexfabric/content.h`), before `Start`. RexFabric knows
+nothing of what one means. It reads, checks, edits, renames, translates and lists its assets, and the game reads them
+back and does what they say. Trouble in Paradise's packets (kinds of ground a player buys and pours), star menu
+leaves and pinata colour variants (patterns, palettes and variant requirements) are game asset types.
+
+A type is a class, under a path of the game's own (`TiP/Packet`), whose assets are files saying the type's kind under
+"asset". Its fields are at the top level of the file beside it:
 
 ```
 mods/MyMod/content/RedSand.json
@@ -548,34 +636,167 @@ mods/MyMod/content/RedSand.json
  "look": {"colour": "MyMod/RedSandColour"}, "unlock": "Shop", "level": 3, "price": 500, "order": 1}
 ```
 
-| Property | What it is |
-|---|---|
-| `base` | A value of the game's base enum (`PacketsDecl::base`, `tip.PacketBase` in Trouble in Paradise): the game's packet it's a variant of |
-| `name`, `help` | Texts, translated as every mod text is (Localisation): the name shown where it's picked and sold, and what the shop says of it |
-| `icon` | A texture asset: its picture where it's picked and sold |
-| `look` | A value of the struct the game gives its base for a look (`PacketsDecl::looks`): what the ground looks like where it lies. A new base starts the look over |
-| `unlock` | `Default` (every player has it) or `Shop`, with `level` (the shop level it's sold from) and `price` |
-| `order` | Where it sorts among its mod's packets, lower first (0 when left out) |
+### Declaring one
 
-RexFabric stays out of what a base means: the game declares its packets once, before `Start`, with `DeclarePackets`
-(`rexfabric/content.h`): the enum a base is one of, the look struct of each base, and its own packets, read only, under
-paths of its own. The game's enum and structs are declared as any of its enums and structs are, so the editor edits a
-look as it edits any struct value.
+| Part of `AssetTypeDecl` | What it is |
+|---|---|
+| `path` | The class its assets are: an asset property of it picks one of them |
+| `kind` | What its files say under "asset" (`packet`): unique, and none of RexFabric's own kinds |
+| `label`, `help`, `colour` | How the content browser names it (New Packet, its tiles, its editor's title), says what it is (its New entry's tooltip), and colours its tiles |
+| `category` | The submenu of the browser's New menus its New entry is in (`UI`, `Variants`): one of the game's own, or RexFabric's Basic or Advanced, which it joins below their own entries. Empty for Other, the last |
+| `fields` | Its fields, each an `AssetFieldDecl`: a name, a type (any property type, in any container), a default, a label, help, a condition (below), and `custom`, for a field its own editor alone edits (Own editors) |
+| `create_with` | The fields a new asset is asked for before it's made (a packet's base) |
+| `name_field` | A text field a new asset's name goes into, as a start |
+| `check` | What's wrong with an asset, as the game sees it: each problem a line its editor shows, and the reason it isn't loaded |
+| `warn` | What's doubtful about an asset that loads all the same: each a line its editor shows below the problems, in the warning colour. A check runs as the assets load, before the others are there, so it looks at the asset alone; `warn` runs only while the editor is drawn, and may look at what the asset names (a palette's pattern) |
+| `built_in` | The game's own assets of the type, read only, listed first and offered in every picker of it |
+| `preview` | A 2D preview of an asset as its fields are now, drawn at the top of its editor (Previews) |
+| `editor` | The type's own editor, drawn with ImGui below the field table (Own editors) |
+| `viewport` | A live 3D viewport of an asset as its fields are now, drawn by the game's viewport renderer and played with Play, Pause, Restart and Loop (Asset viewports) |
+| `events` | Game events fired for one asset of the type, each with its node's title: with any, each asset has a graph of its own (Asset graphs) |
+| `asset_events` | The event nodes an asset's graph has for its own fields, given its fields: a shop catalog's On Bought of each of its actions. A type with these has a graph even without `events` (Asset graphs, Field events) |
+
+A field can show only while a field declared before it holds one of some values (`when_field`, `when_values`: an enum
+value's name, a bool's `true` or `false`, a number as text). One type then holds several shapes: a packet's shop
+level and price show only while its unlock is `Shop`. Two fields may share a name under conditions that never hold
+together, each typing the value its own way: a packet's `look` is a struct of grass's look for a grass packet and of
+the ground's look for sand and snow. A field hidden by its condition isn't loaded, checked or saved.
+
+### What RexFabric does with them
 
 | Part | What it does |
 |---|---|
-| New Packet | Asks for a name and the base it pours as (the base enum's values); only offered when the game declared packets |
-| The tile | A seed packet: a paper bag with a sprout on it |
-| Packet editor | Its base, name, help, icon (a texture the mod may use), its look as a struct value, its unlock with the level and price for the shop, and its order, with a problem shown for a base the game doesn't have or a missing name (`world_mesh_editors.cpp`) |
-| Properties | A property of type asset of `Packet` picks from the game's own packets and the packets the mod may use |
-| References | Its icon and the asset values in its look are references like any other: renaming or moving a texture repoints them, and deleting one lists them |
-| Texts | Its name and help are in the mod's texts (`RedSand:name`, `RedSand:help`), translated in its string tables |
-| For the game | `Packets()` lists every packet: the game's own in their order, then the loaded mods', by mod load order, then `order`, then path; `FindPacket(path)` gives one. Each has its base, its texts in the language the game shows, its icon, every field of its look (its own value or the field's default) and its unlock. `PacketsRevision()` goes up each time the packets load again, for a game keeping what it made of them (Trouble in Paradise makes the looks' pictures into its own textures) |
+| New | Each type adds New `label` to its category's submenu of the content browser's New menus, asking for a name and the type's `create_with` fields. The new asset has every field shown for it at its default, and its name in `name_field` |
+| The tile | Its thumbnail (The content browser, Thumbnails): its Thumbnail field's picture, else its preview, else a picture made of its viewport; a card in the type's colour with the first letter of its label for a type with none of these, and while the picture is made |
+| The thumbnail field | Every type gets a `thumbnail` field, a Texture asset, last in its field table as Thumbnail, unless it declares one of that name itself. It's left out of the file while it's empty, and it's in the JSON the type's functions are given, as any field is |
+| The editor | One editor for every type (`src/ui/game_asset_editor.cpp`): each field shown, as its condition says, edited as any value is (but the `custom` ones of a type with its own editor), then the type's own editor, then the problems: a value that doesn't fit its field, then the type's check; then its warnings. A type with a viewport has it beside all that (Asset viewports). Editing the field a condition reads shows the fields that go with it; a field shown as another of the type's fields than before (a packet's look, when its base changes) starts over at that field's default, and one shown again keeps its value where it still fits. Undo and redo bring back the whole asset |
+| Files | Written with "asset" first, then the fields shown in the order they're declared; keys of no field of the type are kept as they were |
+| Properties | An asset property of the type's class picks from the game's own assets of it and the assets of it the mod may use |
+| References | Asset values in its fields are references like any other: renaming or moving a texture repoints them, and deleting one lists them |
+| Texts | Its text fields are the mod's texts (`RedSand:name`, `RedSand:help`), translated in its string tables |
+| For the game | `GameAssets(type)` lists every asset of a type: the game's own in their order, then the loaded mods', by mod load order, then path. `FindGameAsset(path)` gives one. Each has its path, its mod, and its fields as JSON text (each fitted to its type, defaults filled in, texts in the language the game shows) and its single fields as values, so a game reads them with whatever it parses JSON with. `GameAssetsRevision(type)` goes up each time the type's assets load again, for a game keeping what it made of them |
 
-Packets load with the classes (`LoadPackets`, `src/content/packets.cpp`), after the enums and structs; one whose base
-isn't one of the game's is logged and left out. What a game does with them is its own: Trouble in Paradise records
-which packet made each vertex's ground, pours them from Lua and draws each one's look where it lies (DeTiP's
-docs/modding.md, Packets).
+### Previews
+
+A type's `preview` is given an asset's fields (as `GameAsset::json` has them, untranslated) and gives the layers of a
+picture, bottom first, which the editor draws in a square at the top of its first column every frame:
+
+| Part of `PreviewLayer` | What it is |
+|---|---|
+| `texture` | A Texture asset, drawn as its picture |
+| `file` | An image file, when there's no texture |
+| `shape` | A filled outline when there's no picture: points as fractions of `rect` from its top left, in order round it, concave or not |
+| `rect` | Where in the square: left, top, width and height as fractions of its side |
+| `colour` | The shape's fill, or the picture's tint |
+| `stretch` | A picture fills its `rect` exactly, as a game stretches a picture over a box, rather than fitting it with its shape kept |
+| `clip` | The part of the square the layer is cut to, as `rect` gives one; none while its width is 0 |
+
+Trouble in Paradise's star leaf draws its leaf in its colour (or its own leaf picture) with its icon over it.
+
+### Own editors
+
+What a field table can't show well, a type draws itself: its `editor` is drawn with ImGui into the asset's editor,
+mouse and all, below the field table, every frame the editor is drawn. Trouble in Paradise's pinata palette draws a
+swatch for each grey of its pattern beside the pattern's picture coloured through the palette.
+
+The editor draws it below the table rather than in its place, so the fields that the table edits well (the palette's
+pattern, an asset picker) stay there and a type draws only what it adds. A field marked `custom` is left out of the
+table, as the editor edits it; it loads, checks and saves as any field does.
+
+| Part | What it is |
+|---|---|
+| What it's given | The asset's path, and its fields as JSON text as the editor holds them now: every field shown for it there, as the file has them (not fitted, so read them as a check reads a file) |
+| What it gives | True when it changed them, the text then holding the asset's fields as they are now. The editor takes that as it takes an edit in the table: shown again over its fields' conditions, undone and redone (an edit is kept in the history once no item is active, so a drag of a colour picker is one edit) and saved with the rest |
+| Pictures | `EditorImage(key, version, width, height, rgba)` (`rexfabric/content.h`) gives the UI's texture of pixels the game made (RGBA8), for `ImGui::Image` or a draw list's `AddImage`. It's kept under the game's key (the asset's path in it, so two open editors don't share one) and made again only when `version` changes, so a game gives the same version until its pixels do. It works inside an editor alone; one not asked for in a while is freed (`MenuModel::CodePicture`) |
+
+### Asset viewports
+
+A type whose assets are seen best moving (an effect playing) declares a `viewport`, an `AssetViewportDecl`: its
+editor then shows a live 3D viewport of the asset as the editor has it, saved or not, so an edit shows at once. It's
+the viewport a class has (The viewport), drawn by the same viewport renderer the game registers, with the same camera
+(drag to go round, the wheel to come nearer, Reset View), but with playback controls in place of the component tools:
+
+| Control | What it does |
+|---|---|
+| Play, Pause | Whether its time runs (`ViewportView::playing`); paused, what it shows holds still |
+| Restart | Everything from the start (`ViewportView::replays` goes up) |
+| Loop | Whether what it shows starts again once it's done (`ViewportView::looping`), or plays once and stays done. It starts as the declaration's `looping` says |
+| The time | How long it's played since it last started, in seconds: the game's `ViewportImage::time`, or counted by the editor while the game doesn't say |
+| Capture Thumbnail, Clear | The camera and the time as the asset's thumbnail framing, or the default framing again (The content browser, Capture Thumbnail) |
+
+What playing, looping and starting over mean is the game's to say: RexFabric only passes them on.
+
+| Part of `AssetViewportDecl` | What it is |
+|---|---|
+| `backing` | The backing the renderer shows, as a class's viewport shows its class's (`ViewportView::backing`); empty for none, the scene's parts alone |
+| `build` | Builds what the viewport shows of an asset, an `AssetViewportScene`, from its path and its fields as the editor has them now (as `GameAsset::json` has them, untranslated): the values its backing is shown with and parts on the stage beside it, each a `ViewportPart` the renderer shows as it shows a component of its type in a class's viewport. A part's type needn't be a declared component, only one the renderer knows. It's called as the editor opens and again whenever the fields change, not every frame; a scene unlike the one it gave last starts everything over, as Restart does. It may throw, and the editor shows the reason over the viewport |
+| `looping` | Whether Loop starts on |
+
+A declaration with neither a backing nor a build is refused. The renderer knows an asset's viewport from a class's by
+`ViewportView::asset`, the asset's path, set only for an asset's (`class_path` then empty).
+
+An asset without a graph is laid out as a material is: the viewport on the left, as wide as its edge is dragged, and the
+fields, the 2D preview, the type's own editor and the problems beside it. An asset with a graph has the viewport as its
+Viewport tab, in place of the 2D preview. The viewport is made when it's first drawn and closed with its editor.
+
+Trouble in Paradise's FX Emitter plays the effect its editor holds so, recompiled as its fields change (DeTiP's
+docs/modding.md, FX).
+
+### Asset graphs
+
+A type naming `events` or `asset_events` gives each of its assets a node graph of its own, Blueprint style: edited in
+the asset's editor and kept beside its file, as the asset's companions (they move, copy and go with it):
+
+```
+mods/MyMod/content/Leaves/Maze.json         the asset
+mods/MyMod/content/Leaves/Maze.graph.json   its graph
+mods/MyMod/content/Leaves/Maze.graph.lua    the Lua it compiles to, run after the mod's scripts
+```
+
+| Part | How |
+|---|---|
+| The events | Each is a game event (`Namespace::Event`) whose Args name the asset's path first: `tip.star_leaf_pressed(leaf, pinata)`. A new graph gets a node of each down the left of its event graph (`graph::PlaceEventNodes`), titled as the type says ("On Pressed"), which can't be deleted, copied or duplicated. Each is `asset.event:<event>`, a twin of the event's own node kept out of the add menu, without the asset's pin |
+| What it compiles to | The event's own `rex.on`, which returns at once unless the first value is the graph's asset: `if Leaf ~= Asset then return end`, `Asset` being `rex.content.script_asset()`, worked out when the script loads from where it is. So a renamed or copied asset's graph is its new asset's without compiling it again |
+| Running | `LuaScripts` (mods.h) gives each mod's scripts folder, then every `*.graph.lua` in its content folder; a script there counts as its mod's (lua_vm's `CallerMod`) |
+| The editor | Laid out as a blueprint, and drawn as the node editor is (its glass theme and the canvas's light behind the panes, `AssetEditor::HoldsCanvas`): the toolbar, then the tabs across the window (Viewport, the type's viewport or else its preview as large as fits; Event Graph, the canvas; Lua), which stay put whichever is open, and under them the panes: the graph's functions, macros, variables and dispatchers on the left, only on the Event Graph and Lua tabs; the open tab's page in the middle; on the right the details, the asset's fields and problems on the viewport and the selected node's on the graph. Each side pane is as wide as its edge is dragged. The canvas is the node editor's own (`GraphView`, `src/ui/graph_view.h`, which the node editor window shows too). The layout is `OwnGraph` (`src/ui/own_graph.h`), which an avatar class's editor shares (Class graphs). The fields and the graph are one document to undo and redo: a settled edit of the canvas goes into the editor's history with the fields, and an undo that changes the graph puts it back on the canvas |
+| Saving | Writes the asset, its graph and its script, then runs the mods' scripts again (as the node editor's Save and Reload), so the graph runs at once |
+
+The node editor and the asset graphs come with `WITH_NODE_EDITOR`; without it a type's assets are edited without
+their graphs.
+
+#### Field events
+
+Some events only make sense for a part of an asset: a shop catalog fires `tip.catalog_action_bought(catalog, action)`,
+and each of its actions wants a node of its own. A type's `asset_events` gives those nodes from the asset's fields
+(as `check` gets them, fitted and untranslated): an `AssetEventDecl` for each, with its event, its title
+("OnBought_Romance") and `match`, the values the event's arguments after the asset must equal for the node to run
+(`{"Romance"}`). An empty match runs for every firing for the asset, as a node of `events` does.
+
+| Part | How |
+|---|---|
+| The nodes | Each is the event's `asset.event:<event>` node with two settings of its own: `Match`, the match as a JSON array of strings, and `Title`, its title (the event's own when empty). Like the `events` nodes they're down the left of the event graph, a new one below the event nodes there, and can't be deleted, copied or duplicated. Their outputs are the event's arguments after the asset, as the other asset events have |
+| Who it is | A node is known by its event and its match, never by its place in the fields, so reordering a catalog's actions keeps every node and its links |
+| Following the fields | The editor asks `asset_events` again whenever an edit of the fields settles (not every frame, and not while a value is still being typed) and makes the graph's nodes what it gives (`graph::PlaceFieldEvents`, `src/graph/node_library.h`): a node for a new one, and a node whose event and match it no longer gives goes. What was linked from a node that went stays where it was, unlinked: a ghost, as Blueprint leaves the nodes of a removed event, so the work isn't lost and can be linked to another event. The change is part of the edit that caused it, so one undo brings back the field and its node with its links |
+| Renaming | A renamed action is a new match, so its old node goes (its chain left a ghost) and a new one is added. A node whose title alone changed, its match the same, keeps its place and links and takes the new title |
+| What it compiles to | The event's own `rex.on` with the asset guard, then a guard on the values after the asset, in order, each compared as text, so a number the game fires matches the text of it |
+| Saving and loading | They're saved in the graph's file as any node is. Opening the editor asks `asset_events` of the fields as the file has them and makes the nodes so, as if they'd always been, for fields changed outside the editor. A type whose `asset_events` throws keeps the nodes the graph has, and the editor says why |
+
+A shop catalog's node for its action Romance compiles to:
+
+```lua
+local n7_Asset = rex.content.script_asset()
+
+-- OnBought_Romance
+rex.on("tip.catalog_action_bought", function(n7_Catalog, n7_Action)
+  if n7_Catalog ~= n7_Asset then return end
+  if tostring(n7_Action) ~= "Romance" then return end
+  rex.info("bought", n7_Action)
+end)
+```
+
+Game assets load with the classes (`LoadGameAssets`, `src/content/game_assets.cpp`), after the enums and structs. One
+whose value doesn't fit a field, or that the type's check finds wrong, is logged and left out. Trouble in Paradise's
+packet type, what it does with packets and how it sorts them by their `order` are DeTiP's (docs/modding.md, Packets).
 
 ## Map edits
 
@@ -712,7 +933,8 @@ system's `objInst_s` and adds a position at +0x68, so `Avatar` here is the game'
 An avatar class has, beyond its defaults:
 
 * a component tree,
-* a graph: an event graph made in the node editor, compiled to Lua as graphs are today, run for each spawned instance,
+* a graph: an event graph made in the node editor, compiled to Lua as graphs are today, run for each spawned instance
+  (Class graphs),
 * a backing: what the game makes in the world for it. The game defines the backings it offers. For Trouble in
   Paradise these would be a decor or a pinata based on one of the game's own tags, or a plain world object with no
   game item behind it.
@@ -751,8 +973,9 @@ the world.
 | Removing | Detaches the components in reverse order and removes the backing. A reload of the mods' scripts removes every avatar but the saved ones, disposing of them on the next tick |
 | Saving | An avatar spawned saved (`SetAvatarSaved`) is kept in its world's save and spawned again when the world loads (Saved with the world) |
 | Lua | `rex.content.spawn`, `remove`, `is_avatar` and `avatars`, and the avatar handle (Lua) |
-| Graphs | The Avatars nodes: Spawn (one per avatar class the mod may use, its Avatar output typed by the class, with a Saved input), Remove Avatar, Move Avatar, Avatar Location and Is Avatar Valid |
-| Class editor | An Avatar section on an avatar class: the backing, picked from the game's for its game class or kept as its parent's; the inherited components listed; and its own as a tree, each with its name, type, position, rotation and scale, its type's properties with a reset to the default, up, down, remove and Add Child |
+| Graphs | The Avatars nodes: Spawn (one per avatar class the mod may use, its Avatar output typed by the class, with a Saved input), Remove Avatar, Move Avatar, Avatar Location, Is Avatar Valid, and Get Value and Set Value of a property of the avatar's class |
+| Class editor | An Avatar section on an avatar class: the backing, picked from the game's for its game class or kept as its parent's; the inherited components listed; and its own as a tree, each with its name, type, position, rotation and scale, its type's properties with a reset to the default, up, down, remove and Add Child. With the node editor, laid out as a blueprint with the class's own graph (Class graphs) |
+| Events | Each avatar fires RexFabric's avatar events, spawned, tick and removed, which its class graph runs (Class graphs) |
 
 An avatar's handle is RexFabric's own, not a game object. Where Lua or a graph gives it to something taking a game
 object, it goes as its backing's object, an error for a backing that's only a place; a cast to a game type or class
@@ -762,8 +985,7 @@ A game class can carry properties its backing reads: Trouble in Paradise's `TiP/
 Signposts) has a text, a colour, an image and an action, which a mod's subclass sets and its backing makes a real
 signpost of the game's from, the first avatar backed by one of the game's own objects.
 
-Placed avatars live in map edits (Map edits). Not yet: the components' and backings' texts in other languages,
-and a graph per avatar class (stage 9).
+Placed avatars live in map edits (Map edits). Not yet: the components' and backings' texts in other languages.
 
 ### Saved with the world
 
@@ -818,10 +1040,11 @@ rexfabric::content::SetViewportRenderer({.show = ShowViewport, .close = CloseVie
 
 | Part | What it is |
 |---|---|
-| `ViewportView` | What's asked: the class, its game class, its backing (its own or inherited), every property's value as the editor has it, every component as a `ViewportPart` (its name, type, place in the avatar's space and values, inherited or its own), the camera (yaw and pitch round the avatar, in degrees, and a zoom on the game's framing), the viewport's size, whether its time runs (Play and Pause), a count that goes up with each Replay, and whether a gizmo is held, when the game should keep its framing still |
-| `ViewportImage` | What was drawn: the UI's texture of it (an `ImTextureID`) and the part of it filled, the view and projection it was drawn with (row vectors, as ImGuizmo takes them; the view only turning and moving, any scale in the projection), whether it's orthographic, and a message to show over it (why there's nothing to see, or what a component couldn't show). The image is drawn over the viewport's grid, so what the game leaves clear shows the grid |
+| `ViewportView` | What's asked: the class, its game class, its backing (its own or inherited), every property's value as the editor has it, every component as a `ViewportPart` (its name, type, place in the avatar's space and values, inherited or its own), the camera (yaw and pitch round the avatar, in degrees, and a zoom on the game's framing), the viewport's size, whether its time runs (Play and Pause), whether it loops (an asset viewport's Loop; always on for a class's), a count that goes up with each Replay, whether a gizmo is held, when the game should keep its framing still, and for a game asset type's viewport the asset's path (Asset viewports) |
+| `ViewportImage` | What was drawn: the UI's texture of it (an `ImTextureID`) and the part of it filled, the view and projection it was drawn with (row vectors, as ImGuizmo takes them; the view only turning and moving, any scale in the projection), whether it's orthographic, a message to show over it (why there's nothing to see, or what a component couldn't show), and how long it's played since it last started, for an asset viewport's time readout. The image is drawn over the viewport's grid, so what the game leaves clear shows the grid |
 | `show` | From the UI thread, every frame a viewport is seen, giving at once what was drawn last: the game draws on its own time, on its own thread |
 | `close` | The viewport's editor closed: what the game made for it can go |
+| `capture` | Optional: one picture of a view on a stage of its own, for the content browser's thumbnails, handed back a few frames later (The content browser, Making a picture) |
 
 With no renderer the viewport says so ("No viewport renderer: the game has not registered one, so avatars can't be
 previewed. Components can still be edited by their values.", logged once), and everything else keeps working over a
@@ -840,6 +1063,7 @@ not ImGuizmo, whose grid can't cut a line behind a camera of this projection.
 | A marker | Every component with a place is a marker where the avatar puts it, its name beside it: the inherited ones grey, the class's own orange, the selected one yellow. Clicking one of the class's own selects it |
 | The gizmo | ImGuizmo's, on the selected component: Move, Turn or Scale (W, E, R over the viewport), along its own axes or the avatar's. A drag changes the component's transform as it goes, kept relative to the component above it, to four decimals; the whole drag is one step of undo |
 | Reset View | The camera it started with |
+| Capture Thumbnail, Clear | The camera as the class's thumbnail framing, or the default framing again (The content browser, Capture Thumbnail) |
 | Pause, Play, Replay | Its time held or running (what the components do, how the avatar moves), and everything from the start, as when an avatar of the class is spawned |
 
 A component is selected in the viewport or by its name in the tree, which shows it selected. ImGuizmo (MIT, commit
@@ -853,6 +1077,140 @@ avatar viewport).
 Not yet: clicking the avatar itself to select (a game would have to say what's under the pointer), and the avatar placed
 in the live scene as a second view. What a component does shows as the game previews it: Trouble in Paradise plays an
 emitter's effect.
+
+### Class graphs
+
+Every avatar class has a node graph of its own, Blueprint style, which runs for each avatar of the class that's
+spawned: its events are the avatar's, Self is the avatar, and its variables are each avatar's own. It comes with
+`WITH_NODE_EDITOR`.
+
+#### Files
+
+The graph is kept beside the class's file, as a game asset's graph is (Asset graphs), so it moves, copies and goes with
+the class:
+
+```
+mods/MyMod/content/Lights/Glow.json         the class
+mods/MyMod/content/Lights/Glow.graph.json   its graph
+mods/MyMod/content/Lights/Glow.graph.lua    the Lua it compiles to, run after the mod's scripts
+```
+
+`LuaScripts` (mods.h) runs every `*.graph.lua` of a mod's content folder after its scripts folder, so a class graph runs
+as an asset graph does. The script finds its class from where it is (`rex.content.script_asset()`), so a renamed or
+copied class's graph is the new class's without compiling it again.
+
+#### The editor
+
+An avatar class's editor is laid out as a blueprint, as a game asset with a graph is (`OwnGraph`, `src/ui/own_graph.h`,
+which both share): the toolbar and the class's problems, then the tabs across the window (Viewport, the class's viewport
+with its gizmos; Event Graph, the canvas; Lua, the script it saves as), and under them the panes: the graph's functions,
+macros, variables and dispatchers on the left, beside the graph alone; the open tab's page in the middle; and on the
+right the class's details (its parent, help, inherited values, own properties and the Avatar section) on the viewport,
+the selected node's on the graph. The class and its graph are one document to undo and redo. Saving writes the class,
+the graph and its script, then runs the mods' scripts again, so the graph runs at once. A class that becomes an avatar
+class as it's edited (given a backing, or a parent with one) gets its graph then.
+
+#### Events
+
+A new graph gets a node of each of its avatars' events down the left of its event graph (`graph::ClassEventNodes`,
+placed by `graph::PlaceEventNodes`), which can't be deleted, copied or duplicated. Each is `class.event:<event>`, kept
+out of the add menu.
+
+| Node | Event | When |
+|---|---|---|
+| On Spawned | `avatar_spawned` | Once the avatar is spawned and its components attached |
+| On Tick | `avatar_tick`, with Seconds | Every frame, after its components ticked, with the seconds since the last |
+| On Removed | `avatar_removed` | As it goes, removed or gone with its world, before its components detach. Self can still be read; for one gone with its world its backing is gone already |
+| The game's | Each `ClassEventDecl` of the class's game class and its ancestors (`ClassDecl::events`), titled as it says | When the game fires it for the avatar, with the rest of its values as the node's outputs |
+
+These are real events, fired by the avatar runtime (`src/content/avatars.cpp`) with the avatar's id first, so a plain
+`rex.on("avatar_tick", function(avatar, seconds) end)` hears them too (content.h, `kAvatarSpawned`). A game fires its
+class events the same way, with the avatar's id first as an int64, which it finds from a backing's handle with
+`AvatarOfBacking(backing, handle)`. Lua gets that first value as the avatar itself, in a class graph and in a plain
+`rex.on` alike (lua_rex.cpp's `DispatchEvent`, for every `content::IsAvatarEvent`); fired with an id no avatar has now, it
+reaches no Lua at all. A game event of a class, used in a mod's ordinary graph, has its first output typed as an avatar
+of the class that declares it.
+
+A reload of the mods' scripts removes the avatars they spawned without their removed event, as the scripts whose graphs
+would run it are gone. The saved avatars a reload keeps fire their spawned event again on the next tick, so the new
+scripts' class graphs start each one's own (`content::AnnounceAvatars`).
+
+Only these events and Custom Events go in a class graph: another event (On Frame, a hook, a game event that isn't one
+avatar's) has no avatar to run for, so it's an error there and belongs in one of the mod's graphs. On Tick is where work
+done every frame goes.
+
+#### Self
+
+Self is the avatar a chain runs for, typed by the class, so it goes into anything taking an avatar of the class or of a
+class above it. The Self node gives it anywhere in the graph, functions and macros too, and as a blueprint's Target is
+self, an Avatar input of the Avatars nodes left unlinked in a class graph is Self: Move Avatar, Remove Avatar, Avatar
+Location and Is Avatar Valid act on it, and Get Value and Set Value read and set its property values. The add menu offers
+a Get and a Set of each of Self's properties under Avatars/Self.
+
+#### Running and inheritance
+
+A class graph runs for every avatar of its class and of the classes below it. A subclass's own graph runs too, Blueprint
+style: an event linked in a class's graph overrides the same event of the graphs above it, for the avatars of that class
+and below, and its Call Parent node runs the parent's chain of the event (the nearest class above with one) with the same
+values. An event left with nothing linked is a ghost, as a blueprint's placed events are: it overrides nothing, so a
+subclass that only adds a tick of its own still runs its parent's spawned and removed chains.
+
+Overriding rather than running both, parent first, is what Blueprint does, and it's the only way a subclass can replace
+what its parent does rather than only add to it; Call Parent gives back the other at the one place it's wanted, before,
+after or between the subclass's own nodes. Running both in order would also need the graphs to load in class order,
+which scripts of several mods don't.
+
+Each linked event compiles to `rex.content.on_class(Class, event, handler)`, `Class` being `rex.content.script_asset()`.
+RexFabric keeps the handlers by event and class (lua_content.cpp) and puts one listener on each event through `rex.on`:
+fired for an avatar, it runs the handler of the avatar's own class, or of the nearest class above it that has one.
+`rex.content.call_parent(Class, event, Self, ...)` runs the next one above `Class`.
+
+#### Variables are each avatar's own
+
+As Blueprint's member variables are, a class graph's variables are each avatar's own, and so are its event dispatchers
+and what its nodes keep between runs (a Do Once done, a Delay waiting). They're the fields of a table RexFabric keeps for
+the avatar, `rex.content.own(Self, Class, Fresh)`: made by the script's `Fresh` the first time it's asked for, with each
+variable's starting value, kept for as long as the avatar is there, and dropped once it's gone (after its removed event).
+Every function the script writes, the events', the graph's functions and the chains timers and dispatchers run, takes
+the avatar as Self first and fetches its table as `My`, so a variable `Count` is `My.Count`.
+
+An event handed to a timer or a dispatcher is handed on as its chain run for that avatar, the same function each time
+(so Unbind finds it), which does nothing once the avatar is gone; a Delay of a removed avatar goes no further either. A
+looping timer keeps running until it's cleared, so clear it in On Removed.
+
+`Self`, `My`, `Class` and `Fresh` are the script's own names in a class graph, which variables, functions and
+dispatchers can't take.
+
+Here is a graph with a variable `Count`, its On Tick counting ticks and then calling its parent's, and its On Removed
+logging the count, with the Lua it saves (its On Spawned left a ghost):
+
+```lua
+-- Made with the RexFabric node editor from content/Lights/Glow.graph.json.
+-- Saving the graph again replaces this file, so change the graph rather than this file.
+
+-- The class this is the own graph of, as it's named now: wherever its files are, so a rename or a copy needs no compiling.
+local Class = rex.content.script_asset()
+
+-- What each avatar's own variables start as; rex.content.own keeps them for it while it's there.
+local function Fresh()
+  return {
+    Count = 0,  -- ticks so far
+  }
+end
+
+-- On Tick
+rex.content.on_class(Class, "avatar_tick", function(Self, n2_Seconds)
+  local My = rex.content.own(Self, Class, Fresh)
+  My.Count = My.Count + 1
+  rex.content.call_parent(Class, "avatar_tick", Self, n2_Seconds)
+end)
+
+-- On Removed
+rex.content.on_class(Class, "avatar_removed", function(Self)
+  local My = rex.content.own(Self, Class, Fresh)
+  rex.info("ticks", My.Count)
+end)
+```
 
 ## Files
 
@@ -982,6 +1340,7 @@ rexfabric::content::DeclareClass({.path = "TiP/Pinata", .parent = "TiP/Avatar", 
 | `type` | The game type the class stands for, by its full name. Empty: its objects are of its parent's type |
 | `test` | For a class without a type of its own: which objects of its type are one of it. It gets the object as the type holds it, and may throw to refuse |
 | `properties` | The properties it adds |
+| `events` | Game events its avatars' class graphs can start with (`ClassEventDecl`: the event's full name and its node's title), each declared with `Namespace::Event`, its Args naming the avatar first. The game fires one with the avatar's id first (Class graphs) |
 
 Its structs are declared the same way, after the enums and structs their fields name. Its enums are the ones its API
 declares (`Namespace::Enum`), named as Lua names them:
@@ -1075,6 +1434,10 @@ doesn't depend on is an error naming the missing dependency.
 | `rex.content.remove(avatar)` | Removes it: true when it was there |
 | `rex.content.is_avatar(value)` | Whether it's an avatar still there |
 | `rex.content.avatars(class)` | Every avatar of the class or a class below it, every avatar when left out, oldest first |
+| `rex.content.avatar(value)` | The avatar a value stands for, an avatar or its id, while it's there; nil for anything else |
+| `rex.content.on_class(class, event, fn)` | `fn(avatar, ...)` runs when an avatar event is fired for an avatar of the class or a class below it, unless a class between them has its own handler of the event (Class graphs) |
+| `rex.content.call_parent(class, event, avatar, ...)` | The handler of the event of the nearest class above `class` that has one; nothing for none |
+| `rex.content.own(avatar, key, make)` | The avatar's own table under `key`, made by `make()` (or empty) the first time, kept while the avatar is there and dropped once it's gone |
 
 An avatar has `id`, `class`, `valid`, `x`, `y`, `z` and `yaw` (setting one of the last four moves it), `object` (its
 backing's game object, nil for a place), `saved` (set it to keep the avatar in its world's save or not), and `:move(x, y, z, yaw)`, `:get(property)`, `:set(property, value)` and
@@ -1175,9 +1538,10 @@ Avatar Location compiled with no problems, spawned it and logged its X.
 
 ## Runtime
 
-When a mod is enabled its class assets load, parents first, and their graphs compile. Spawning an avatar class makes
-its backing in the world, attaches its components in tree order and starts its graph. Removing it detaches them in
-reverse order. All but the graph is built (Avatars, What is built).
+When a mod is enabled its class assets load, parents first, and their graphs run with the mod's scripts. Spawning an
+avatar class makes its backing in the world, attaches its components in tree order and fires its spawned event, which
+its class graph runs; each frame its components tick and its tick event fires; removing it fires its removed event,
+then detaches its components in reverse order (Avatars, What is built; Class graphs).
 
 Mod avatars are never written into the game's own save. The ones spawned saved are kept beside it as records of their
 class, place and values, and spawned again as the same class when the world loads; a record whose class is gone is
@@ -1202,8 +1566,8 @@ next, then stage 5 but for adding languages, then stage 6.
 6. The game's `Avatar`, one backing (a plain world object) and the first component, `pinata_fx_emitter`.
 7. The content browser.
 8. The properties editor, which every class can already use.
-9. The Avatar editor: the component tree and defaults (built), then the graph, then the viewport (for Trouble in
-   Paradise, the journal viewer drawing into a texture) and ImGuizmo's gizmos over it (built).
+9. The Avatar editor: the component tree and defaults (built), then the graph (built: Class graphs), then the viewport
+   (for Trouble in Paradise, the journal viewer drawing into a texture) and ImGuizmo's gizmos over it (built).
 10. Game-backed avatars for Trouble in Paradise: decor and pinata classes as new items of the game (new tags, new
     assets and models; see DeTiP's notes on asset loading).
 11. Asset classes and their editors: `Texture` and a texture viewer (built), then `Model`.

@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -70,6 +71,16 @@ struct PropertyDecl {
 // holds it, on the thread the mod asking runs on.
 using ClassTest = std::function<bool(const Object& object)>;
 
+// A game event an avatar class's graph can start with (ClassDecl::events; docs/content_and_classes.md, Class graphs):
+// the game fires it for one avatar, its Args naming the avatar first ("tip.avatar_interacted(avatar, button)"), and the
+// graph of the avatar's class runs it for that avatar as Self. The game fires it with the avatar's id first, as an
+// int64 (ComponentContext::avatar; AvatarOfBacking finds it from a backing's handle). Lua gets that value as the avatar
+// itself, in a class graph and in a plain rex.on alike; fired with an id no avatar has now, it reaches no Lua at all.
+struct ClassEventDecl {
+  std::string event;  // its full name ("tip.avatar_interacted")
+  std::string title;  // its node's title on a class graph ("On Interact"); the event's own when empty
+};
+
 struct ClassDecl {
   // Under a path of the game's own ("TiP/Pinata").
   std::string path;
@@ -82,6 +93,9 @@ struct ClassDecl {
   // one of its parent.
   ClassTest test;
   std::vector<PropertyDecl> properties;
+  // Game events its avatars' class graphs can start with, beside RexFabric's own (spawned, ticked, removed); a class
+  // has its ancestors' too. Each is declared with Namespace::Event, its Args naming the avatar first.
+  std::vector<ClassEventDecl> events;
 };
 
 // Declares one of the game's classes. Before rexfabric::Start, after the types it names; false (logged) for a bad
@@ -191,6 +205,30 @@ void TableChanged(std::string_view path);
 // refused a reader on another thread.
 bool FillTable(std::string_view path);
 
+// One row of a data table, the game's or a loaded mod's, by its name: its fields as a JSON object in text, every field of
+// the table's struct there. None for a table or a row that isn't there, as for a game table whose rows aren't made yet
+// (they're made first when they're out of date and the game can make them now). Any thread.
+std::optional<std::string> FindTableRow(std::string_view table, std::string_view row);
+
+// A list of strings a game offers for a string to be picked from (docs/content_and_classes.md, String lists): named by a
+// kString's ValueType::of as a data table is, its editors' pickers offer its strings in its order. Unlike a table it has
+// no rows of a struct, so it can mix what no table holds together (Trouble in Paradise's effects: the mods' FX Emitter
+// assets by path first, then the game's effects by name). `list` makes it each time a picker opens, on the UI thread.
+struct StringListDecl {
+  // Under a path of the game's own ("TiP/AnyEffect").
+  std::string path;
+  std::string help;
+  std::function<std::vector<std::string>()> list;
+};
+
+// Declares one of the game's string lists. Before rexfabric::Start; false (logged) for a bad path, a taken one (a
+// table's, class's or struct's too) or no list.
+bool DeclareStringList(StringListDecl decl);
+
+// What a string of ValueType::of `of` is picked from: a string list's strings, or a table's row names; empty for
+// neither. Any thread, though a string list is made on the thread asking.
+std::vector<std::string> StringChoices(std::string_view of);
+
 // Where something is: a position, a rotation (pitch, yaw and roll, in degrees, turned yaw first, then pitch, then
 // roll) and a scale, in the game's units and axes, y up.
 struct Transform {
@@ -236,6 +274,18 @@ struct BackingDecl {
 // Declares one of the game's backings. Before rexfabric::Start, after the class it's for; false (logged) for a bad
 // path, a taken one, an unknown class or a missing function.
 bool DeclareBacking(BackingDecl decl);
+
+// The id of the avatar a backing made: the backing's path and the handle its `make` gave. 0 for none (never made, or
+// that avatar removed since). Any thread. A game fires its class events (ClassEventDecl) with this id.
+uint32_t AvatarOfBacking(std::string_view backing, uint64_t handle);
+
+// RexFabric's own events of avatars (docs/content_and_classes.md, Class graphs), fired on the thread the avatar is
+// spawned, ticked or removed on, each with the avatar's id first: spawned once its components are attached, tick each
+// frame after its components ticked (with the seconds since the last), removed before its components detach. Lua gets
+// the avatar itself, as for a class event.
+inline constexpr std::string_view kAvatarSpawned = "avatar_spawned";
+inline constexpr std::string_view kAvatarTick = "avatar_tick";
+inline constexpr std::string_view kAvatarRemoved = "avatar_removed";
 
 // What a component's functions are given: the avatar, where the component is, its values, and room for its own state.
 struct ComponentContext {
@@ -319,46 +369,184 @@ struct WorldSavePartDecl {
 // Declares a part. Before rexfabric::Start; false (logged) for a bad name, a taken one or a missing function.
 bool DeclareWorldSavePart(WorldSavePartDecl decl);
 
-// Packets (docs/content_and_classes.md, Packets): kinds of ground a player buys and pours, each a variant of one of
-// the game's own kinds, its base, that looks and sells as it says. The game says what the bases are and what a look
-// holds for each; RexFabric keeps the mods' packet assets and lists them after the game's own.
-enum class PacketUnlock { kDefault, kShop };
-
-struct Packet {
-  std::string path;   // "TiP/Sand", "MyMod/RedSand"
-  std::string mod;    // the mod it's from, empty for the game's own
-  std::string base;   // a value of the game's base enum, by name ("Sand")
-  std::string name;   // shown where it's picked and sold, in the language the game shows
-  std::string help;   // the same
-  std::string icon;   // a Texture asset, empty for none
-  AvatarValues look;  // each field of its base's look struct, as the packet sets it or the field's default
-  PacketUnlock unlock = PacketUnlock::kDefault;  // every player has it, or it's bought in the shop
-  int64_t level = 0;  // kShop: the shop level it's sold from
-  int64_t price = 0;  // kShop: what it costs
-  double order = 0.0;  // where it sorts among its mod's packets
+// Game asset types (docs/content_and_classes.md, Game asset types): kinds of asset a game adds beside RexFabric's own,
+// each a set of typed fields its files hold at their top level, laid out in a generic editor. RexFabric knows nothing
+// of what they mean: it reads, checks, edits, renames, translates and lists them, and the game reads them back.
+//
+// A field can show only while another field holds one of some values, so one asset type can hold several shapes (a
+// packet's shop level and price only while it's sold in the shop). Two fields may even share a name under conditions
+// that never hold together, each typing the value its own way (a packet's look, a struct of its base's). A field
+// hidden by its condition isn't loaded, checked or saved.
+struct AssetFieldDecl {
+  std::string name;
+  ValueType type;
+  // The default, for a single value; none is the type's empty value (an enum's first value, a struct's defaults).
+  PropertyValue value;
+  // As the editor names it; the name when empty.
+  std::string label;
+  std::string help;
+  // Shown only while the field `when_field`, declared before it, holds one of `when_values`: an enum value's name, a
+  // bool's "true" or "false", a number as text. Empty `when_field`: always shown.
+  std::string when_field;
+  std::vector<std::string> when_values;
+  // Edited by the type's own editor (AssetTypeDecl::editor) alone, so left out of the field table; loaded, checked and
+  // saved as any field is. Ignored for a type without an editor.
+  bool custom = false;
 };
 
-struct PacketsDecl {
-  // The game's enum a packet's base is one of, by its Lua name ("tip.PacketBase").
-  std::string base;
-  // What a packet of each base looks like: the game's struct its look is, by the base value's name.
-  std::map<std::string, std::string> looks;
-  // The game's own packets, read only, listed first and in this order, under paths of the game's own.
-  std::vector<Packet> built_in;
+// One asset of a game asset type, as the game reads it.
+struct GameAsset {
+  std::string path;  // "TiP/Sand", "MyMod/RedSand"
+  std::string mod;   // the mod it's from, empty for the game's own
+  // Every field shown for it, as a JSON object of the fields by name: its value, or the field's default, each fitted to
+  // its type (a struct with every field, an empty asset null) and its texts translated into the language the game
+  // shows. The JSON is text, so a game reads it with whatever it parses JSON with.
+  std::string json;
+  // Its single fields as values (an enum's by its name), the containers and structs none: for reading the simple
+  // fields without parsing the JSON.
+  AvatarValues values;
 };
 
-// Declares the game's packets. Before rexfabric::Start, after its base enum and look structs; at most once. Without
-// it there's no New Packet and the mods' packet assets aren't loaded.
-void DeclarePackets(PacketsDecl decl);
+// One layer of a game asset's 2D preview, drawn over the layers before it inside the preview's square: a picture (a
+// mod's Texture asset, or an image file of the game's), as large as fits its part of the square with its shape kept,
+// or a filled shape filling its part; each tinted.
+struct PreviewLayer {
+  std::string texture;            // a Texture asset ("MyMod/Icon"), empty for none
+  std::filesystem::path file;     // an image file, when there's no texture
+  // A filled outline when there's no picture: points as fractions of `rect`, from its top left, in order round it.
+  std::vector<std::array<float, 2>> shape;
+  std::array<float, 4> rect{0.0f, 0.0f, 1.0f, 1.0f};    // left, top, width and height, as fractions of the square
+  std::array<float, 4> colour{1.0f, 1.0f, 1.0f, 1.0f};  // the shape's fill, or the picture's tint: red, green, blue, alpha
+  bool stretch = false;  // a picture fills `rect` exactly, its shape not kept (as a game stretches it over a box)
+  // The part of the square it's cut to, as `rect` gives one; none while its width is 0.
+  std::array<float, 4> clip{0.0f, 0.0f, 0.0f, 0.0f};
+};
 
-// Every packet: the game's own in their order, then the loaded mods', by mod load order, then by their order, then by
-// path. Any thread.
-std::vector<Packet> Packets();
-// One packet, the game's or a loaded mod's; none for a path that isn't one. Any thread.
-std::optional<Packet> FindPacket(std::string_view path);
-// Goes up whenever the mods' packets are loaded again (a mod turned on or off, a packet's file changed), for a game
-// keeping what it made of them, such as their looks. Any thread.
-uint64_t PacketsRevision();
+// One of the class's components as the viewport shows it, for a game that shows what it does (an emitter playing):
+// where the avatar puts it and its values. An asset viewport's scene (AssetViewportScene) is made of them too.
+struct ViewportPart {
+  std::string name;
+  std::string type;     // its component type ("TiP/FxEmitter")
+  Transform world;      // in the avatar's space
+  AvatarValues values;  // each of its type's properties, as the class sets it
+  bool own = false;     // the class's own, not inherited
+  bool operator==(const ViewportPart&) const = default;
+};
+
+// What a game asset type's viewport shows of one asset (AssetViewportDecl::build): the values its backing is shown
+// with, and parts on the stage beside it, each shown as the game's viewport renderer shows a component of its type in a
+// class's viewport (an emitter playing). A part's type needn't be a declared component, only one the renderer knows.
+struct AssetViewportScene {
+  AvatarValues values;
+  std::vector<ViewportPart> parts;
+  bool operator==(const AssetViewportScene&) const = default;
+};
+
+// A game asset type's live 3D preview (docs/content_and_classes.md, Asset viewports): the viewport a class has, drawn
+// by the game's viewport renderer as it draws a class's, showing an asset as its editor has it now, saved or not. Its
+// toolbar plays it: Play and Pause (ViewportView::playing), Restart (ViewportView::replays), Loop
+// (ViewportView::looping) and how long it's played (ViewportImage::time). What playing means is the game's to say.
+struct AssetViewportDecl {
+  // The backing the renderer shows, as a class's viewport shows its class's; empty for none, the parts alone.
+  std::string backing;
+  // What the viewport shows of the asset, built from its path and its fields as the editor has them now, given as
+  // GameAsset::json has it but untranslated. Called as the editor opens and again whenever its fields change, not every
+  // frame; a scene unlike the one it gave last starts everything over, as Restart does. May throw to say what it can't
+  // show, which the editor shows over the viewport. Unset: the backing alone, with no values. On the UI thread.
+  std::function<AssetViewportScene(const std::string& path, const std::string& json)> build;
+  // Whether Loop starts on.
+  bool looping = true;
+};
+
+// An event a game asset's own graph starts with (AssetTypeDecl::events).
+struct AssetEventDecl {
+  std::string event;  // its full name ("tip.star_leaf_pressed")
+  std::string title;  // its node's title on the asset's graph ("On Pressed"); the event's own when empty
+  // For an event made from an asset's fields (AssetTypeDecl::asset_events): the values the event's arguments after the
+  // asset's path must equal for this node to run, in order ({"Romance"} for tip.catalog_action_bought(catalog, action)
+  // and the action named Romance). Empty: the node runs for every firing for the asset.
+  std::vector<std::string> match;
+};
+
+struct AssetTypeDecl {
+  // The class its assets are, under a path of the game's own ("TiP/Packet"): an asset property of it picks one.
+  std::string path;
+  // What its files say under "asset" ("packet"): unique, and none of RexFabric's own kinds.
+  std::string kind;
+  // How the content browser names it ("Packet"): its New entry, its tiles, its editor's title.
+  std::string label;
+  // The submenu of the content browser's New menus it's in ("UI"), beside RexFabric's own Basic and Advanced (a game's
+  // type may join either); empty for Other, after the rest.
+  std::string category;
+  std::string help;
+  std::vector<AssetFieldDecl> fields;
+  // The fields a new asset is asked for before it's made (a packet's base), each one of `fields`.
+  std::vector<std::string> create_with;
+  // A text or string field a new asset's name goes into, as a start ("name"); empty for none.
+  std::string name_field;
+  // What's wrong with an asset, given as GameAsset::json has it but untranslated: each problem a line its editor shows,
+  // and the reason it isn't loaded. Unset or empty for nothing wrong. Any thread.
+  std::function<std::vector<std::string>(const std::string& json)> check;
+  // What's doubtful about an asset that loads all the same (a palette missing a colour, another asset it names not
+  // loaded), given as `check` is: each a line its editor shows below the problems, in the warning colour. Unlike
+  // `check`, it may read other assets, as it only runs while an editor is drawn, once they've loaded. Unset or empty for
+  // nothing. On the UI thread.
+  std::function<std::vector<std::string>(const std::string& json)> warn;
+  // The game's own assets of the type, read only, listed first and in this order, and offered in every picker of it.
+  // Each gives its path (under the game's own) and its JSON; `mod` and `values` are filled in.
+  std::vector<GameAsset> built_in;
+  // Its tiles' colour in the content browser, red, green and blue from 0 to 1.
+  std::array<float, 3> colour{0.6f, 0.7f, 0.8f};
+  // A 2D preview its editor shows of an asset as its fields are now, given as GameAsset::json has it but untranslated:
+  // the layers to draw, bottom first (a star leaf: the leaf in its colour, its icon over it). Unset for no preview. On
+  // the UI thread, every frame the editor is drawn.
+  std::function<std::vector<PreviewLayer>(const std::string& json)> preview;
+  // The type's own editor, for what the field table can't show well (a palette's colours over the pattern they colour):
+  // drawn with ImGui, mouse and all, in the asset's editor below the field table, every frame the editor is drawn, on
+  // the UI thread. It gets the asset's path and its fields as JSON text as the editor holds them now (every field shown
+  // for it there, as its file has them: not fitted, so read them as a check reads a file), and gives true when it
+  // changed them, `json` then holding the asset's fields as they are now. The editor takes that as it takes an edit in
+  // the table: undone, redone and saved with the rest. EditorImage shows a picture made in code. Unset for the table
+  // alone.
+  std::function<bool(const std::string& path, std::string& json)> editor;
+  // A live 3D viewport its editor shows of an asset as its fields are now, with Play, Pause, Restart and Loop
+  // (AssetViewportDecl): beside the fields, or as the Viewport tab of an asset with a graph, in place of the 2D preview.
+  // None for no viewport.
+  std::optional<AssetViewportDecl> viewport;
+  // Game events the game fires for one asset of the type, by full name ("tip.star_leaf_pressed"), each declared with
+  // Namespace::Event and its Args naming the asset's path first. With any, each asset has a node graph of its own,
+  // edited in its editor and kept beside its file (Leaf.graph.json, compiled to Leaf.graph.lua and run with the mod),
+  // which starts with a node of each event that can't be deleted and runs when the game fires it for that asset.
+  std::vector<AssetEventDecl> events;
+  // Events made from an asset's own fields, beside `events`: given the asset's fields as JSON (as `check` gets them),
+  // the event nodes its graph has for them (a shop catalog's "OnBought_Romance" for each of its actions, each matching
+  // its action's name). They follow the fields: a node appears for a new one and goes (with what's linked to it kept as
+  // a ghost, Blueprint style) when its field goes. A type with these has a graph even without `events`. On the UI thread.
+  std::function<std::vector<AssetEventDecl>(const std::string& json)> asset_events;
+};
+
+// Declares one of the game's asset types. Before rexfabric::Start, after the types its fields name; false (logged)
+// for a bad path, a taken path or kind, a field of a type that isn't there, a condition on a field that isn't declared
+// before it, or a viewport with neither a backing nor a build.
+bool DeclareAssetType(AssetTypeDecl decl);
+
+// Every asset of a type: the game's own in their order, then the loaded mods', by mod load order, then by path. Any
+// thread.
+std::vector<GameAsset> GameAssets(std::string_view type);
+// One asset of any game asset type, the game's or a loaded mod's; none for a path that isn't one. Any thread.
+std::optional<GameAsset> FindGameAsset(std::string_view path);
+// Goes up whenever a type's assets are loaded again (a mod turned on or off, a file changed), for a game keeping what
+// it made of them. Any thread.
+uint64_t GameAssetsRevision(std::string_view type);
+
+// A picture a game makes in code, for its asset type's own editor (AssetTypeDecl::editor) to draw with ImGui (a palette
+// over its pattern): the UI's texture (an ImTextureID) of it, kept under `key`, a name of the game's own for it
+// ("TiP/PinataPalette:MyMod/Red:preview", the asset's path in it so two editors don't share one). It's made again from
+// `rgba` (RGBA8, rows top first, tightly packed) whenever `version` isn't the one it was last made with, so a game gives
+// the same version until its pixels change; `rgba` is read only then. 0 when it can't be made (no UI pictures, a size
+// the pixels don't fill) and outside an editor. One not asked for in a while is freed. On the UI thread, inside an
+// editor.
+uint64_t EditorImage(std::string_view key, uint64_t version, uint32_t width, uint32_t height, std::span<const uint8_t> rgba);
 
 // A kind of map edit the game offers beside RexFabric's own Spawn: a model swapped, an actor removed. Its functions run
 // on the thread RexFabric ticks on, the game's, and may throw to refuse, with the reason as their message.
@@ -541,16 +729,9 @@ struct TextureImage {
 // The picture of a loaded mod's texture asset ("MyMod/Pictures/Logo"), read from its file; none, with `why`, for a
 // path that isn't one or a picture that can't be read. Any thread.
 std::optional<TextureImage> LoadTextureImage(std::string_view path, std::string* why = nullptr);
-
-// One of the class's components as the viewport shows it, for a game that shows what it does (an emitter playing):
-// where the avatar puts it and its values.
-struct ViewportPart {
-  std::string name;
-  std::string type;     // its component type ("TiP/FxEmitter")
-  Transform world;      // in the avatar's space
-  AvatarValues values;  // each of its type's properties, as the class sets it
-  bool own = false;     // the class's own, not inherited
-};
+// The version LoadTextureImage would give the picture now, without reading it: for a game checking whether what it made
+// of one is out of date. None, with `why`, where LoadTextureImage finds no picture to read. Any thread.
+std::optional<uint64_t> TextureImageVersion(std::string_view path, std::string* why = nullptr);
 
 // The Avatar editor's viewport (docs/content_and_classes.md, The viewport): one avatar of the class being edited,
 // alone, drawn by the game and shown by the editor, which draws the components' gizmos over it. What's asked for: the
@@ -567,8 +748,12 @@ struct ViewportView {
   uint32_t height = 0;
   std::vector<ViewportPart> parts;  // every component with its place: the inherited first, each tree in order
   bool playing = true;     // its time runs (an emitter plays); paused, everything holds still
+  bool looping = true;     // what plays starts again once it's done; off, it plays once and stays done (Loop)
   uint32_t replays = 0;    // goes up each time the editor asks for everything to start again
   bool hold_framing = false;  // a component is being dragged: the framing stays as it is, so the camera keeps still
+  // A game asset type's viewport (AssetViewportDecl): the asset's path, `class_path` then empty, the backing the type's
+  // and the values and parts its scene's. Empty for a class's viewport.
+  std::string asset;
 };
 
 // What the game drew last for a viewport.
@@ -583,14 +768,35 @@ struct ViewportImage {
   std::array<float, 16> view{};
   std::array<float, 16> projection{};
   std::string message;  // what to show in its place while there's no image, as why
+  // How long what it shows has played since it last started (ViewportView::replays), in seconds, for the time readout
+  // of a viewport with one (an asset's); none when the game doesn't say, and the editor counts it itself.
+  std::optional<double> time;
+};
+
+// A still picture of a viewport, for the content browser's thumbnails (docs/content_and_classes.md, Thumbnails):
+// RGBA8, rows top first, tightly packed, its alpha straight (not premultiplied), what the stage left clear see through.
+// No pixels, with `message` saying why, when the game couldn't make one.
+struct ViewportCapture {
+  std::vector<uint8_t> rgba;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  std::string message;
 };
 
 // What draws the viewports, each known by a number of its own. `show` comes from the UI thread every frame a viewport
 // is seen and gives what was drawn last, the game drawing on its own time; `close` when the viewport goes. Either may
 // be called on any thread, and neither should wait for the game.
+//
+// `capture`, which a game may leave unset, makes one picture of `view` on a stage of its own, under a viewport number
+// of its own: as `show` would draw it at the view's width and height, after its time has run `seconds` of the stage's
+// clock from the start (an effect played that far, so its particles are out; 0 for as soon as it shows). It's called on
+// the UI thread and returns at once; the game draws on its own time and calls `done` once, on any thread, a few frames
+// later, with the picture or with why there's none. `close` with the capture's number means it's no longer wanted:
+// the game may stop, and a `done` after it is ignored. RexFabric asks for one capture at a time.
 struct ViewportRenderer {
   std::function<ViewportImage(uint64_t viewport, const ViewportView& view)> show;
   std::function<void(uint64_t viewport)> close;
+  std::function<void(uint64_t viewport, const ViewportView& view, double seconds, std::function<void(ViewportCapture)> done)> capture;
 };
 
 // Registers the game's viewport renderer, at any time, a later one replacing it. Until one is, the viewport says so and

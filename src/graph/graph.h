@@ -9,6 +9,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -183,12 +184,19 @@ class Graph {
   // "Speed", "Speed1", "Speed2": a variable name nothing uses yet.
   std::string UniqueVariableName(std::string_view base) const;
 
+  // The avatar class whose own graph this is (docs/content_and_classes.md, Class graphs), or empty for any other graph:
+  // what Self is in it, and what makes its variables each avatar's own. Not kept in the file, as the class is wherever
+  // the file is; the document holding the graph says.
+  const std::string& self_class() const { return self_class_; }
+  void SetSelfClass(std::string path) { self_class_ = std::move(path); }
+
  private:
   std::vector<Node> nodes_;
   std::vector<Link> links_;
   std::vector<Variable> variables_;
   std::vector<Routine> routines_;
   std::vector<Dispatcher> dispatchers_;
+  std::string self_class_;
   int next_node_ = 1;
   int next_link_ = 1;
   int next_routine_ = 1;

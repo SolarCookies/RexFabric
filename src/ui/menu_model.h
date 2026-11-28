@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 
@@ -59,10 +60,13 @@ class MenuModel {
     uint32_t height = 0;
   };
   Picture AssetPicture(const std::filesystem::path& file);
+  // A picture made in code as an ImGui texture, kept under `key` and made again from `rgba` (RGBA8, `width` by
+  // `height`) whenever `version` isn't the one it was made with; an invalid id when it can't be made. For the game asset
+  // types' own editors (rexfabric/content.h, EditorImage). One not asked for in a while is freed at a Poll.
+  ImTextureID CodePicture(const std::string& key, uint64_t version, uint32_t width, uint32_t height, std::span<const uint8_t> rgba);
   void OpenModsFolder() const;
 
- private:
-  // An uploaded icon, freed through Images::destroy when it goes.
+  // An uploaded picture, freed through Images::destroy when it goes.
   class Texture {
    public:
     Texture(const Images& images, ImTextureID id) : images_(images), id_(id) {}
@@ -75,7 +79,13 @@ class MenuModel {
     const Images& images_;
     ImTextureID id_;
   };
+  // A picture of RGBA8 pixels (rows top first, tightly packed) kept by whoever asked for it, as the thumbnails keep
+  // theirs; null when it can't be made. Let it go with Retire.
+  std::unique_ptr<Texture> UploadPicture(uint32_t width, uint32_t height, std::span<const uint8_t> rgba);
+  // Frees a picture at the next Poll, as the frame being drawn may still hold it.
+  void Retire(std::unique_ptr<Texture> texture);
 
+ private:
   std::vector<ModInfo> Loadable() const;
   std::unique_ptr<Texture> MakeTexture(const std::vector<uint8_t>& encoded, uint32_t* width = nullptr, uint32_t* height = nullptr);
   void PrunePackageIcons();
@@ -98,6 +108,12 @@ class MenuModel {
     uint32_t height = 0;
   };
   std::unordered_map<std::string, CachedPicture> pictures_;
+  struct CodeImage {
+    std::unique_ptr<Texture> texture;
+    uint64_t version = 0;
+    uint64_t used = 0;  // the poll it was last asked for in
+  };
+  std::unordered_map<std::string, CodeImage> code_pictures_;
   // Pictures replaced since the last Poll, freed then: this frame's draw list may still hold them.
   std::vector<std::unique_ptr<Texture>> retired_;
   std::vector<net::Thunderstore::Failure> failures_;

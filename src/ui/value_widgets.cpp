@@ -10,6 +10,7 @@
 #include <optional>
 
 #include <imgui.h>
+#include <rexfabric/content.h>
 
 #include "../content/assets.h"
 #include "../content/tables.h"
@@ -35,7 +36,6 @@ constexpr std::string_view kMaterialClass = "Material";
 constexpr std::string_view kMapEditClass = "MapEdit";
 constexpr std::string_view kMeshClass = "Mesh";
 constexpr std::string_view kWorldClass = "World";
-constexpr std::string_view kPacketClass = "Packet";
 constexpr PropertyType kPlainTypes[] = {PropertyType::kBool, PropertyType::kInt, PropertyType::kFloat, PropertyType::kString, PropertyType::kText, PropertyType::kAsset};
 constexpr PropertyType kPlainKeys[] = {PropertyType::kBool, PropertyType::kInt, PropertyType::kString, PropertyType::kAsset};
 
@@ -47,15 +47,16 @@ std::string Lower(std::string_view text) {
 
 bool Matches(const std::string& text, const std::string& filter) { return filter.empty() || Lower(text).find(Lower(filter)) != std::string::npos; }
 
-// What an asset value of `type` picks from: the textures, materials, map edits, meshes, worlds or packets for an asset of
-// those built-in classes, whose assets are files of their own kind, and the classes for an asset of any other class.
+// What an asset value of `type` picks from: the textures, materials, map edits, meshes or worlds for an asset of those
+// built-in classes and the assets of a game asset type for its class, whose assets are files of their own kind, and the
+// classes for an asset of any other class.
 const std::vector<std::string>& OfferedAssets(const ValueType& type, const TypeChoices& choices) {
   if (type.of == kTextureClass) return choices.textures;
   if (type.of == kMaterialClass) return choices.materials;
   if (type.of == kMapEditClass) return choices.map_edits;
   if (type.of == kMeshClass) return choices.meshes;
   if (type.of == kWorldClass) return choices.worlds;
-  if (type.of == kPacketClass) return choices.packets;
+  if (const auto game = choices.game_assets.find(Lower(type.of)); game != choices.game_assets.end()) return game->second;
   return choices.classes;
 }
 
@@ -226,7 +227,8 @@ bool Single(const char* id, const ValueType& type, nlohmann::json& value, const 
     case PropertyType::kString:
     case PropertyType::kText: {
       std::string text = value.is_string() ? value.get<std::string>() : std::string();
-      // A string from a table: typed, or picked from the table's rows (a game's fill once its data is there).
+      // A string from a table or a game's string list: typed, or picked from the table's rows (a game's fill once its
+      // data is there) or the list's strings.
       const bool from_table = type.type == PropertyType::kString && !type.of.empty();
       // A string holding a colour ("#RRGGBB", as a game's colour properties take one) gets a swatch to pick it with.
       std::optional<std::array<float, 3>> colour = type.type == PropertyType::kString ? HexColour(text) : std::nullopt;
@@ -243,7 +245,7 @@ bool Single(const char* id, const ValueType& type, nlohmann::json& value, const 
       changed |= widgets::InputString("##value", text);
       if (from_table) {
         ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
-        const std::vector<std::string> rows = content::RowNames(type.of);
+        const std::vector<std::string> rows = content::StringChoices(type.of);
         changed |= PathCombo("##pick", "", text, rows, nullptr, ImGuiComboFlags_NoPreview | ImGuiComboFlags_PopupAlignLeft);
         ImGui::SetItemTooltip("%s", rows.empty() ? ("Nothing in " + type.of + " yet: a game's table fills once its data is loaded").c_str() : ("Pick from " + type.of).c_str());
       }

@@ -146,10 +146,10 @@ function(rexfabric_attach target)
 
   set(dir ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
   set(sources
-    src/api.cpp src/content/assets.cpp src/content/avatars.cpp src/content/classes.cpp src/content/components.cpp src/content/game_texts.cpp src/content/localisation.cpp src/content/map_edits.cpp src/content/material_graph.cpp src/content/material_nodes.cpp src/content/materials.cpp src/content/packets.cpp src/content/tables.cpp src/content/types.cpp src/content/values.cpp src/content/viewport.cpp src/content/world_saves.cpp src/content/world_view.cpp src/events.cpp src/game_api.cpp src/guest_hooks.cpp src/hooks.cpp src/host_input.cpp src/library.cpp src/midasm.cpp src/mods.cpp src/native_loader.cpp src/platform.cpp src/rexfabric.cpp src/settings.cpp src/switches.cpp
+    src/api.cpp src/content/assets.cpp src/content/avatars.cpp src/content/classes.cpp src/content/components.cpp src/content/game_texts.cpp src/content/localisation.cpp src/content/map_edits.cpp src/content/material_graph.cpp src/content/material_nodes.cpp src/content/materials.cpp src/content/game_assets.cpp src/content/tables.cpp src/content/thumbnail_view.cpp src/content/types.cpp src/content/values.cpp src/content/viewport.cpp src/content/world_saves.cpp src/content/world_view.cpp src/events.cpp src/game_api.cpp src/guest_hooks.cpp src/hooks.cpp src/host_input.cpp src/library.cpp src/midasm.cpp src/mods.cpp src/native_loader.cpp src/platform.cpp src/rexfabric.cpp src/settings.cpp src/switches.cpp
     src/lua/lua_console.cpp src/lua/lua_content.cpp src/lua/lua_definitions.cpp src/lua/lua_game.cpp src/lua/lua_host.cpp src/lua/lua_rex.cpp src/lua/lua_timers.cpp src/lua/lua_vm.cpp src/lua/lua_world_data.cpp
     src/net/http.cpp src/net/mod_channel.cpp src/net/thunderstore.cpp
-    src/ui/asset_editors.cpp src/ui/avatar_viewport.cpp src/ui/editor_parts.cpp src/ui/material_graph_editor.cpp src/ui/content_browser.cpp src/ui/file_picker.cpp src/ui/image_decode.cpp src/ui/imgui_menu.cpp src/ui/lua_console_window.cpp src/ui/map_edit_world.cpp src/ui/menu_model.cpp src/ui/screen_text.cpp src/ui/value_widgets.cpp src/ui/widgets.cpp src/ui/world_mesh_editors.cpp
+    src/ui/asset_editors.cpp src/ui/avatar_viewport.cpp src/ui/editor_parts.cpp src/ui/material_graph_editor.cpp src/ui/content_browser.cpp src/ui/file_picker.cpp src/ui/game_asset_editor.cpp src/ui/image_decode.cpp src/ui/imgui_menu.cpp src/ui/lua_console_window.cpp src/ui/map_edit_world.cpp src/ui/menu_model.cpp src/ui/screen_text.cpp src/ui/thumbnails.cpp src/ui/value_widgets.cpp src/ui/widgets.cpp src/ui/world_mesh_editors.cpp
   )
   if(arg_WITH_GUIDE)
     list(APPEND sources src/ui/guide_menu.cpp)
@@ -161,7 +161,7 @@ function(rexfabric_attach target)
   if(arg_WITH_NODE_EDITOR)
     list(APPEND sources
       src/graph/graph.cpp src/graph/graph_document.cpp src/graph/graph_file.cpp src/graph/lua_compiler.cpp src/graph/node_library.cpp src/graph/nodes_builtin.cpp src/graph/nodes_content.cpp src/graph/nodes_game.cpp src/graph/nodes_api.cpp
-      src/ui/node_editor.cpp src/ui/node_graph_style.cpp src/ui/node_graph_widgets.cpp
+      src/ui/graph_view.cpp src/ui/node_editor.cpp src/ui/node_graph_style.cpp src/ui/node_graph_widgets.cpp src/ui/own_graph.cpp
     )
     rexfabric_link_imgui_node_editor(${target})
     target_compile_definitions(${target} PRIVATE REXFABRIC_WITH_NODE_EDITOR=1)

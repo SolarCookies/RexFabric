@@ -141,14 +141,16 @@ void RegistryTable(lua_State* L, const char* key) {
 std::string CallerMod(lua_State* L) {
   const VM& vm = Vm();
   if (!vm.loading_mod.empty()) return vm.loading_mod;
-  // The innermost Lua function on the stack that lives in a mod's scripts folder.
+  // The innermost Lua function on the stack that lives in a mod's scripts folder, or that is a game asset's graph
+  // compiled beside the asset in the mod's content folder (the first content folder in its path is the mod's).
   lua_Debug ar;
   for (int level = 0; lua_getstack(L, level, &ar); ++level) {
     lua_getinfo(L, "S", &ar);
     const std::string_view source = ar.source ? ar.source : "";
-    const size_t scripts = source.rfind("/scripts/");
-    if (source.empty() || source.front() != '@' || scripts == std::string_view::npos) continue;
-    const std::string_view mod_dir = source.substr(0, scripts);
+    size_t folder = source.rfind("/scripts/");
+    if (folder == std::string_view::npos && source.ends_with(".graph.lua")) folder = source.find("/content/");
+    if (source.empty() || source.front() != '@' || folder == std::string_view::npos) continue;
+    const std::string_view mod_dir = source.substr(0, folder);
     return std::string(mod_dir.substr(mod_dir.rfind('/') + 1));
   }
   return "lua";
@@ -183,6 +185,8 @@ void Start(const std::vector<ModInfo>& mods) {
     if (vm.L) DrainCvarChanges(vm.L);
   });
 
+  // The avatars already there (the saved ones a reload keeps) are new to these scripts: their class graphs start each.
+  content::AnnounceAvatars();
   for (const auto& [mod, files] : scripted) {
     ScriptMod& record = loaded.emplace_back(ScriptMod{mod->folder});
     for (const std::filesystem::path& file : files) {

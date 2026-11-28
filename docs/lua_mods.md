@@ -88,7 +88,13 @@ A cvar a mod defines shows in the settings and is saved like any other. `rex.cva
 ```lua
 rex.on("frame", function(seconds) end)              -- every frame, with the seconds since the last
 rex.on("tip.garden_loaded", function(garden) end)   -- events the game declares
+rex.on("avatar_tick", function(avatar, seconds) end) -- every avatar of a mod's class, every frame
 ```
+
+Avatars of mods' classes have events of their own: RexFabric's `avatar_spawned(avatar)`, `avatar_tick(avatar,
+seconds)` and `avatar_removed(avatar)`, and the ones the game declares for its classes (`tip.avatar_interacted(avatar,
+button)`). Each comes with the avatar first, as rex.content gives one, and an avatar class's own graph runs them for its
+avatars (content_and_classes.md, Class graphs).
 
 ## Timers
 

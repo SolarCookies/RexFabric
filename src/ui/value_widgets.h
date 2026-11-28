@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,9 @@ struct TypeChoices {
   std::vector<std::string> map_edits;  // the map edit assets, for an asset of the class MapEdit
   std::vector<std::string> meshes;     // the mesh assets, for an asset of the class Mesh
   std::vector<std::string> worlds;     // the mods' worlds, for an asset of the class World
-  std::vector<std::string> packets;    // the game's packets and the mods', for an asset of the class Packet
+  // The assets of each of the game's asset types, its own and the mods', by the type's path in lower case, for an asset
+  // of that type's class.
+  std::map<std::string, std::vector<std::string>> game_assets;
 };
 
 // Picks from `paths`, with a search box at the list's top; `none` adds an entry for nothing. True when one was picked.

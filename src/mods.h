@@ -104,7 +104,8 @@ void NoteModsChanged();
 // plugins folder, sorted by name.
 std::vector<std::filesystem::path> NativePlugins(const std::filesystem::path& dir);
 
-// The Lua files a mod runs: every .lua directly in its scripts folder, by name. Subfolders are for require.
+// The Lua files a mod runs: every .lua directly in its scripts folder, by name (subfolders are for require), then the
+// game assets' compiled graphs in its content folder (Name.graph.lua beside Name.json), by path.
 std::vector<std::filesystem::path> LuaScripts(const std::filesystem::path& dir);
 
 }  // namespace rexfabric

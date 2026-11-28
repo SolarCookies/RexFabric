@@ -31,7 +31,8 @@ inline constexpr std::string_view kContentFolder = "content";
 inline constexpr std::string_view kAssetExtension = ".json";
 
 // What an asset file holds, by its "asset". Files of kinds RexFabric doesn't know are kOther.
-enum class AssetKind { kClass, kEnum, kStruct, kTable, kLanguage, kTexture, kMapEdit, kMaterial, kMesh, kWorld, kPacket, kOther };
+// kGame is an asset of one of the game's asset types (game_assets.h), the type in AssetInfo::type.
+enum class AssetKind { kClass, kEnum, kStruct, kTable, kLanguage, kTexture, kMapEdit, kMaterial, kMesh, kWorld, kGame, kOther };
 
 struct AssetInfo {
   std::string path;  // "MyMod/Garden/Rock"
@@ -39,6 +40,7 @@ struct AssetInfo {
   std::filesystem::path file;
   AssetKind kind = AssetKind::kOther;
   std::string parent;  // a class's parent, as its file names it
+  std::string type;    // a game asset's type ("TiP/Packet")
 };
 
 // One mod's content: every folder in it and every asset, each sorted by path.
@@ -130,28 +132,6 @@ struct WorldAsset {
   bool operator==(const WorldAsset& other) const = default;
 };
 
-// A packet (docs/content_and_classes.md, Packets), an asset of the class Packet: a kind of ground a player buys and
-// pours, a variant of one of the game's own kinds (its base) that looks and sells as it says. Its name and help are
-// texts, translated as every mod text is.
-struct PacketAsset {
-  std::string base;  // a value of the game's packet base enum, by name
-  std::string name;
-  std::string help;
-  std::string icon;  // a Texture asset
-  nlohmann::json look = nlohmann::json::object();  // a value of the base's look struct
-  PacketUnlock unlock = PacketUnlock::kDefault;
-  int64_t level = 0;
-  int64_t price = 0;
-  double order = 0.0;
-  nlohmann::json rest = nlohmann::json::object();
-
-  bool operator==(const PacketAsset& other) const = default;
-};
-
-// What a packet file's "unlock" says.
-inline constexpr std::string_view kPacketUnlockDefault = "Default";
-inline constexpr std::string_view kPacketUnlockShop = "Shop";
-
 // One change a map edit makes to its world (docs/content_and_classes.md, Map edits): RexFabric's own Spawn, an avatar
 // of a class placed there, or one of the kinds the game declares (DeclareMapEditKind).
 inline constexpr std::string_view kSpawnEdit = "Spawn";
@@ -213,6 +193,9 @@ std::string_view ModOf(std::string_view path);
 std::string_view FolderOf(std::string_view path);
 std::string_view NameOf(std::string_view path);
 
+// Whether "asset" names one of RexFabric's own kinds ("class", "texture"), which no game asset type may take.
+bool IsBuiltInKind(std::string_view kind);
+
 // Reads a mod's content folder. Names that aren't valid are left out, as the loaders skip them.
 ModContent ScanContent(const ModInfo& mod);
 
@@ -241,9 +224,6 @@ bool SetMeshModel(const std::filesystem::path& asset_file, const std::filesystem
 
 std::optional<WorldAsset> ReadWorldAsset(const std::filesystem::path& file, std::string* error);
 bool WriteWorldAsset(const std::filesystem::path& file, const WorldAsset& asset, std::string* error);
-
-std::optional<PacketAsset> ReadPacketAsset(const std::filesystem::path& file, std::string* error);
-bool WritePacketAsset(const std::filesystem::path& file, const PacketAsset& asset, std::string* error);
 
 std::optional<MapEditAsset> ReadMapEditAsset(const std::filesystem::path& file, std::string* error);
 bool WriteMapEditAsset(const std::filesystem::path& file, const MapEditAsset& asset, std::string* error);
@@ -291,8 +271,9 @@ bool CreateTexture(const ModInfo& mod, std::string_view folder, std::string_view
 bool CreateMesh(const ModInfo& mod, std::string_view folder, std::string_view name, const std::filesystem::path& source, std::string* error);
 // A new world on the game's world `base`.
 bool CreateWorld(const ModInfo& mod, std::string_view folder, std::string_view name, std::string_view base, std::string* error);
-// A new packet of the game's packet base `base`, unlocked by default.
-bool CreatePacket(const ModInfo& mod, std::string_view folder, std::string_view name, std::string_view base, std::string* error);
+// A new asset of the game's asset type `type`, with `values` for the fields it's created with; its name goes into the
+// type's name field when `values` doesn't set it.
+bool CreateGameAsset(const ModInfo& mod, std::string_view folder, std::string_view name, std::string_view type, const nlohmann::json& values, std::string* error);
 // Copies an asset beside itself, under a free name ("Rock_Copy", "Rock_Copy2"); `made` is the copy's path.
 bool Duplicate(const ModInfo& mod, std::string_view path, std::string* made, std::string* error);
 // Renames an asset or folder, or moves it to another folder of the same mod, and makes every asset of every mod

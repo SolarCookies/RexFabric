@@ -8,6 +8,12 @@
 #define STBI_NO_STDIO
 #include <stb_image.h>
 
+// The same for the writer, RexFabric's own copy (thirdparty/stb), which content/textures.cpp has a copy of too.
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBI_WRITE_NO_STDIO
+#include <stb/stb_image_write.h>
+
 namespace rexfabric::ui {
 
 std::vector<uint8_t> DecodeImageRGBA(const uint8_t* data, size_t size, int& width, int& height) {
@@ -24,6 +30,18 @@ std::vector<uint8_t> DecodeImageRGBA(const uint8_t* data, size_t size, int& widt
   std::vector<uint8_t> rgba(pixels, pixels + static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
   stbi_image_free(pixels);
   return rgba;
+}
+
+std::vector<uint8_t> EncodePngRGBA(const uint8_t* rgba, int width, int height) {
+  if (!rgba || width <= 0 || height <= 0) return {};
+  std::vector<uint8_t> png;
+  const auto write = [](void* context, void* data, int size) {
+    auto* out = static_cast<std::vector<uint8_t>*>(context);
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    out->insert(out->end(), bytes, bytes + size);
+  };
+  if (stbi_write_png_to_func(write, &png, width, height, 4, rgba, width * 4) == 0) return {};
+  return png;
 }
 
 }  // namespace rexfabric::ui

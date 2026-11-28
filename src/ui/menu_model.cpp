@@ -30,6 +30,9 @@ namespace {
 
 // Thunderstore icons kept around for paging back and forth.
 constexpr size_t kMaxPackageIcons = 96;
+// How many polls a picture made in code is kept without being asked for: long after its editor closed, so it's never
+// one the frame being drawn holds.
+constexpr uint64_t kCodePictureFrames = 300;
 
 std::vector<uint8_t> ReadFile(const std::filesystem::path& file) {
   std::ifstream in(file, std::ios::binary);
@@ -84,6 +87,7 @@ void MenuModel::Poll() {
     }
   }
   retired_.clear();
+  std::erase_if(code_pictures_, [this](const auto& entry) { return frame_ - entry.second.used > kCodePictureFrames; });
   // Something changed the mods since the last scan: an install, or the game.
   if (ModsRevision() != seen_revision_) {
     seen_revision_ = ModsRevision();
@@ -162,6 +166,31 @@ MenuModel::Picture MenuModel::AssetPicture(const std::filesystem::path& file) {
     picture.texture = MakeTexture(ReadFile(file), &picture.width, &picture.height);
   }
   return picture.texture ? Picture{picture.texture->id(), picture.width, picture.height} : Picture{};
+}
+
+ImTextureID MenuModel::CodePicture(const std::string& key, uint64_t version, uint32_t width, uint32_t height, std::span<const uint8_t> rgba) {
+  auto [it, added] = code_pictures_.try_emplace(key);
+  CodeImage& picture = it->second;
+  picture.used = frame_;
+  // Made once per version, made or not, so pixels that can't be made into one aren't tried every frame.
+  if (added || picture.version != version) {
+    if (picture.texture) retired_.push_back(std::move(picture.texture));
+    picture.version = version;
+    const bool filled = width > 0 && height > 0 && rgba.size() >= static_cast<size_t>(width) * height * 4;
+    const ImTextureID id = filled && images_.create ? images_.create(width, height, rgba.data()) : ImTextureID_Invalid;
+    if (id != ImTextureID_Invalid) picture.texture = std::make_unique<Texture>(images_, id);
+  }
+  return picture.texture ? picture.texture->id() : ImTextureID_Invalid;
+}
+
+std::unique_ptr<MenuModel::Texture> MenuModel::UploadPicture(uint32_t width, uint32_t height, std::span<const uint8_t> rgba) {
+  const bool filled = width > 0 && height > 0 && rgba.size() >= static_cast<size_t>(width) * height * 4;
+  const ImTextureID id = filled && images_.create ? images_.create(width, height, rgba.data()) : ImTextureID_Invalid;
+  return id != ImTextureID_Invalid ? std::make_unique<Texture>(images_, id) : nullptr;
+}
+
+void MenuModel::Retire(std::unique_ptr<Texture> texture) {
+  if (texture) retired_.push_back(std::move(texture));
 }
 
 ImTextureID MenuModel::ModIcon(const ModInfo& mod) {

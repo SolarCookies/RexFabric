@@ -4,10 +4,12 @@
 #include <cctype>
 #include <cstdlib>
 
+#include <rexfabric/content.h>
 #include <rexfabric/game_api.h>
 
 #include <map>
 #include <mutex>
+#include <set>
 
 #include "../content/classes.h"
 #include "../content/types.h"
@@ -271,6 +273,89 @@ Routine& CreateRoutine(Graph& graph, RoutineKind kind, std::string name) {
   graph.AddNode(std::string(kRoutineExit), 360.0f, 0.0f).owner = id;
   return *graph.FindRoutine(id);
 }
+
+namespace {
+
+// Event nodes placed down the left of a graph: a node's height and a gap apart.
+constexpr float kEventSpacing = 160.0f;
+
+}  // namespace
+
+std::string AssetEventNode(std::string_view event) { return std::string(kAssetEventPrefix) + std::string(event); }
+
+bool IsAssetEvent(const Node& node) { return node.type.starts_with(kAssetEventPrefix); }
+
+bool PlaceEventNodes(Graph& graph, const std::vector<std::string>& types) {
+  bool added = false;
+  float y = 0.0f;
+  for (const std::string& type : types) {
+    const auto placed = std::find_if(graph.nodes().begin(), graph.nodes().end(), [&type](const Node& node) { return node.owner == 0 && node.type == type && !IsFieldEvent(node); });
+    if (placed != graph.nodes().end()) {
+      y = std::max(y, placed->y + kEventSpacing);
+      continue;
+    }
+    graph.AddNode(type, 0.0f, y);
+    y += kEventSpacing;
+    added = true;
+  }
+  return added;
+}
+
+bool IsFieldEvent(const Node& node) { return IsAssetEvent(node) && node.settings.contains(kMatchSetting); }
+
+std::vector<std::string> MatchOf(const Node& node) {
+  std::vector<std::string> match;
+  if (!IsFieldEvent(node)) return match;
+  const nlohmann::json values = nlohmann::json::parse(node.Setting(kMatchSetting), nullptr, false);
+  if (!values.is_array()) return match;
+  for (const nlohmann::json& value : values) match.push_back(value.is_string() ? value.get<std::string>() : value.dump());
+  return match;
+}
+
+bool PlaceFieldEvents(Graph& graph, const std::vector<content::AssetEventDecl>& events) {
+  using Key = std::pair<std::string, std::vector<std::string>>;
+  const auto wanted = [&events](const Key& key) { return std::find_if(events.begin(), events.end(), [&key](const content::AssetEventDecl& event) { return AssetEventNode(event.event) == key.first && event.match == key.second; }); };
+  bool changed = false;
+  // The ones the fields still give keep their place and links, their titles as the fields say; the rest go, and so
+  // does a second node of one, which would run its chain twice.
+  std::set<Key> placed;
+  std::vector<int> gone;
+  for (Node& node : graph.nodes()) {
+    if (node.owner != 0 || !IsFieldEvent(node)) continue;
+    Key key{node.type, MatchOf(node)};
+    const auto event = wanted(key);
+    if (event == events.end() || !placed.insert(std::move(key)).second) {
+      gone.push_back(node.id);
+      continue;
+    }
+    if (node.Setting(kTitleSetting) == event->title) continue;
+    if (event->title.empty()) node.settings.erase(std::string(kTitleSetting));
+    else node.settings[std::string(kTitleSetting)] = event->title;
+    changed = true;
+  }
+  for (int id : gone) graph.RemoveNode(id);
+  changed |= !gone.empty();
+  // The new ones below every event node down the left, fixed or made from the fields.
+  float y = 0.0f;
+  for (const Node& node : graph.nodes()) {
+    if (node.owner == 0 && IsAssetEvent(node)) y = std::max(y, node.y + kEventSpacing);
+  }
+  for (const content::AssetEventDecl& event : events) {
+    if (!placed.insert({AssetEventNode(event.event), event.match}).second) continue;
+    Node& node = graph.AddNode(AssetEventNode(event.event), 0.0f, y);
+    node.settings[std::string(kMatchSetting)] = nlohmann::json(event.match).dump();
+    if (!event.title.empty()) node.settings[std::string(kTitleSetting)] = event.title;
+    y += kEventSpacing;
+    changed = true;
+  }
+  return changed;
+}
+
+std::string ClassEventNode(std::string_view event) { return std::string(kClassEventPrefix) + std::string(event); }
+
+bool IsClassEvent(const Node& node) { return node.type.starts_with(kClassEventPrefix); }
+
+std::string ClassEventOf(const Node& node) { return IsClassEvent(node) ? node.type.substr(kClassEventPrefix.size()) : std::string(); }
 
 void RenameRoutine(Graph& graph, int id, const std::string& name) {
   Routine* routine = graph.FindRoutine(id);

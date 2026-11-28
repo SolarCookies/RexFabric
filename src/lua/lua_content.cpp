@@ -19,9 +19,22 @@
 //   local glow = rex.content.spawn("MyMod/Glow", x, y, z, yaw)          -- yaw in degrees
 //   glow.x = glow.x + 2; glow:set("brightness", 3); glow:remove()
 //   rex.content.spawn("MyMod/Statue", x, y, z, 0, {saved = true})      -- kept in the world's save
+//   rex.content.script_asset()                                          -- "MyMod/Leaves/Maze" in that asset's own graph
+//
+// An avatar class's own graph (docs/content_and_classes.md, Class graphs) runs through on_class, which runs the handler
+// of the avatar's nearest class that has one, and keeps each avatar's own variables with own:
+//
+//   rex.content.on_class(Class, "avatar_tick", function(Self, seconds) ... end)
+//   rex.content.call_parent(Class, "avatar_tick", Self, seconds)       -- the handler of the nearest class above Class
+//   local My = rex.content.own(Self, Class, Fresh)                      -- Fresh() the first time, kept until it's gone
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <exception>
+#include <vector>
 #include <string>
+#include <string_view>
 
 #include "../content/avatars.h"
 #include "../content/classes.h"
@@ -287,11 +300,6 @@ struct AvatarUD {
   uint32_t id;
 };
 
-void PushAvatar(lua_State* L, uint32_t id) {
-  auto* avatar = static_cast<AvatarUD*>(lua_newuserdata(L, sizeof(AvatarUD)));
-  avatar->id = id;
-  luaL_setmetatable(L, kAvatarMeta);
-}
 
 AvatarUD* TestAvatar(lua_State* L, int arg) { return static_cast<AvatarUD*>(luaL_testudata(L, arg, kAvatarMeta)); }
 
@@ -520,6 +528,145 @@ int Avatars(lua_State* L) {
   return 1;
 }
 
+// rex.content.avatar(value): the avatar a value stands for, an avatar or its id (as the game fires class events with),
+// while it's there; nil for anything else.
+int AvatarFromValue(lua_State* L) {
+  uint32_t id = 0;
+  if (const AvatarUD* avatar = TestAvatar(L, 1)) id = avatar->id;
+  else if (lua_isinteger(L, 1) && lua_tointeger(L, 1) > 0 && lua_tointeger(L, 1) <= UINT32_MAX) id = static_cast<uint32_t>(lua_tointeger(L, 1));
+  if (id == 0 || content::ClassOfAvatar(id).empty()) lua_pushnil(L);
+  else PushAvatar(L, id);
+  return 1;
+}
+
+// Class graphs ---------------------------------------------------------------------------------------------
+
+// Each avatar event's handlers, by event, then by the lower case path of the class whose graph it's from.
+constexpr const char* kClassEventsTable = "rexfabric.class_events";
+// Each avatar's own tables (rex.content.own), by its id, then by key; dropped once the avatar is gone.
+constexpr const char* kOwnTable = "rexfabric.avatar_own";
+
+std::string Lower(std::string_view text) {
+  std::string lower(text);
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return lower;
+}
+
+// Runs the handler of `event` of the first of `classes` that has one, with the values from `first` to the top of the
+// stack (the avatar, then the event's own). Nothing when none has one.
+void RunHandler(lua_State* L, const char* event, const std::vector<std::string>& classes, int first) {
+  const int last = lua_gettop(L);
+  RegistryTable(L, kClassEventsTable);
+  lua_getfield(L, -1, event);
+  if (lua_istable(L, -1)) {
+    for (const std::string& path : classes) {
+      lua_getfield(L, -1, Lower(path).c_str());
+      if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        continue;
+      }
+      for (int at = first; at <= last; ++at) lua_pushvalue(L, at);
+      lua_call(L, last - first + 1, 0);
+      break;
+    }
+  }
+  lua_settop(L, last);
+}
+
+// The listener on_class puts on an avatar event: the handler of the avatar's own class, or of the nearest class above
+// it that has one, as a blueprint's event runs its most derived override. Its upvalue is the event's name.
+int RunClassEvent(lua_State* L) {
+  const AvatarUD* avatar = TestAvatar(L, 1);
+  const std::string path = avatar ? content::ClassOfAvatar(avatar->id) : std::string();
+  if (!path.empty()) RunHandler(L, lua_tostring(L, lua_upvalueindex(1)), content::AncestryOf(path), 1);
+  return 0;
+}
+
+// rex.content.on_class(class, event, fn): fn(avatar, ...) runs when `event` (an avatar event) is fired for an avatar of
+// the class or a class below it, unless a class between them has a handler of its own for it, which runs instead.
+int OnClass(lua_State* L) {
+  const std::string path = luaL_checkstring(L, 1);
+  const std::string event = luaL_checkstring(L, 2);
+  luaL_checktype(L, 3, LUA_TFUNCTION);
+  if (!content::IsAvatarEvent(event)) return luaL_argerror(L, 2, "an event of avatars: RexFabric's own, or one a game class declares");
+  RegistryTable(L, kClassEventsTable);
+  lua_getfield(L, -1, event.c_str());
+  const bool first = !lua_istable(L, -1);
+  if (first) {
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, -3, event.c_str());
+  }
+  lua_pushvalue(L, 3);
+  lua_setfield(L, -2, Lower(path).c_str());
+  lua_pop(L, 2);
+  if (!first) return 0;
+  // One listener for the event, through rex.on, so it goes with the scripts as theirs do.
+  lua_getglobal(L, "rex");
+  lua_getfield(L, -1, "on");
+  lua_pushstring(L, event.c_str());
+  lua_pushstring(L, event.c_str());
+  lua_pushcclosure(L, RunClassEvent, 1);
+  lua_call(L, 2, 0);
+  lua_pop(L, 1);
+  return 0;
+}
+
+// rex.content.call_parent(class, event, avatar, ...): the handler of `event` of the nearest class above `class` that
+// has one, as a blueprint's Parent node runs the event it overrides. Nothing when none has.
+int CallParent(lua_State* L) {
+  const std::string path = luaL_checkstring(L, 1);
+  const char* event = luaL_checkstring(L, 2);
+  if (!TestAvatar(L, 3)) return luaL_argerror(L, 3, "an avatar of a mod's class");
+  std::vector<std::string> above = content::AncestryOf(path);
+  if (!above.empty()) above.erase(above.begin());
+  RunHandler(L, event, above, 3);
+  return 0;
+}
+
+// rex.content.own(avatar, key, make): the avatar's own table under `key` (a class graph's is its class), kept for as
+// long as the avatar is there: make() gives it the first time it's asked for (an empty table without a make), and it's
+// dropped once the avatar is gone. An error for an avatar that's gone.
+int Own(lua_State* L) {
+  const auto* avatar = static_cast<AvatarUD*>(luaL_checkudata(L, 1, kAvatarMeta));
+  const char* key = luaL_checkstring(L, 2);
+  if (content::ClassOfAvatar(avatar->id).empty()) return luaL_error(L, "the avatar is gone");
+  RegistryTable(L, kOwnTable);
+  lua_rawgeti(L, -1, avatar->id);
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    lua_rawseti(L, -3, avatar->id);
+  }
+  lua_getfield(L, -1, key);
+  if (lua_istable(L, -1)) return 1;
+  lua_pop(L, 1);
+  if (lua_isnoneornil(L, 3)) {
+    lua_newtable(L);
+  } else {
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+    lua_pushvalue(L, 3);
+    lua_call(L, 0, 1);
+    if (!lua_istable(L, -1)) return luaL_error(L, "make gave a %s, not a table", luaL_typename(L, -1));
+  }
+  lua_pushvalue(L, -1);
+  lua_setfield(L, -3, key);
+  return 1;
+}
+
+// An avatar is gone for good: its own tables go too.
+void ForgetOwn(uint32_t id) {
+  VM& vm = Vm();
+  std::lock_guard lock(vm.mutex);
+  if (!vm.L) return;
+  RegistryTable(vm.L, kOwnTable);
+  lua_pushnil(vm.L);
+  lua_rawseti(vm.L, -2, id);
+  lua_pop(vm.L, 1);
+}
+
 // The value as an object of a type or class, or nil when it isn't one: the cast node's Lua. An avatar is one of its class
 // and the mod classes above it, and as a game type or class it's its backing's object; a game object is one of a mod's
 // class when it's the object of an avatar of it.
@@ -629,15 +776,44 @@ int ValidName(lua_State* L) {
   return 2;
 }
 
+// The game asset whose own graph the calling script is: the script compiled beside the asset in its mod's content
+// folder ("mods/MyMod/content/Leaves/Maze.graph.lua" is "MyMod/Leaves/Maze"), so a renamed or copied asset's graph
+// knows its asset without being compiled again. Nil for any other script.
+int ScriptAsset(lua_State* L) {
+  constexpr std::string_view kContent = "/content/";
+  constexpr std::string_view kGraphScript = ".graph.lua";
+  lua_Debug ar;
+  for (int level = 1; lua_getstack(L, level, &ar); ++level) {
+    lua_getinfo(L, "S", &ar);
+    const std::string_view source = ar.source ? ar.source : "";
+    const size_t content = source.find(kContent);
+    if (source.empty() || source.front() != '@' || !source.ends_with(kGraphScript) || content == std::string_view::npos) continue;
+    const std::string_view mod_dir = source.substr(0, content);
+    const std::string_view inside = source.substr(content + kContent.size(), source.size() - content - kContent.size() - kGraphScript.size());
+    const std::string asset = std::string(mod_dir.substr(mod_dir.rfind('/') + 1)) + "/" + std::string(inside);
+    lua_pushstring(L, asset.c_str());
+    return 1;
+  }
+  lua_pushnil(L);
+  return 1;
+}
+
 constexpr luaL_Reg kContentFuncs[] = {
     {"classes", Classes}, {"class", Class}, {"is_a", IsA}, {"properties", Properties}, {"default", Default}, {"cast", Cast}, {"valid_name", ValidName},
     {"enums", Enums}, {"enum", EnumOf}, {"structs", Structs}, {"struct", StructOf},
     {"tables", Tables}, {"table", TableOf}, {"row", Row}, {"row_names", RowNames}, {"has_row", HasRow},
-    {"spawn", Spawn}, {"remove", Remove}, {"is_avatar", IsAvatar}, {"avatars", Avatars},
+    {"spawn", Spawn}, {"remove", Remove}, {"is_avatar", IsAvatar}, {"avatars", Avatars}, {"avatar", AvatarFromValue},
+    {"script_asset", ScriptAsset}, {"on_class", OnClass}, {"call_parent", CallParent}, {"own", Own},
     {nullptr, nullptr},
 };
 
 }  // namespace
+
+void PushAvatar(lua_State* L, uint32_t id) {
+  auto* avatar = static_cast<AvatarUD*>(lua_newuserdata(L, sizeof(AvatarUD)));
+  avatar->id = id;
+  luaL_setmetatable(L, kAvatarMeta);
+}
 
 bool AvatarObject(lua_State* L, int arg, Object& object) {
   const AvatarUD* avatar = TestAvatar(L, arg);
@@ -660,6 +836,7 @@ void OpenContent(lua_State* L) {
   lua_pop(L, 1);
   luaL_newlib(L, kContentFuncs);
   lua_setfield(L, -2, "content");
+  content::OnAvatarGone(ForgetOwn);
 }
 
 }  // namespace rexfabric::lua

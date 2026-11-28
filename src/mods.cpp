@@ -375,6 +375,15 @@ std::vector<std::filesystem::path> NativePlugins(const std::filesystem::path& di
 std::vector<std::filesystem::path> LuaScripts(const std::filesystem::path& dir) {
   std::vector<std::filesystem::path> scripts = FilesWith(dir / "scripts", [](const std::string& extension) { return extension == ".lua"; });
   std::sort(scripts.begin(), scripts.end());
+  // Then the game assets' own graphs, each compiled beside its asset ("Leaf.graph.lua" for Leaf.json), so it moves,
+  // is copied and goes with the asset.
+  std::vector<std::filesystem::path> graphs;
+  std::error_code error;
+  for (auto it = std::filesystem::recursive_directory_iterator(dir / "content", error); !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+    if (it->is_regular_file(error) && Lower(it->path().filename().string()).ends_with(".graph.lua")) graphs.push_back(it->path());
+  }
+  std::sort(graphs.begin(), graphs.end());
+  scripts.insert(scripts.end(), graphs.begin(), graphs.end());
   return scripts;
 }
 

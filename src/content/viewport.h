@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 
 #include <rexfabric/content.h>
@@ -17,5 +18,9 @@ std::optional<ViewportImage> ShowViewport(uint64_t viewport, const ViewportView&
 
 // The viewport is gone: the renderer may let go of what it made for it.
 void CloseViewport(uint64_t viewport);
+
+// Asks the renderer for a picture of `view` (ViewportRenderer::capture), `done` called on any thread once it has it.
+// False, and `done` never called, when there's no renderer or it makes no pictures. UI thread.
+bool CaptureViewport(uint64_t viewport, const ViewportView& view, double seconds, std::function<void(ViewportCapture)> done);
 
 }  // namespace rexfabric::content

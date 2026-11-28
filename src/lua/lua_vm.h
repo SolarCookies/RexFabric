@@ -49,6 +49,8 @@ void OpenContent(lua_State* L);
 // Whether the value at `arg` is an avatar of a mod's class; with its backing's game object, none for a gone avatar or
 // a backing that's only a place.
 bool AvatarObject(lua_State* L, int arg, Object& object);
+// Pushes the handle of an avatar of a mod's class, by its id, as rex.content gives one.
+void PushAvatar(lua_State* L, uint32_t id);
 void OpenHost(lua_State* L);
 // The game's namespaces, as globals.
 void OpenGame(lua_State* L);

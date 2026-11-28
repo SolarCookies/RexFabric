@@ -13,7 +13,6 @@
 #include <nlohmann/json.hpp>
 
 #include "../content/map_edits.h"
-#include "../content/packets.h"
 #include "../content/types.h"
 #include "editor_parts.h"
 #include "file_picker.h"
@@ -211,102 +210,6 @@ class WorldEditor final : public DocumentEditor<content::WorldAsset> {
   }
 };
 
-class PacketEditor final : public DocumentEditor<content::PacketAsset> {
- public:
-  PacketEditor(EditorHost& host, std::string path, content::PacketAsset asset) : DocumentEditor(host, std::move(path), std::move(asset)) {}
-
-  bool Save() override {
-    const std::optional<std::filesystem::path> file = File();
-    std::string error;
-    if (!file || !content::WritePacketAsset(*file, document_, &error)) {
-      if (file) SetStatus(error, true);
-      return false;
-    }
-    MarkSaved();
-    host_.Saved(path_);
-    SavedStatus(!Problem().empty());
-    return true;
-  }
-
- protected:
-  std::string Title() const override { return std::string(content::NameOf(path_)) + " (packet)"; }
-
-  void DrawContents() override {
-    DrawToolbar(CanUndo(), CanRedo());
-    const TypeChoices choices = host_.Choices(content::ModOf(path_));
-    if (BeginLabelTable("##packet")) {
-      DrawBase();
-      LabelRow("Name");
-      widgets::InputString("##name", document_.name, 0, "Shown where it's picked and sold");
-      LabelRow("Help");
-      widgets::InputString("##help", document_.help, 0, "What the shop says of it");
-      LabelRow("Icon");
-      nlohmann::json icon = document_.icon.empty() ? nlohmann::json() : nlohmann::json(document_.icon);
-      if (ValueField("##icon", {.type = content::PropertyType::kAsset, .of = std::string(kTextureClass)}, icon, host_.Types(), choices)) document_.icon = icon.is_string() ? icon.get<std::string>() : std::string();
-      ImGui::SetItemTooltip("The picture on its star menu leaf and its shop reel");
-      LabelRow("Look");
-      const std::string look = content::PacketLookStruct(document_.base);
-      if (look.empty()) ImGui::TextDisabled("Its base has no look to set");
-      else ValueField("##look", {.type = content::PropertyType::kStruct, .of = look}, document_.look, host_.Types(), choices);
-      DrawUnlock();
-      LabelRow("Order");
-      ImGui::InputDouble("##order", &document_.order, 1.0, 10.0, "%g");
-      ImGui::SetItemTooltip("Where it sorts among its mod's packets, lower first; equal ones by path");
-      ImGui::EndTable();
-    }
-    if (const std::string problem = Problem(); !problem.empty()) ImGui::TextColored(widgets::kErrorColor, "%s", problem.c_str());
-    ImGui::TextDisabled("It pours, grows and counts as its base does; the look and the unlock are its own.");
-    Remember();
-  }
-
- private:
-  static constexpr std::string_view kTextureClass = "Texture";
-
-  // The base, from the game's packet base enum. A new base starts its look over, as each base's look is its own.
-  void DrawBase() {
-    LabelRow("Pours as");
-    const std::optional<content::Enum> bases = content::FindEnum(content::PacketBaseEnum());
-    if (ImGui::BeginCombo("##base", document_.base.empty() ? "Pick a base" : document_.base.c_str())) {
-      for (const content::EnumValue& base : bases ? bases->values : std::vector<content::EnumValue>{}) {
-        if (ImGui::Selectable(base.name.c_str(), base.name == document_.base) && base.name != document_.base) {
-          document_.base = base.name;
-          document_.look = nlohmann::json::object();
-        }
-        if (!base.help.empty()) ImGui::SetItemTooltip("%s", base.help.c_str());
-      }
-      ImGui::EndCombo();
-    }
-    ImGui::SetItemTooltip("The game's packet it's a variant of");
-  }
-
-  void DrawUnlock() {
-    LabelRow("Unlock");
-    const bool shop = document_.unlock == content::PacketUnlock::kShop;
-    if (ImGui::BeginCombo("##unlock", shop ? "In the shop" : "By default")) {
-      if (ImGui::Selectable("By default", !shop)) document_.unlock = content::PacketUnlock::kDefault;
-      ImGui::SetItemTooltip("Every player has it from the start");
-      if (ImGui::Selectable("In the shop", shop)) document_.unlock = content::PacketUnlock::kShop;
-      ImGui::SetItemTooltip("Bought in the shop, from its level, for its price");
-      ImGui::EndCombo();
-    }
-    if (!shop) return;
-    LabelRow("Shop level");
-    ImGui::InputScalar("##level", ImGuiDataType_S64, &document_.level);
-    LabelRow("Price");
-    ImGui::InputScalar("##price", ImGuiDataType_S64, &document_.price);
-  }
-
-  std::string Problem() const {
-    if (document_.base.empty()) return "Pick the packet it pours as";
-    const std::optional<content::Enum> bases = content::FindEnum(content::PacketBaseEnum());
-    const bool known = bases && std::any_of(bases->values.begin(), bases->values.end(), [this](const content::EnumValue& value) { return value.name == document_.base; });
-    if (!known) return "\"" + document_.base + "\" isn't one of the game's packets";
-    if (document_.name.empty()) return "Give it a name";
-    if (document_.unlock == content::PacketUnlock::kShop && (document_.level < 0 || document_.price < 0)) return "Its shop level and price can't be below 0";
-    return {};
-  }
-};
-
 }  // namespace
 
 std::unique_ptr<AssetEditor> OpenMeshEditor(EditorHost& host, const std::string& path) {
@@ -319,12 +222,6 @@ std::unique_ptr<AssetEditor> OpenWorldEditor(EditorHost& host, const std::string
   const ModInfo* mod = host.model().mods().Find(content::ModOf(path));
   std::optional<content::WorldAsset> asset = mod ? content::ReadWorldAsset(content::AssetFile(*mod, path), nullptr) : std::nullopt;
   return asset ? std::make_unique<WorldEditor>(host, path, std::move(*asset)) : nullptr;
-}
-
-std::unique_ptr<AssetEditor> OpenPacketEditor(EditorHost& host, const std::string& path) {
-  const ModInfo* mod = host.model().mods().Find(content::ModOf(path));
-  std::optional<content::PacketAsset> asset = mod ? content::ReadPacketAsset(content::AssetFile(*mod, path), nullptr) : std::nullopt;
-  return asset ? std::make_unique<PacketEditor>(host, path, std::move(*asset)) : nullptr;
 }
 
 }  // namespace rexfabric::ui

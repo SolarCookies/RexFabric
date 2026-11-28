@@ -1,5 +1,6 @@
 // Nodes for content's enums, structs and data tables (docs/content_and_classes.md, Structs and enums, Data tables),
-// typed ones for maps, and avatars of mods' classes (Avatars).
+// typed ones for maps, avatars of mods' classes (Avatars), and an avatar class's own graph (Class graphs): its avatars'
+// events, Self, Call Parent and the avatar's property values.
 //
 // A struct's Make and Break, an enum's value and text, and a table's rows pick the struct, enum or table with a
 // setting, so the add menu offers one of each for every one the graph's mod may use, and they follow it as it changes.
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "../content/assets.h"
+#include "../content/classes.h"
 #include "../content/tables.h"
 #include "../content/types.h"
 #include "lua_compiler.h"
@@ -27,6 +29,8 @@ constexpr std::string_view kTableSetting = "Table";
 constexpr std::string_view kRowNamePin = "Row Name";
 constexpr std::string_view kClassSetting = "Class";
 constexpr std::string_view kAvatarPin = "Avatar";
+constexpr std::string_view kPropertySetting = "Property";
+constexpr std::string_view kSelf = "Self";
 
 // A key in a table constructor: name for a name Lua takes as one, ["odd name"] for the rest.
 std::string TableKey(const std::string& name) {
@@ -34,10 +38,10 @@ std::string TableKey(const std::string& name) {
   return member.starts_with(".") ? name : member;
 }
 
-// An input for a struct's field, its default typed in.
-Pin FieldPin(const content::Property& field) {
+// An input for a struct's field or a class's property, its default typed in: under the field's name unless given one.
+Pin FieldPin(const content::Property& field, std::string_view name = {}) {
   const PinType type = PinTypeOf(field.type);
-  Pin pin = ValuePin(field.name, type);
+  Pin pin = ValuePin(name.empty() ? std::string_view(field.name) : name, type);
   if (type.container == PinContainer::kSingle && type.kind != PinKind::kStruct && !field.value.is_null()) pin.initial = TypedValue(type.kind, field.value);
   return pin;
 }
@@ -340,6 +344,40 @@ std::vector<Pin> PlacePins() { return {DataPin("X", PinKind::kFloat, 0.0), DataP
 
 std::string PlaceArgs(Emitter& emit) { return emit.Input("X") + ", " + emit.Input("Y") + ", " + emit.Input("Z") + ", " + emit.Input("Yaw"); }
 
+namespace {
+
+// An avatar node's Avatar input: in a class graph it may be left unlinked, for Self, as a blueprint's Target is self.
+Pin AvatarPin(const Graph& graph) {
+  Pin pin = ObjectPin(kAvatarPin, "");
+  pin.required = graph.self_class().empty();
+  return pin;
+}
+
+// What the Avatar input brings, or Self when a class graph leaves it unlinked.
+std::string AvatarInput(Emitter& emit) { return emit.Linked(kAvatarPin) || !emit.ClassGraph() ? emit.Input(kAvatarPin) : std::string(kSelf); }
+
+// The property a Get Value or Set Value picks, of the class of the avatar it acts on; none when that class has no such.
+std::optional<content::Property> PickedProperty(const Node& node, const Graph& graph) {
+  const std::string name = SettingOf(node, kPropertySetting);
+  for (const content::Property& property : content::Properties(AvatarClassOf(node, graph))) {
+    if (property.name == name) return property;
+  }
+  return std::nullopt;
+}
+
+// The name of the property a node picks, or an error when the avatar's class has no such.
+std::string PropertyName(Emitter& emit) {
+  const std::string name = emit.Setting(kPropertySetting);
+  if (PickedProperty(emit.node(), emit.graph())) return name;
+  const std::string of = AvatarClassOf(emit.node(), emit.graph());
+  emit.Error(name.empty() ? "Pick a property" : (of.empty() ? std::string("The avatar's class") : of) + " has no property " + name);
+  return name;
+}
+
+bool InClassGraph(const Graph& graph) { return !graph.self_class().empty(); }
+
+}  // namespace
+
 void AddAvatars(Library& library) {
   const std::string category = "Avatars";
   const SettingDesc class_setting{.name = std::string(kClassSetting), .kind = SettingKind::kAvatarClass, .tooltip = "The class it spawns an avatar of"};
@@ -357,34 +395,158 @@ void AddAvatars(Library& library) {
       .emit = [](Emitter& emit) { emit.Line(emit.Output(kAvatarPin) + " = rex.content.spawn(" + LuaQuote(emit.Setting(kClassSetting)) + ", " + PlaceArgs(emit) + ", {saved = " + emit.Input("Saved") + "})"); }});
 
   library.Add({.id = "avatar.remove", .title = "Remove Avatar", .category = category,
-      .description = "Removes an avatar of a mod's class: its components detached and its backing removed. Nothing for one gone already.",
+      .description = "Removes an avatar of a mod's class: its components detached and its backing removed. Nothing for one gone already. In a class graph, Avatar left unlinked is Self.",
       .keywords = "avatar remove destroy delete despawn",
-      .pins = {{ExecPin(), ObjectPin(kAvatarPin, "")}, {ExecPin(kExecOut)}},
-      .emit = [](Emitter& emit) { emit.Line("rex.content.remove(" + emit.Input(kAvatarPin) + ")"); }});
+      .pins = {{ExecPin()}, {ExecPin(kExecOut)}},
+      .shape = [](const Node&, const Graph& graph, NodePins& pins) { pins.inputs.push_back(AvatarPin(graph)); },
+      .emit = [](Emitter& emit) { emit.Line("rex.content.remove(" + AvatarInput(emit) + ")"); }});
 
   library.Add({.id = "avatar.move", .title = "Move Avatar", .category = category,
-      .description = "Moves an avatar of a mod's class to X, Y and Z, turned Yaw degrees; its components go with it.",
+      .description = "Moves an avatar of a mod's class to X, Y and Z, turned Yaw degrees; its components go with it. In a class graph, Avatar left unlinked is Self.",
       .keywords = "avatar move teleport set location place",
       .pins = {{ExecPin()}, {ExecPin(kExecOut)}},
-      .shape = [](const Node&, const Graph&, NodePins& pins) {
-        pins.inputs.push_back(ObjectPin(kAvatarPin, ""));
+      .shape = [](const Node&, const Graph& graph, NodePins& pins) {
+        pins.inputs.push_back(AvatarPin(graph));
         for (Pin& pin : PlacePins()) pins.inputs.push_back(std::move(pin));
       },
-      .emit = [](Emitter& emit) { emit.Line("(" + emit.Input(kAvatarPin) + "):move(" + PlaceArgs(emit) + ")"); }});
+      .emit = [](Emitter& emit) { emit.Line("(" + AvatarInput(emit) + "):move(" + PlaceArgs(emit) + ")"); }});
 
   library.Add({.id = "avatar.location", .title = "Avatar Location", .category = category,
-      .description = "Where an avatar of a mod's class is: X, Y, Z and its yaw in degrees.",
+      .description = "Where an avatar of a mod's class is: X, Y, Z and its yaw in degrees. In a class graph, Avatar left unlinked is Self.",
       .keywords = "avatar position location where get",
       .role = NodeRole::kPure,
-      .pins = {{ObjectPin(kAvatarPin, "")}, {DataPin("X", PinKind::kFloat), DataPin("Y", PinKind::kFloat), DataPin("Z", PinKind::kFloat), DataPin("Yaw", PinKind::kFloat)}},
-      .expression = [](Emitter& emit, std::string_view output) { return "(" + emit.Input(kAvatarPin) + ")" + LuaMember(output == "Yaw" ? "yaw" : output == "X" ? "x" : output == "Y" ? "y" : "z"); }});
+      .pins = {{}, {DataPin("X", PinKind::kFloat), DataPin("Y", PinKind::kFloat), DataPin("Z", PinKind::kFloat), DataPin("Yaw", PinKind::kFloat)}},
+      .shape = [](const Node&, const Graph& graph, NodePins& pins) { pins.inputs.push_back(AvatarPin(graph)); },
+      .expression = [](Emitter& emit, std::string_view output) { return "(" + AvatarInput(emit) + ")" + LuaMember(output == "Yaw" ? "yaw" : output == "X" ? "x" : output == "Y" ? "y" : "z"); }});
 
   library.Add({.id = "avatar.is_valid", .title = "Is Avatar Valid", .category = category,
-      .description = "Whether an avatar of a mod's class is still there: not removed, and its world not gone.",
+      .description = "Whether an avatar of a mod's class is still there: not removed, and its world not gone. In a class graph, Avatar left unlinked is Self.",
       .keywords = "avatar valid alive exists",
       .role = NodeRole::kPure,
-      .pins = {{ObjectPin(kAvatarPin, "")}, {DataPin("Result", PinKind::kBool)}},
-      .expression = [](Emitter& emit, std::string_view) { return "rex.content.is_avatar(" + emit.Input(kAvatarPin) + ")"; }});
+      .pins = {{}, {DataPin("Result", PinKind::kBool)}},
+      .shape = [](const Node&, const Graph& graph, NodePins& pins) { pins.inputs.push_back(AvatarPin(graph)); },
+      .expression = [](Emitter& emit, std::string_view) { return "rex.content.is_avatar(" + AvatarInput(emit) + ")"; }});
+
+  // The avatar's property values, as its class declares them: in a class graph, the add menu offers a Get and a Set of
+  // each of Self's.
+  const SettingDesc property_setting{.name = std::string(kPropertySetting), .kind = SettingKind::kProperty, .tooltip = "The property, of the class of the avatar it acts on"};
+
+  library.Add({.id = "avatar.get_value", .title = "Get Value", .category = category,
+      .description = "One of an avatar's property values: the one set on it, or else its class's. In a class graph, Avatar left unlinked is Self.",
+      .keywords = "avatar property value get read member",
+      .role = NodeRole::kPure, .settings = {property_setting},
+      .shape = [](const Node& node, const Graph& graph, NodePins& pins) {
+        pins.inputs.push_back(AvatarPin(graph));
+        const std::optional<content::Property> property = PickedProperty(node, graph);
+        pins.outputs.push_back(ValuePin("Value", property ? PinTypeOf(property->type) : PinType{PinKind::kAny}));
+      },
+      .title_of = [](const Node& node) { return SettingOf(node, kPropertySetting).empty() ? std::string("Get Value") : "Get " + SettingOf(node, kPropertySetting); },
+      .expression = [](Emitter& emit, std::string_view) { return "(" + AvatarInput(emit) + "):get(" + LuaQuote(PropertyName(emit)) + ")"; }});
+
+  library.Add({.id = "avatar.set_value", .title = "Set Value", .category = category,
+      .description = "Sets one of an avatar's property values on it alone; its backing shows it. In a class graph, Avatar left unlinked is Self.",
+      .keywords = "avatar property value set write member",
+      .pins = {{ExecPin()}, {ExecPin(kExecOut)}}, .settings = {property_setting},
+      .shape = [](const Node& node, const Graph& graph, NodePins& pins) {
+        pins.inputs.push_back(AvatarPin(graph));
+        const std::optional<content::Property> property = PickedProperty(node, graph);
+        pins.inputs.push_back(property ? FieldPin(*property, "Value") : DataPin("Value", PinKind::kAny));
+      },
+      .title_of = [](const Node& node) { return SettingOf(node, kPropertySetting).empty() ? std::string("Set Value") : "Set " + SettingOf(node, kPropertySetting); },
+      .emit = [](Emitter& emit) { emit.Line("(" + AvatarInput(emit) + "):set(" + LuaQuote(PropertyName(emit)) + ", " + emit.Input("Value") + ")"); }});
+}
+
+namespace {
+
+// A class graph's own nodes: RexFabric's events of avatars (the game's are nodes_game.cpp's), Self and Call Parent.
+void AddClassGraphs(Library& library) {
+  const std::string category = "Avatars";
+
+  // RexFabric's own events of avatars (content.h, kAvatarSpawned), as a blueprint's BeginPlay, Tick and Destroyed.
+  struct Own {
+    std::string_view event;
+    std::string title;
+    std::string description;
+    std::vector<Pin> outputs;
+  };
+  const Own own[] = {
+      {content::kAvatarSpawned, "On Spawned", "Runs for each avatar of the class once it's spawned, its components attached.", {}},
+      {content::kAvatarTick, "On Tick", "Runs for each avatar of the class every frame, after its components ticked, with the seconds since the last.", {DataPin("Seconds", PinKind::kFloat)}},
+      {content::kAvatarRemoved, "On Removed", "Runs for each avatar of the class as it goes (removed, or gone with its world), before its components detach. Self can still be read.", {}},
+  };
+  for (const Own& event : own) {
+    NodeDesc desc{.id = ClassEventNode(event.event), .title = event.title, .description = event.description, .role = NodeRole::kEvent, .delegate = true};
+    desc.pins.outputs = {ExecPin(kExecOut)};
+    std::vector<std::string> names;
+    for (const Pin& pin : event.outputs) {
+      desc.pins.outputs.push_back(pin);
+      names.push_back(pin.name);
+    }
+    desc.emit = [event = std::string(event.event), names](Emitter& emit) {
+      std::vector<std::string> params;
+      for (const std::string& name : names) params.push_back(emit.Param(name));
+      EmitClassEvent(emit, event, params);
+    };
+    library.Add(std::move(desc));
+  }
+
+  library.Add({.id = "avatar.self", .title = "Self", .category = category,
+      .description = "The avatar the class graph runs for: the one its event was fired for.",
+      .keywords = "self this me avatar reference target",
+      .role = NodeRole::kPure, .compact = true,
+      .shape = [](const Node&, const Graph& graph, NodePins& pins) { pins.outputs.push_back(ObjectPin(kSelf, graph.self_class())); },
+      .expression = [](Emitter& emit, std::string_view) {
+        if (!emit.ClassGraph()) emit.Error("Self is only in an avatar class's own graph");
+        return std::string(kSelf);
+      },
+      .offered = InClassGraph});
+
+  library.Add({.id = "class.call_parent", .title = "Call Parent", .category = category,
+      .description = "Runs the parent class's own chain of this event for Self, as a blueprint's Parent node does. An event linked in a class's graph runs in place of its parent's, so this is how both run.",
+      .keywords = "parent super base inherited override",
+      .pins = {{ExecPin()}, {ExecPin(kExecOut)}},
+      .emit = [](Emitter& emit) {
+        const std::string event = ClassEventOf(emit.event());
+        if (!emit.ClassGraph() || event.empty()) {
+          emit.Error("Call Parent runs in the chain of one of the avatar's own events");
+          return;
+        }
+        std::string args = "Class, " + LuaQuote(event) + ", " + std::string(kSelf);
+        for (const std::string& param : emit.EventParams()) args += ", " + param;
+        emit.Line("rex.content.call_parent(" + args + ")");
+      },
+      .offered = InClassGraph});
+}
+
+}  // namespace
+
+std::string AvatarClassOf(const Node& node, const Graph& graph) {
+  const std::optional<PinType> linked = LinkedType(node, graph, kAvatarPin);
+  if (!linked) return graph.self_class();
+  return linked->kind == PinKind::kObject && content::FindClass(linked->object) ? linked->object : std::string();
+}
+
+std::vector<std::string> ClassEventNodes(std::string_view game_class) {
+  std::vector<std::string> types = {ClassEventNode(content::kAvatarSpawned), ClassEventNode(content::kAvatarTick), ClassEventNode(content::kAvatarRemoved)};
+  for (const content::ClassEventDecl& event : content::ClassEventsOf(game_class)) types.push_back(ClassEventNode(event.event));
+  return types;
+}
+
+void EmitClassEvent(Emitter& emit, std::string_view event, const std::vector<std::string>& params, const std::function<void()>& convert) {
+  if (!emit.ClassGraph()) {
+    emit.Error("This event only runs in an avatar class's own graph");
+    return;
+  }
+  // A ghost, as a blueprint's unlinked event is: it replaces nothing, so the parent class's chain of it runs.
+  if (!emit.Linked(kExecOut) && !emit.Linked(kDelegatePin)) return;
+  std::string list(kSelf);
+  for (const std::string& param : params) list += ", " + param;
+  emit.Line("rex.content.on_class(Class, " + LuaQuote(event) + ", function(" + list + ")");
+  emit.Open();
+  if (convert) convert();
+  emit.Chain(kExecOut);
+  emit.Close();
+  emit.Line("end)");
 }
 
 void AddContentNodes(Library& library) {
@@ -393,6 +555,7 @@ void AddContentNodes(Library& library) {
   AddTables(library);
   AddMaps(library);
   AddAvatars(library);
+  AddClassGraphs(library);
 }
 
 }  // namespace rexfabric::graph

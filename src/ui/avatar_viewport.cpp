@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <functional>
 #include <memory>
@@ -18,9 +19,6 @@ namespace {
 
 using Matrix = std::array<float, 16>;
 
-// Where the camera starts: a little round from the front and above, at the game's own framing.
-constexpr double kStartYaw = 25.0;
-constexpr double kStartPitch = 12.0;
 constexpr double kMaxPitch = 89.0;
 constexpr double kMinZoom = 0.1;
 constexpr double kMaxZoom = 20.0;
@@ -54,6 +52,10 @@ constexpr ImU32 kMarkerOutline = IM_COL32(0, 0, 0, 200);
 constexpr ImVec4 kMessageColor{0.92f, 0.78f, 0.45f, 1.0f};
 
 constexpr const char* kNoRenderer = "No viewport renderer: the game has not registered one, so avatars can't be previewed. Components can still be edited by their values.";
+
+bool Same(std::string_view a, std::string_view b) {
+  return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](unsigned char x, unsigned char y) { return std::tolower(x) == std::tolower(y); });
+}
 
 // The rows of `a` times `b`, row vectors.
 Matrix Multiply(const Matrix& a, const Matrix& b) {
@@ -181,38 +183,102 @@ double Tidy(double value) {
   return tidy == 0.0 ? 0.0 : tidy;
 }
 
+// The placed components as the game is given them.
+std::vector<content::ViewportPart> PartsOf(const std::vector<Placed>& placed) {
+  std::vector<content::ViewportPart> parts;
+  for (const Placed& component : placed) {
+    content::ViewportPart part{.name = component.name, .type = component.component->type, .world = component.world, .own = component.own != nullptr};
+    if (component.type) {
+      for (const auto& [name, value] : content::ComponentValues(*component.type, *component.component)) part.values[name] = content::ToPropertyValue(value);
+    }
+    parts.push_back(std::move(part));
+  }
+  return parts;
+}
+
 }  // namespace
 
-AvatarViewport::AvatarViewport() : id_(content::NewViewport()), yaw_(kStartYaw), pitch_(kStartPitch), zoom_(1.0) {}
+content::AvatarValues ClassViewValues(const std::vector<content::Property>& inherited, const content::ClassAsset& asset) {
+  content::AvatarValues values;
+  for (const content::Property& property : inherited) {
+    // The class's value where it sets one (its file may name it in another case), else the inherited one.
+    const nlohmann::json* set = nullptr;
+    for (const auto& [key, value] : asset.defaults.items()) {
+      if (!set && Same(key, property.name)) set = &value;
+    }
+    values[property.name] = content::ToPropertyValue(set ? *set : property.value);
+  }
+  for (const content::Property& property : asset.properties) values[property.name] = content::ToPropertyValue(property.value);
+  return values;
+}
+
+std::vector<content::ViewportPart> ViewportParts(const std::vector<content::Component>& inherited, const std::vector<content::Component>& own) {
+  std::vector<Placed> placed;
+  Place(inherited, {}, nullptr, placed);
+  // Its own are only read, but placed as the movable ones are, so each part says it's the class's own.
+  std::vector<content::Component> own_copy = own;
+  Place(own_copy, {}, &own_copy, placed);
+  return PartsOf(placed);
+}
+
+AvatarViewport::AvatarViewport(ViewportControls controls) : id_(content::NewViewport()), yaw_(kViewportStartYaw), pitch_(kViewportStartPitch), zoom_(1.0), controls_(controls), looping_(controls.looping) {}
 
 AvatarViewport::~AvatarViewport() {
   content::CloseViewport(id_);
 }
 
-void AvatarViewport::DrawToolbar() {
+void AvatarViewport::Restart() {
+  ++replays_;
+  time_ = 0.0;
+}
+
+void AvatarViewport::DrawToolbar(std::optional<content::ThumbnailView>* thumbnail) {
+  const bool playback = controls_.playback;
   if (glass::SmallButton(playing_ ? "Pause" : "Play")) playing_ = !playing_;
-  ImGui::SetItemTooltip("Whether its time runs: what its components do (an emitter playing) and how the avatar moves");
+  ImGui::SetItemTooltip(playback ? "Whether its time runs: what it shows plays, or holds still where it is" : "Whether its time runs: what its components do (an emitter playing) and how the avatar moves");
   ImGui::SameLine();
-  if (glass::SmallButton("Replay")) ++replays_;
-  ImGui::SetItemTooltip("Everything from the start, as when an avatar of the class is spawned");
+  if (glass::SmallButton(playback ? "Restart" : "Replay")) Restart();
+  ImGui::SetItemTooltip(playback ? "Everything from the start" : "Everything from the start, as when an avatar of the class is spawned");
   ImGui::SameLine();
-  const auto tool = [this](const char* label, Tool which, const char* tip) {
-    if (glass::SmallButton(label, tool_ == which ? glass::kAccent : glass::kNeutral)) tool_ = which;
-    ImGui::SetItemTooltip("%s", tip);
+  if (playback) {
+    if (glass::SmallButton("Loop", looping_ ? glass::kAccent : glass::kNeutral)) looping_ = !looping_;
+    ImGui::SetItemTooltip("Whether what it shows starts again once it's done, or plays once and stays done");
     ImGui::SameLine();
-  };
-  tool("Move", Tool::kMove, "Move the selected component (W)");
-  tool("Turn", Tool::kTurn, "Turn the selected component (E)");
-  tool("Scale", Tool::kScale, "Scale the selected component (R)");
-  if (glass::SmallButton(local_ ? "Its axes" : "Avatar's axes")) local_ = !local_;
-  ImGui::SetItemTooltip("Whether the gizmo follows the component's own axes or the avatar's");
-  ImGui::SameLine();
+  }
+  if (controls_.gizmos) {
+    const auto tool = [this](const char* label, Tool which, const char* tip) {
+      if (glass::SmallButton(label, tool_ == which ? glass::kAccent : glass::kNeutral)) tool_ = which;
+      ImGui::SetItemTooltip("%s", tip);
+      ImGui::SameLine();
+    };
+    tool("Move", Tool::kMove, "Move the selected component (W)");
+    tool("Turn", Tool::kTurn, "Turn the selected component (E)");
+    tool("Scale", Tool::kScale, "Scale the selected component (R)");
+    if (glass::SmallButton(local_ ? "Its axes" : "Avatar's axes")) local_ = !local_;
+    ImGui::SetItemTooltip("Whether the gizmo follows the component's own axes or the avatar's");
+    ImGui::SameLine();
+  }
   if (glass::SmallButton("Reset View")) {
-    yaw_ = kStartYaw;
-    pitch_ = kStartPitch;
+    yaw_ = kViewportStartYaw;
+    pitch_ = kViewportStartPitch;
     zoom_ = 1.0;
   }
-  ImGui::SetItemTooltip("Back to the camera it started with. Drag to go round the avatar, the wheel to come nearer");
+  ImGui::SetItemTooltip("Back to the camera it started with. Drag to go round it, the wheel to come nearer");
+  if (thumbnail) {
+    ImGui::SameLine();
+    if (glass::SmallButton("Capture Thumbnail", thumbnail->has_value() ? glass::kAccent : glass::kNeutral)) *thumbnail = content::ThumbnailView{.yaw = yaw_, .pitch = pitch_, .zoom = zoom_, .time = playback ? std::optional<double>(time_) : std::nullopt};
+    ImGui::SetItemTooltip(playback ? "Its thumbnail in the content browser framed as the camera is now, played as far as it has: kept in the asset, so it looks the same for everyone" : "Its thumbnail in the content browser framed as the camera is now: kept in the asset, so it looks the same for everyone");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!thumbnail->has_value());
+    if (glass::SmallButton("Clear##thumbnail")) thumbnail->reset();
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("Its thumbnail framed the default way again");
+  }
+  if (playback) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("%.2f s", time_);
+    ImGui::SetItemTooltip("How long it's played since it last started");
+  }
 }
 
 void AvatarViewport::TakeCamera(bool hovered, bool dragging) {
@@ -230,10 +296,10 @@ void AvatarViewport::TakeCamera(bool hovered, bool dragging) {
   }
 }
 
-bool AvatarViewport::Draw(const ImVec2& size, content::ViewportView view, const std::vector<content::Component>& inherited, std::vector<content::Component>& own, std::string& selected) {
+bool AvatarViewport::Draw(const ImVec2& size, content::ViewportView view, const std::vector<content::Component>& inherited, std::vector<content::Component>& own, std::string& selected, std::optional<content::ThumbnailView>* thumbnail) {
   BeginGizmoFrame();
 
-  DrawToolbar();
+  DrawToolbar(thumbnail);
   const ImVec2 room = ImGui::GetContentRegionAvail();
   const ImVec2 canvas(std::max(size.x, 1.0f), std::max(std::min(size.y, room.y), 1.0f));
   // A window of its own that doesn't move or scroll: a drag in it is the camera's, and the wheel the zoom.
@@ -252,16 +318,13 @@ bool AvatarViewport::Draw(const ImVec2& size, content::ViewportView view, const 
   view.width = static_cast<uint32_t>(canvas.x);
   view.height = static_cast<uint32_t>(canvas.y);
   view.playing = playing_;
+  view.looping = looping_;
   view.replays = replays_;
   view.hold_framing = held_;
-  for (const Placed& component : placed) {
-    content::ViewportPart part{.name = component.name, .type = component.component->type, .world = component.world, .own = component.own != nullptr};
-    if (component.type) {
-      for (const auto& [name, value] : content::ComponentValues(*component.type, *component.component)) part.values[name] = content::ToPropertyValue(value);
-    }
-    view.parts.push_back(std::move(part));
-  }
+  for (content::ViewportPart& part : PartsOf(placed)) view.parts.push_back(std::move(part));
   const std::optional<content::ViewportImage> image = content::ShowViewport(id_, view);
+  if (image && image->time) time_ = *image->time;
+  else if (playing_) time_ += ImGui::GetIO().DeltaTime;
 
   Matrix camera_view;
   Matrix projection;

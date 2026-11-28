@@ -15,7 +15,7 @@
 #include "localisation.h"
 #include "map_edits.h"
 #include "materials.h"
-#include "packets.h"
+#include "game_assets.h"
 #include "tables.h"
 #include "types.h"
 
@@ -28,7 +28,6 @@ constexpr std::string_view kMapEdit = "MapEdit";
 constexpr std::string_view kMaterial = "Material";
 constexpr std::string_view kMesh = "Mesh";
 constexpr std::string_view kWorld = "World";
-constexpr std::string_view kPacket = "Packet";
 constexpr size_t kMaxName = 64;
 // What kind of asset a file is, under "asset". Only classes so far.
 constexpr std::string_view kAssetClass = "class";
@@ -54,7 +53,7 @@ struct Registry {
     Class object;
     object.path = std::string(kObject);
     object.help = "The root of every class";
-    object.properties.push_back({.name = "thumbnail", .type = {.type = PropertyType::kAsset}, .value = nullptr, .help = "What the content browser shows for it; its class's icon when unset", .declared_by = std::string(kObject)});
+    object.properties.push_back({.name = "thumbnail", .type = {.type = PropertyType::kAsset, .of = std::string(kTexture)}, .value = nullptr, .help = "A picture the content browser shows for it in place of the one it makes (an avatar class's), or of its icon; none for that one", .declared_by = std::string(kObject)});
     Add(std::move(object));
     // The class of the pictures mods import: its assets are texture files, an asset property of it picks one.
     Class texture;
@@ -86,12 +85,6 @@ struct Registry {
     world.parent = std::string(kObject);
     world.help = "One of the game's worlds as a mod changes it: its base, with this world's map edits besides its own";
     Add(std::move(world));
-    // The class of mods' packets: its assets are packet files, each a kind of ground that pours as one of the game's.
-    Class packet;
-    packet.path = std::string(kPacket);
-    packet.parent = std::string(kObject);
-    packet.help = "A kind of ground a player buys and pours: a variant of one of the game's own packets, its base, that looks and sells as it says";
-    Add(std::move(packet));
     declared = classes.size();
   }
 
@@ -391,6 +384,7 @@ bool DeclareClass(ClassDecl decl) {
   pending.added.help = std::move(decl.help);
   pending.added.type = std::move(decl.type);
   pending.added.test = std::move(decl.test);
+  pending.added.events = std::move(decl.events);
   for (const PropertyDecl& property : decl.properties) {
     nlohmann::ordered_json entry{{"name", property.name}};
     WriteType(property.type, entry);
@@ -455,7 +449,7 @@ void LoadModContent(const std::vector<ModInfo>& mods) {
   RF_INFO("content: {} classes, {} of them from mods", registry.classes.size(), registry.classes.size() - registry.declared);
   lock.unlock();
   LoadMaterials(mods);
-  LoadPackets(mods);
+  LoadGameAssets(mods);
   // Last, as their spawns name the classes.
   LoadMapEdits(mods);
 }
@@ -487,6 +481,14 @@ bool IsA(std::string_view path, std::string_view base) {
   std::shared_lock lock(registry.mutex);
   const std::vector<const Class*> chain = registry.Chain(path);
   return std::any_of(chain.begin(), chain.end(), [&](const Class* at) { return Lower(at->path) == Lower(base); });
+}
+
+std::vector<std::string> AncestryOf(std::string_view path) {
+  Registry& registry = Get();
+  std::shared_lock lock(registry.mutex);
+  std::vector<std::string> paths;
+  for (const Class* at : registry.Chain(path)) paths.push_back(at->path);
+  return paths;
 }
 
 std::vector<Property> Properties(std::string_view path) {
@@ -543,6 +545,33 @@ std::vector<std::string> AvatarClassPaths(std::string_view from) {
   }
   return paths;
 }
+
+std::vector<ClassEventDecl> ClassEventsOf(std::string_view path) {
+  Registry& registry = Get();
+  std::shared_lock lock(registry.mutex);
+  const std::vector<const Class*> chain = registry.Chain(path);
+  std::vector<ClassEventDecl> events;
+  for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+    for (const ClassEventDecl& event : (*it)->events) {
+      const auto named = [&event](const ClassEventDecl& listed) { return listed.event == event.event; };
+      if (std::none_of(events.begin(), events.end(), named)) events.push_back(event);
+    }
+  }
+  return events;
+}
+
+std::optional<DeclaredClassEvent> FindClassEvent(std::string_view event) {
+  Registry& registry = Get();
+  std::shared_lock lock(registry.mutex);
+  for (size_t i = 0; i < registry.declared; ++i) {
+    for (const ClassEventDecl& declared : registry.classes[i].events) {
+      if (declared.event == event) return DeclaredClassEvent{.for_class = registry.classes[i].path, .decl = declared};
+    }
+  }
+  return std::nullopt;
+}
+
+bool IsAvatarEvent(std::string_view event) { return event == kAvatarSpawned || event == kAvatarTick || event == kAvatarRemoved || FindClassEvent(event).has_value(); }
 
 bool MayReference(std::string_view from, std::string_view path, std::string* why) {
   Registry& registry = Get();

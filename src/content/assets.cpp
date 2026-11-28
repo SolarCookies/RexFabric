@@ -11,7 +11,7 @@
 #include "map_edits.h"
 #include "material_graph.h"
 #include "materials.h"
-#include "packets.h"
+#include "game_assets.h"
 #include "types.h"
 
 namespace rexfabric::content {
@@ -29,7 +29,6 @@ constexpr std::string_view kMapEditKind = "map_edit";
 constexpr std::string_view kMaterialKind = "material";
 constexpr std::string_view kMeshKind = "mesh";
 constexpr std::string_view kWorldKind = "world";
-constexpr std::string_view kPacketKind = "packet";
 // The keys each kind's file has that its asset holds itself; the rest go in the asset's `rest`.
 constexpr std::string_view kClassKeys[] = {"asset", "parent", "help", "properties", "defaults", "backing", "components"};
 constexpr std::string_view kEnumKeys[] = {"asset", "help", "values"};
@@ -39,7 +38,6 @@ constexpr std::string_view kLanguageKeys[] = {"asset", "language", "help", "text
 constexpr std::string_view kTextureKeys[] = {"asset", "help"};
 constexpr std::string_view kMeshKeys[] = {"asset", "help"};
 constexpr std::string_view kWorldKeys[] = {"asset", "base", "help"};
-constexpr std::string_view kPacketKeys[] = {"asset", "base", "name", "help", "icon", "look", "unlock", "level", "price", "order"};
 constexpr std::string_view kMapEditKeys[] = {"asset", "world", "help", "edits"};
 constexpr std::string_view kMaterialKeys[] = {"asset", "type", "help", "values", "preview", "graph"};
 // A duplicate's name: the original's with this after it, then a number when that's taken.
@@ -299,15 +297,13 @@ void ForEachPath(const ModList& mods, const TypeLookup& types, MapEditAsset& ass
   }
 }
 
-// A packet's look, typed as its base's look struct; its icon is a path of its own.
-void ForEachValue(PacketAsset& asset, const ValueVisit& visit) {
-  const std::string look = PacketLookStruct(asset.base);
-  if (!look.empty()) visit({.type = PropertyType::kStruct, .of = look}, asset.look, "its look");
+// A game asset's values, each typed as the field of its type shown for it.
+void ForEachValue(GameAssetFile& asset, const ValueVisit& visit) {
+  ForEachShownValue(*asset.type, asset.json, [&visit](const AssetField& field, nlohmann::json& value) { visit(field.property.type, value, field.Label()); });
 }
 
-void ForEachPath(const TypeLookup& types, PacketAsset& asset, const PathVisit& visit) {
+void ForEachPath(const TypeLookup& types, GameAssetFile& asset, const PathVisit& visit) {
   ForEachValue(asset, [&](const ValueType& type, nlohmann::json& value, const std::string& where) { VisitAssetValues(types, type, value, where, visit); });
-  if (!asset.icon.empty()) visit(asset.icon, "its icon");
 }
 
 // A changed asset, ready to write: to its own file, or where it went.
@@ -323,7 +319,7 @@ struct AssetEditors {
   std::function<bool(const AssetInfo&, TableAsset&)> on_table;
   std::function<bool(const AssetInfo&, MapEditAsset&)> on_map_edit;
   std::function<bool(const AssetInfo&, MaterialAsset&)> on_material;
-  std::function<bool(const AssetInfo&, PacketAsset&)> on_packet;
+  std::function<bool(const AssetInfo&, GameAssetFile&)> on_game;
 };
 
 // Every class, struct, table and map edit asset of every mod, read and given to its editor; the ones changed come back
@@ -349,9 +345,9 @@ std::vector<Edit> EditAssets(const ModList& mods, const AssetEditors& editors) {
       } else if (info.kind == AssetKind::kMaterial && editors.on_material) {
         std::optional<MaterialAsset> asset = ReadMaterialAsset(info.file, nullptr);
         if (asset && editors.on_material(info, *asset)) edits.push_back({info.file, [kept = std::move(*asset)](const std::filesystem::path& to, std::string* error) { return WriteMaterialAsset(to, kept, error); }});
-      } else if (info.kind == AssetKind::kPacket && editors.on_packet) {
-        std::optional<PacketAsset> asset = ReadPacketAsset(info.file, nullptr);
-        if (asset && editors.on_packet(info, *asset)) edits.push_back({info.file, [kept = std::move(*asset)](const std::filesystem::path& to, std::string* error) { return WritePacketAsset(to, kept, error); }});
+      } else if (info.kind == AssetKind::kGame && editors.on_game) {
+        std::optional<GameAssetFile> asset = ReadGameAsset(info.file, nullptr);
+        if (asset && editors.on_game(info, *asset)) edits.push_back({info.file, [kept = std::move(*asset)](const std::filesystem::path& to, std::string* error) { return WriteGameAsset(to, *kept.type, kept.json, error); }});
       }
     }
   }
@@ -402,7 +398,7 @@ bool Relocate(const ModList& mods, std::string_view from, std::string_view to, s
       .on_table = [&](const AssetInfo&, TableAsset& asset) { return repointed(asset, [&](TableAsset& held, const PathVisit& visit) { ForEachPath(types, held, visit); }); },
       .on_map_edit = [&](const AssetInfo&, MapEditAsset& asset) { return repointed(asset, [&](MapEditAsset& held, const PathVisit& visit) { ForEachPath(mods, types, held, visit); }); },
       .on_material = [&](const AssetInfo&, MaterialAsset& asset) { return repointed(asset, [&](MaterialAsset& held, const PathVisit& visit) { ForEachPath(types, held, visit); }); },
-      .on_packet = [&](const AssetInfo&, PacketAsset& asset) { return repointed(asset, [&](PacketAsset& held, const PathVisit& visit) { ForEachPath(types, held, visit); }); },
+      .on_game = [&](const AssetInfo&, GameAssetFile& asset) { return repointed(asset, [&](GameAssetFile& held, const PathVisit& visit) { ForEachPath(types, held, visit); }); },
   });
 
   const std::vector<std::filesystem::path> companions = is_folder ? std::vector<std::filesystem::path>{} : Companions(source);
@@ -449,7 +445,7 @@ std::string RenameValues(const ModList& mods, const std::function<bool(const Val
       .on_table = [&](const AssetInfo&, TableAsset& asset) { return walked([&](const ValueVisit& visit) { ForEachValue(asset, visit); }); },
       .on_map_edit = [&](const AssetInfo&, MapEditAsset& asset) { return walked([&](const ValueVisit& visit) { ForEachValue(mods, asset, visit); }); },
       .on_material = [&](const AssetInfo&, MaterialAsset& asset) { return walked([&](const ValueVisit& visit) { ForEachValue(asset, visit); }); },
-      .on_packet = [&](const AssetInfo&, PacketAsset& asset) { return walked([&](const ValueVisit& visit) { ForEachValue(asset, visit); }); },
+      .on_game = [&](const AssetInfo&, GameAssetFile& asset) { return walked([&](const ValueVisit& visit) { ForEachValue(asset, visit); }); },
   }));
 }
 
@@ -499,6 +495,11 @@ std::string_view NameOf(std::string_view path) {
   return slash == std::string_view::npos ? path : path.substr(slash + 1);
 }
 
+bool IsBuiltInKind(std::string_view kind) {
+  static constexpr std::string_view kKinds[] = {kClassKind, kEnumKind, kStructKind, kTableKind, kLanguageKind, kTextureKind, kMapEditKind, kMaterialKind, kMeshKind, kWorldKind};
+  return std::find(std::begin(kKinds), std::end(kKinds), kind) != std::end(kKinds);
+}
+
 ModContent ScanContent(const ModInfo& mod) {
   ModContent content;
   content.mod = mod.folder;
@@ -540,8 +541,9 @@ ModContent ScanContent(const ModInfo& mod) {
       info.kind = AssetKind::kMesh;
     } else if (kind == kWorldKind) {
       info.kind = AssetKind::kWorld;
-    } else if (kind == kPacketKind) {
-      info.kind = AssetKind::kPacket;
+    } else if (const std::shared_ptr<const AssetType> type = FindAssetTypeByKind(kind)) {
+      info.kind = AssetKind::kGame;
+      info.type = type->path;
     }
     content.assets.push_back(std::move(info));
   }
@@ -739,45 +741,6 @@ bool WriteWorldAsset(const std::filesystem::path& file, const WorldAsset& asset,
   return WriteJson(file, json, error);
 }
 
-std::optional<PacketAsset> ReadPacketAsset(const std::filesystem::path& file, std::string* error) {
-  std::optional<nlohmann::json> json = ReadKind(file, kPacketKind, error);
-  if (!json) return std::nullopt;
-  PacketAsset asset{.base = json->value("base", std::string()), .name = json->value("name", std::string()), .help = json->value("help", std::string()), .icon = json->value("icon", std::string()), .look = json->value("look", nlohmann::json::object()), .rest = Rest(*json, kPacketKeys)};
-  const std::string unlock = json->value("unlock", std::string(kPacketUnlockDefault));
-  if (unlock != kPacketUnlockDefault && unlock != kPacketUnlockShop) {
-    if (error) *error = "\"unlock\" is \"" + std::string(kPacketUnlockDefault) + "\" or \"" + std::string(kPacketUnlockShop) + "\", not \"" + unlock + "\"";
-    return std::nullopt;
-  }
-  if (!asset.look.is_object()) {
-    if (error) *error = "\"look\" is an object of its base's look";
-    return std::nullopt;
-  }
-  asset.unlock = unlock == kPacketUnlockShop ? PacketUnlock::kShop : PacketUnlock::kDefault;
-  const auto number = [&json](const char* key) { return json->contains(key) && (*json)[key].is_number() ? std::optional<nlohmann::json>((*json)[key]) : std::nullopt; };
-  if (const auto level = number("level")) asset.level = level->get<int64_t>();
-  if (const auto price = number("price")) asset.price = price->get<int64_t>();
-  if (const auto order = number("order")) asset.order = order->get<double>();
-  return asset;
-}
-
-bool WritePacketAsset(const std::filesystem::path& file, const PacketAsset& asset, std::string* error) {
-  nlohmann::ordered_json json;
-  json["asset"] = kPacketKind;
-  json["base"] = asset.base;
-  json["name"] = asset.name;
-  if (!asset.help.empty()) json["help"] = asset.help;
-  if (!asset.icon.empty()) json["icon"] = asset.icon;
-  if (!asset.look.empty()) json["look"] = nlohmann::ordered_json::parse(asset.look.dump());
-  json["unlock"] = asset.unlock == PacketUnlock::kShop ? kPacketUnlockShop : kPacketUnlockDefault;
-  if (asset.unlock == PacketUnlock::kShop) {
-    json["level"] = asset.level;
-    json["price"] = asset.price;
-  }
-  if (asset.order != 0.0) json["order"] = asset.order;
-  for (const auto& [key, value] : asset.rest.items()) json[key] = value;
-  return WriteJson(file, json, error);
-}
-
 std::optional<MapEditAsset> ReadMapEditAsset(const std::filesystem::path& file, std::string* error) {
   std::optional<nlohmann::json> json = ReadKind(file, kMapEditKind, error);
   if (!json) return std::nullopt;
@@ -944,8 +907,11 @@ std::optional<std::filesystem::path> MeshModelOf(std::string_view path, std::str
   return model;
 }
 
-std::optional<TextureImage> LoadTextureImage(std::string_view path, std::string* why) {
-  const auto fail = [why](std::string reason) -> std::optional<TextureImage> {
+namespace {
+
+// The picture beside a loaded mod's texture asset; none, with `why`, for a path that isn't one or a texture without one.
+std::optional<std::filesystem::path> LoadedTexturePicture(std::string_view path, std::string* why) {
+  const auto fail = [why](std::string reason) -> std::optional<std::filesystem::path> {
     if (why) *why = std::move(reason);
     return std::nullopt;
   };
@@ -956,18 +922,39 @@ std::optional<TextureImage> LoadTextureImage(std::string_view path, std::string*
   if (!ReadTextureAsset(file, why)) return std::nullopt;
   const std::filesystem::path image = TextureImageFile(file);
   if (image.empty()) return fail(std::string(path) + " has no picture beside it");
-  std::ifstream in(image, std::ios::binary);
+  return image;
+}
+
+// A picture file's version: when it was last written.
+uint64_t PictureVersion(const std::filesystem::path& image) {
+  std::error_code code;
+  return static_cast<uint64_t>(std::filesystem::last_write_time(image, code).time_since_epoch().count());
+}
+
+}  // namespace
+
+std::optional<TextureImage> LoadTextureImage(std::string_view path, std::string* why) {
+  const std::optional<std::filesystem::path> image = LoadedTexturePicture(path, why);
+  if (!image) return std::nullopt;
+  std::ifstream in(*image, std::ios::binary);
   const std::vector<uint8_t> encoded((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   int width = 0;
   int height = 0;
   TextureImage loaded;
   loaded.rgba = ui::DecodeImageRGBA(encoded.data(), encoded.size(), width, height);
-  if (loaded.rgba.empty() || width <= 0 || height <= 0) return fail(image.filename().string() + " couldn't be read as a picture");
+  if (loaded.rgba.empty() || width <= 0 || height <= 0) {
+    if (why) *why = image->filename().string() + " couldn't be read as a picture";
+    return std::nullopt;
+  }
   loaded.width = static_cast<uint32_t>(width);
   loaded.height = static_cast<uint32_t>(height);
-  std::error_code code;
-  loaded.version = static_cast<uint64_t>(std::filesystem::last_write_time(image, code).time_since_epoch().count());
+  loaded.version = PictureVersion(*image);
   return loaded;
+}
+
+std::optional<uint64_t> TextureImageVersion(std::string_view path, std::string* why) {
+  const std::optional<std::filesystem::path> image = LoadedTexturePicture(path, why);
+  return image ? std::optional<uint64_t>(PictureVersion(*image)) : std::nullopt;
 }
 
 TypeLookup FileTypes(const ModList& mods) {
@@ -1150,9 +1137,16 @@ bool CreateWorld(const ModInfo& mod, std::string_view folder, std::string_view n
   return CreateAsset(mod, folder, name, [&asset](const std::filesystem::path& file, std::string* failed) { return WriteWorldAsset(file, asset, failed); }, error);
 }
 
-bool CreatePacket(const ModInfo& mod, std::string_view folder, std::string_view name, std::string_view base, std::string* error) {
-  const PacketAsset asset{.base = std::string(base), .name = std::string(name)};
-  return CreateAsset(mod, folder, name, [&asset](const std::filesystem::path& file, std::string* failed) { return WritePacketAsset(file, asset, failed); }, error);
+bool CreateGameAsset(const ModInfo& mod, std::string_view folder, std::string_view name, std::string_view type, const nlohmann::json& values, std::string* error) {
+  const std::shared_ptr<const AssetType> found = FindAssetType(type);
+  if (!found) {
+    if (error) *error = "The game has no asset type " + std::string(type);
+    return false;
+  }
+  nlohmann::json set = values.is_object() ? values : nlohmann::json::object();
+  if (!found->name_field.empty() && !set.contains(found->name_field)) set[found->name_field] = std::string(name);
+  const nlohmann::json json = FittedValues(LoadedTypes(), *found, set);
+  return CreateAsset(mod, folder, name, [&](const std::filesystem::path& file, std::string* failed) { return WriteGameAsset(file, *found, json, failed); }, error);
 }
 
 bool Duplicate(const ModInfo& mod, std::string_view path, std::string* made, std::string* error) {
@@ -1255,7 +1249,7 @@ std::vector<Reference> ReferencesTo(const ModList& mods, std::string_view path) 
         if (!Within(info.path, path)) ForEachPath(types, asset, note(info));
         return false;
       },
-      .on_packet = [&](const AssetInfo& info, PacketAsset& asset) {
+      .on_game = [&](const AssetInfo& info, GameAssetFile& asset) {
         if (!Within(info.path, path)) ForEachPath(types, asset, note(info));
         return false;
       },

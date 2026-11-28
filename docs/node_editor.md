@@ -43,6 +43,12 @@ New Mod (in the mod picker) makes a mod folder with a `mod.toml`, enables it at 
 
 ## The window
 
+The canvas, the graph's functions, macros, variables and dispatchers, its Lua and the details panel are `GraphView`
+(`src/ui/graph_view.h`), which edits one `graph::Document` and is shown by the node editor window, by a game asset's
+editor for the asset's own graph (content_and_classes.md, Asset graphs) and by an avatar class's editor for the class's
+own (Class graphs), those two laid out as a blueprint by `OwnGraph` (`src/ui/own_graph.h`). The window adds the
+toolbar, the mod picker, the mod's graphs and saving them.
+
 | Part | Holds |
 |---|---|
 | Toolbar | The mod picker, Save, Save and Reload, Undo, Redo, and the graph's state: no problems, warnings, or how many errors |
@@ -78,7 +84,7 @@ Events start chains. An event node (On Frame, Before Function, Key Pressed) has 
 
 Values flow along the other links, from outputs on the right of a node to inputs on the left. A pure node, one without exec pins (Add, Get Register, Read Memory), is worked out wherever its output is read, every time it's read, as in a blueprint. An action's outputs (Call Function's Result) are set when it runs, so they can only be read further along the same event's chain. An event's own outputs (On Frame's Seconds, a hook's Registers) only exist in that event's chain.
 
-Variables belong to the whole graph and keep their values between events: a count of calls, a toggle a key flips. Each one becomes a local at the top of the script.
+Variables belong to the whole graph and keep their values between events: a count of calls, a toggle a key flips. Each one becomes a local at the top of the script. In an avatar class's own graph they're each avatar's own instead (Avatar class graphs, below).
 
 ### Functions and macros
 
@@ -189,6 +195,32 @@ if n12_As_Avatar ~= nil and n12_As_Avatar.valid then
 end
 ```
 
+### Avatar class graphs
+
+An avatar class's own graph (content_and_classes.md, Class graphs) runs for each avatar of the class, as a blueprint
+runs for each actor. Its events are the avatar's: On Spawned, On Tick and On Removed, and the ones the game declares for
+its classes, placed down the left of a new graph and never deleted. A placed event with nothing linked is a ghost and
+leaves the parent class's to run; one that's linked runs in place of the parent's, and Call Parent runs the parent's
+too. Other events don't go in a class graph, but Custom Events do.
+
+| Node | Does |
+|---|---|
+| Self | The avatar the graph runs for, typed by the class. Offered only in a class graph |
+| Call Parent | In the chain of one of the avatar's events, runs the parent class's chain of the same event with the same values (`rex.content.call_parent`) |
+| Get Value, Set Value | A property of the avatar's class, picked in the details panel from the class of what's linked into Avatar, or Self's. The add menu offers one of each of Self's properties under Avatars/Self |
+
+In a class graph an Avatar input left unlinked is Self, as a blueprint's Target is self, and the variables, the event
+dispatchers and what nodes keep (a Do Once, a Delay waiting) are each avatar's own: `My.Count` in the script, in the
+table `rex.content.own` keeps for the avatar. Every function the script writes takes Self first, so the graph's own
+functions and the events timers and dispatchers run know which avatar they're for.
+
+```lua
+rex.content.on_class(Class, "avatar_tick", function(Self, n2_Seconds)
+  local My = rex.content.own(Self, Class, Fresh)
+  My.Count = My.Count + 1
+end)
+```
+
 ### Print String
 
 As Unreal's: In String in the screen's top right corner for Duration seconds, newest at the top, in the Color picked in the details panel, and in the log. Print to Screen and Print to Log turn either off. It's for debugging while a mod is made; Log is for what a finished mod reports.
@@ -255,6 +287,7 @@ Ints go into Float pins. Anything goes into an Any pin, and an Any output goes a
 | Log | Log, at info, warn, error or debug; Print String | `rex.info` and the rest; `rex.screen_text` and `rex.info` |
 | Time | Now, Delay, Set Timer by Event, Clear Timer | `rex.now()`, `rex.after`, `rex.every`, `rex.cancel` |
 | Event Dispatchers | Call, Bind Event to, Unbind Event from, Unbind All from, per dispatcher | The graph's event dispatchers |
+| Avatars | Spawn, Remove Avatar, Move Avatar, Avatar Location, Is Avatar Valid, Get Value, Set Value; in a class graph Self and Call Parent | `rex.content.spawn`, the avatar handle, `rex.content.call_parent` |
 | Input | Key Down, Mouse Button Down, Input Allowed, Read Mouse Motion, Read Wheel, Hold Game Input | `rex.input` |
 | Settings | Get Setting, Set Setting, Add Setting, Get Switch, Set Switch | `rex.cvar` and `rex.switch` |
 | Game | Address Of, then one folder per namespace | The game's API, below |
@@ -344,6 +377,8 @@ The pieces, for finding your way around:
 | `src/graph/graph_file.*` | The JSON format, for files and the clipboard |
 | `src/graph/graph_document.*` | A graph on disk, with its script and undo history |
 | `src/ui/node_editor.*` | The window |
+| `src/ui/graph_view.*` | The canvas, the graph's lists, its Lua and the details, for any window to show |
+| `src/ui/own_graph.*` | An asset's or an avatar class's own graph laid out as a blueprint in its editor |
 | `src/ui/node_graph_style.*`, `node_graph_widgets.*` | The canvas's look and pieces, ported from Toon's node graph editors |
 | `src/ui/glass.h` | RexGlass when the game has it, plain ImGui otherwise |
 

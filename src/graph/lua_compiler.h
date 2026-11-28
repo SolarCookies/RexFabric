@@ -26,6 +26,22 @@
 // Functions (graph.h's Routine) become Lua functions, declared together before the events so they can call each other.
 // Macros are written out in full wherever they're used: the chain runs into the macro's entry and out of its exit back
 // into the graph using it, and the names of the macro's own locals start with m and the id of the node using it.
+//
+// An avatar class's own graph (Graph::self_class; docs/content_and_classes.md, Class graphs) runs for each avatar: every
+// function the script writes takes the avatar as Self first, and its variables, dispatchers and the state nodes keep
+// are the avatar's own, fields of the table rex.content.own keeps for it (My), made by Fresh the first time.
+//
+//   local Class = rex.content.script_asset()
+//   local function Fresh()
+//     return {
+//       Count = 0,
+//     }
+//   end
+//
+//   rex.content.on_class(Class, "avatar_tick", function(Self, n2_Seconds)
+//     local My = rex.content.own(Self, Class, Fresh)
+//     My.Count = My.Count + 1
+//   end)
 
 #pragma once
 
@@ -54,6 +70,9 @@ struct CompileOptions {
   std::function<bool(uint32_t address)> hookable;
   // Globals the script reads besides Lua's own and rex: the game's namespaces. Variables can't hide them.
   std::vector<std::string> globals;
+  // The game asset the graph belongs to ("MyMod/Leaf"), for an asset's own graph: its asset events (AssetEventNode)
+  // run only when the game fires them for this asset. Empty for a mod's graph.
+  std::string asset;
 };
 
 struct Compiled {
@@ -77,6 +96,8 @@ class Emitter {
  public:
   Emitter(const Graph& graph, const CompileOptions& options);
 
+  const CompileOptions& options() const { return options_; }
+
   // The node being written.
   const Node& node() const;
   const Graph& graph() const { return graph_; }
@@ -99,6 +120,12 @@ class Emitter {
   std::string State(std::string_view name, std::string_view initial);
   // A local of the event's function, shared by its nodes: Skip Original's flag.
   std::string EventLocal(std::string_view name);
+  // The graph is an avatar class's own: Self is the avatar its chains run for.
+  bool ClassGraph() const { return !graph_.self_class().empty(); }
+  // A variable or dispatcher of the graph as Lua reaches it: a local of the script, or in a class graph the avatar's own.
+  std::string Member(std::string_view name);
+  // The current event's outputs, as the parameters its function has, in order.
+  std::vector<std::string> EventParams();
   // Something in the chain asked for this event local.
   bool HasEventLocal(std::string_view name) const;
   // The event whose function is being written.
@@ -182,9 +209,21 @@ class Emitter {
   void CheckObjectType(const std::string& what, const PinType& type);
   void CheckRoutines();
   void CheckDispatchers();
+  // A class graph's events: the avatar's own, one of each, and custom events.
+  void CheckClassEvents(const std::vector<const Node*>& events);
+  // `params` with Self first, in a class graph, for the functions the script writes and the calls to them.
+  std::string WithSelf(const std::string& params) const;
+  // A class graph's own part of the script's top: its class, and what each avatar's own table starts as.
+  std::string ClassHeader();
 
   const Graph& graph_;
   const CompileOptions& options_;
+  // The names a variable can't have: the options' globals, and in a class graph its own (Self, My, Class, Fresh).
+  std::vector<std::string> globals_;
+  // A class graph: something reads the avatar's own table, so each function fetches it, and the nodes' kept state that
+  // lives in it (State), by name with its starting value.
+  bool uses_own_ = false;
+  std::vector<std::pair<std::string, std::string>> own_state_;
   std::vector<std::string> lines_;
   std::vector<std::string> state_;
   std::set<std::string> state_names_;

@@ -20,7 +20,9 @@
 // Renaming an enum's value or a struct's field and saving renames it in every value of every asset holding one.
 //
 // An avatar class's ClassEditor is the Avatar editor: its viewport (avatar_viewport.h) beside the rest, the component
-// selected in either being the one the viewport's gizmo is on. A later editor is another AssetEditor, picked by the
+// selected in either being the one the viewport's gizmo is on. With the node editor it's laid out as a blueprint with
+// the class's own graph (own_graph.h; docs/content_and_classes.md, Class graphs), the viewport in its Viewport tab and
+// the class's details beside it. A later editor is another AssetEditor, picked by the
 // browser for its class.
 
 #pragma once
@@ -39,6 +41,8 @@
 
 namespace rexfabric::ui {
 
+class Thumbnails;
+
 // What an editor asks of the browser hosting it.
 class EditorHost {
  public:
@@ -53,6 +57,8 @@ class EditorHost {
   virtual void Saved(const std::string& path) = 0;
   // Where a new editor window of this size opens: beside the browser, where there's room.
   virtual ImVec2 EditorPosition(const ImVec2& size) = 0;
+  // The browser's thumbnails (thumbnails.h), for an editor showing the one its asset gets; null for none.
+  virtual Thumbnails* thumbnails() { return nullptr; }
 };
 
 // A problem an editor found, and when there's one, what fixes it.
@@ -88,6 +94,9 @@ class AssetEditor {
   virtual std::string Title() const = 0;
   // How much wider than most its window opens.
   virtual float WidthFactor() const { return 1.0f; }
+  // A window holding a node graph's canvas: the glass theme over all of it, as the node editor has it, and no
+  // scrolling of the window, so the wheel zooms the canvas.
+  virtual bool HoldsCanvas() const { return false; }
   virtual void DrawContents() = 0;
   virtual void Undo() {}
   virtual void Redo() {}

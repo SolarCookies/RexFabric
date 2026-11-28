@@ -5,10 +5,12 @@
 #include <fstream>
 #include <mutex>
 #include <set>
+#include <type_traits>
 
 #include <rexfabric/content.h>
 
 #include "assets.h"
+#include "game_assets.h"
 
 namespace rexfabric::content {
 namespace {
@@ -50,11 +52,14 @@ bool Within(std::string_view path, std::string_view base) {
   return lower == prefix || (lower.size() > prefix.size() && lower.starts_with(prefix) && lower[prefix.size()] == '/');
 }
 
-void Walk(const TypeLookup& types, const ValueType& type, const nlohmann::json& value, const std::string& key, const std::function<void(const std::string&, const std::string&)>& visit, int depth);
+// Each text in a value, with its key: `Json` is the value const to read texts and not to change them.
+template <typename Json, typename Visit>
+void Walk(const TypeLookup& types, const ValueType& type, Json& value, const std::string& key, const Visit& visit, int depth);
 
-void WalkSingle(const TypeLookup& types, const ValueType& type, const nlohmann::json& value, const std::string& key, const std::function<void(const std::string&, const std::string&)>& visit, int depth) {
+template <typename Json, typename Visit>
+void WalkSingle(const TypeLookup& types, const ValueType& type, Json& value, const std::string& key, const Visit& visit, int depth) {
   if (type.type == PropertyType::kText && value.is_string()) {
-    visit(key, value.get<std::string>());
+    visit(key, value);
     return;
   }
   if (type.type != PropertyType::kStruct || !value.is_object() || depth >= kMaxDepth || !types.find_struct) return;
@@ -63,12 +68,18 @@ void WalkSingle(const TypeLookup& types, const ValueType& type, const nlohmann::
   for (const Property& field : found->fields) {
     const auto held = value.find(field.name);
     // A field the value lacks, or has as the struct has it, is the struct's default, which is the struct's own text.
-    if (held != value.end() && *held != field.value) Walk(types, field.type, *held, FieldKey(key, field.name), visit, depth + 1);
-    else Walk(types, field.type, field.value, TextKey(found->path, field.name), visit, depth + 1);
+    if (held != value.end() && *held != field.value) {
+      Walk(types, field.type, *held, FieldKey(key, field.name), visit, depth + 1);
+    } else if constexpr (std::is_const_v<Json>) {
+      Walk(types, field.type, field.value, TextKey(found->path, field.name), visit, depth + 1);
+    } else if (held != value.end()) {
+      Walk(types, field.type, *held, TextKey(found->path, field.name), visit, depth + 1);
+    }
   }
 }
 
-void Walk(const TypeLookup& types, const ValueType& type, const nlohmann::json& value, const std::string& key, const std::function<void(const std::string&, const std::string&)>& visit, int depth) {
+template <typename Json, typename Visit>
+void Walk(const TypeLookup& types, const ValueType& type, Json& value, const std::string& key, const Visit& visit, int depth) {
   switch (type.container) {
     case Container::kSingle: WalkSingle(types, type, value, key, visit, depth); break;
     case Container::kArray:
@@ -77,7 +88,7 @@ void Walk(const TypeLookup& types, const ValueType& type, const nlohmann::json& 
       break;
     case Container::kMap:
       if (!value.is_array()) return;
-      for (const nlohmann::json& pair : value) {
+      for (auto& pair : value) {
         if (pair.is_array() && pair.size() == 2) WalkSingle(types, ElementType(type), pair[1], EntryKey(key, pair[0]), visit, depth);
       }
       break;
@@ -131,7 +142,13 @@ std::string ElementKey(const std::string& key, size_t index) { return key + "[" 
 
 std::string EntryKey(const std::string& key, const nlohmann::json& map_key) { return key + "[" + (map_key.is_string() ? map_key.get<std::string>() : map_key.dump()) + "]"; }
 
-void WalkTexts(const TypeLookup& types, const ValueType& type, const nlohmann::json& value, const std::string& key, const std::function<void(const std::string& key, const std::string& text)>& visit) { Walk(types, type, value, key, visit, 0); }
+void WalkTexts(const TypeLookup& types, const ValueType& type, const nlohmann::json& value, const std::string& key, const std::function<void(const std::string& key, const std::string& text)>& visit) {
+  Walk(types, type, value, key, [&visit](const std::string& at, const nlohmann::json& text) { visit(at, text.get<std::string>()); }, 0);
+}
+
+void TranslateTexts(const TypeLookup& types, const ValueType& type, nlohmann::json& value, const std::string& key) {
+  Walk(types, type, value, key, [](const std::string& at, nlohmann::json& text) { text = Translate(at, text.get<std::string>()); }, 0);
+}
 
 std::vector<TextEntry> ModTexts(const ModList& mods, const ModInfo& mod) {
   const TypeLookup types = FileTypes(mods);
@@ -171,10 +188,9 @@ std::vector<TextEntry> ModTexts(const ModList& mods, const ModInfo& mod) {
           for (const EnumValue& value : asset->values) collect(info.path)(TextKey(info.path, value.name), value.display.empty() ? value.name : value.display);
         }
         break;
-      case AssetKind::kPacket:
-        if (std::optional<PacketAsset> asset = ReadPacketAsset(info.file, nullptr)) {
-          collect(info.path)(TextKey(info.path, "name"), asset->name);
-          if (!asset->help.empty()) collect(info.path)(TextKey(info.path, "help"), asset->help);
+      case AssetKind::kGame:
+        if (std::optional<GameAssetFile> asset = ReadGameAsset(info.file, nullptr)) {
+          ForEachShownValue(*asset->type, asset->json, [&](const AssetField& field, nlohmann::json& value) { WalkTexts(types, field.property.type, value, TextKey(info.path, field.name()), collect(info.path)); });
         }
         break;
       case AssetKind::kLanguage:

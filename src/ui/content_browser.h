@@ -7,7 +7,7 @@
 // double click opens a folder, or an asset in its editor (asset_editors.h); a right click offers what can be done
 // with it; dragging a tile onto a folder, in the grid, the tree or the path above, moves it there. Search and the class
 // filter list the assets below the folder shown (every mod's, from the top) whose name matches and that are of the
-// class.
+// class. A class's or a game asset's tile shows its thumbnail (thumbnails.h) in place of its icon once it has one.
 //
 // Renames and moves take references along: every asset of every mod naming what moved names its new path. A delete
 // says what names what's going first, and leaves those to be fixed.
@@ -29,6 +29,7 @@
 #include "../content/assets.h"
 #include "asset_editors.h"
 #include "menu_model.h"
+#include "thumbnails.h"
 
 namespace rexfabric::ui {
 
@@ -48,19 +49,22 @@ class ContentBrowserWindow : public rex::ui::DialogBase, public EditorHost {
   const content::TypeLookup& Types() override { return types_; }
   void Saved(const std::string& path) override;
   ImVec2 EditorPosition(const ImVec2& size) override;
+  Thumbnails* thumbnails() override { return thumbnails_.get(); }
 
  private:
-  enum class TileKind { kMod, kMetadata, kTranslations, kFolder, kClass, kEnum, kStruct, kTable, kLanguage, kTexture, kMapEdit, kMaterial, kMesh, kWorld, kPacket, kGameTable, kOther };
+  enum class TileKind { kMod, kMetadata, kTranslations, kFolder, kClass, kEnum, kStruct, kTable, kLanguage, kTexture, kMapEdit, kMaterial, kMesh, kWorld, kGameAsset, kGameTable, kOther };
   struct Tile {
     TileKind kind = TileKind::kOther;
     std::string path;
     std::string label;
     std::string sub;
     bool dim = false;
+    std::string type;  // a game asset's type
   };
   // What the window asks for in a popup.
-  enum class Ask { kNone, kNewMod, kNewFolder, kNewClass, kNewEnum, kNewStruct, kNewTable, kNewLanguage, kNewMapEdit, kNewMaterial, kNewWorld, kNewPacket, kImportImage, kImportMesh, kRename, kDelete };
-  static const char* AskTitle(Ask ask);
+  enum class Ask { kNone, kNewMod, kNewFolder, kNewClass, kNewEnum, kNewStruct, kNewTable, kNewLanguage, kNewMapEdit, kNewMaterial, kNewWorld, kNewGameAsset, kImportImage, kImportMesh, kRename, kDelete };
+  // The ask's title: a new game asset's says its type.
+  std::string AskTitle() const;
   // How a class asset looks: its chain of classes, and whether its objects are of a game type.
   struct ClassLook {
     std::vector<std::string> chain;
@@ -90,6 +94,8 @@ class ContentBrowserWindow : public rex::ui::DialogBase, public EditorHost {
   std::vector<Tile> Tiles() const;
   bool PassesFilter(const content::AssetInfo& asset) const;
   const content::ModContent* ContentOf(std::string_view mod) const;
+  // An asset as the content was last read; null for none.
+  const content::AssetInfo* AssetOf(std::string_view path) const;
   const ModInfo* ModOf(std::string_view path) const;
 
   void Navigate(std::string folder);
@@ -101,7 +107,7 @@ class ContentBrowserWindow : public rex::ui::DialogBase, public EditorHost {
   TileKind KindOf(std::string_view path) const;
   // Calls `visit` with the content of `mod` and of each mod it depends on.
   void ForModAndDependencies(std::string_view mod, const std::function<void(const content::ModContent&)>& visit) const;
-  void AskFor(Ask ask, std::string target, std::string text = {});
+  void AskFor(Ask ask, std::string target, std::string text = {}, std::string type = {});
 
   void CreateMod(const std::string& name);
   void CreateFolder(const std::string& name);
@@ -116,8 +122,12 @@ class ContentBrowserWindow : public rex::ui::DialogBase, public EditorHost {
   void CreateMaterial(const std::string& name, const std::string& type);
   // A new world built on `base`, opened in its editor.
   void CreateWorld(const std::string& name, const std::string& base);
-  // A new packet of the game's packet base `base`, opened in its editor.
-  void CreatePacket(const std::string& name, const std::string& base);
+  // A new asset of the game's asset type `ask_type_`, with the values asked for it, opened in its editor.
+  void CreateGameAsset(const std::string& name);
+  // The New entries, as the Add menu and a right click on empty space offer them, each asking for something new in
+  // `folder`: New Folder, then submenus by category (Basic and Advanced with RexFabric's own kinds, then the game's asset
+  // types' categories, then Other for the types naming none), then the imports. Greyed out while `enabled` is false.
+  void DrawNewItems(const std::string& folder, bool enabled);
   // Opens the system's Open dialog for a picture (or a model, for a mesh) to import into `folder`; once one is chosen,
   // asks for its name.
   void StartImport(const std::string& folder, bool mesh = false);
@@ -150,6 +160,8 @@ class ContentBrowserWindow : public rex::ui::DialogBase, public EditorHost {
   std::map<std::string, content::Enum> enums_;
   std::map<std::string, content::Struct> structs_;
   content::TypeLookup types_;
+  // What the tiles of classes and game assets show in place of their icons.
+  std::unique_ptr<Thumbnails> thumbnails_;
   bool refresh_ = false;
   bool reload_ = false;
   std::string navigate_after_refresh_;
@@ -173,6 +185,9 @@ class ContentBrowserWindow : public rex::ui::DialogBase, public EditorHost {
   std::string ask_target_;
   std::string ask_text_;
   std::string ask_parent_;
+  // A new game asset's type, and the values of the fields it's created with.
+  std::string ask_type_;
+  nlohmann::json ask_values_;
   std::vector<content::Reference> ask_references_;
   bool open_close_prompt_ = false;
 

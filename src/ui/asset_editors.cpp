@@ -27,7 +27,14 @@
 #include "material_graph_editor.h"
 #include "file_picker.h"
 #include "glass.h"
+#include "thumbnails.h"
 #include "widgets.h"
+
+#if REXFABRIC_WITH_NODE_EDITOR
+#include "../graph/graph_document.h"
+#include "../graph/node_library.h"
+#include "own_graph.h"
+#endif
 
 namespace rexfabric::ui {
 namespace {
@@ -61,6 +68,8 @@ constexpr const char* kNewEditName = "NewEdit";
 constexpr double kDuplicateOffset = 2.0;
 // How finely a transform's numbers drag.
 constexpr float kTransformDragSpeed = 0.05f;
+// The side of the thumbnail a class's editor shows, in multiples of the font size.
+constexpr float kThumbnailSize = 5.0f;
 
 std::string Lower(std::string_view text) {
   std::string lower(text);
@@ -184,10 +193,24 @@ void DrawDeclared(const char* id, std::vector<Property>& declared, EditorHost& h
   ImGui::EndTable();
 }
 
-// A class's own file, and what it inherits.
-class ClassEditor final : public DocumentEditor<ClassAsset> {
+// What a class's editor edits and undoes as one: the class's file, and an avatar class's own graph as its file keeps it
+// (docs/content_and_classes.md, Class graphs), empty until it's open.
+struct ClassDocument {
+  ClassAsset asset;
+  std::string graph;
+  bool operator==(const ClassDocument&) const = default;
+};
+
+// A class's own file, and what it inherits. An avatar class's is laid out as a blueprint (own_graph.h): its viewport in
+// the Viewport tab with the class's details beside it, and its own graph.
+class ClassEditor final : public DocumentEditor<ClassDocument> {
  public:
-  ClassEditor(EditorHost& host, std::string path, ClassAsset asset) : DocumentEditor(host, std::move(path), std::move(asset)) { Resolve(); }
+  ClassEditor(EditorHost& host, std::string path, ClassAsset asset) : DocumentEditor(host, std::move(path), {.asset = std::move(asset)}) {
+    Resolve();
+#if REXFABRIC_WITH_NODE_EDITOR
+    if (IsAvatarClass()) OpenGraph();
+#endif
+  }
 
   bool Save() override;
   void ContentChanged() override;
@@ -195,6 +218,7 @@ class ClassEditor final : public DocumentEditor<ClassAsset> {
  protected:
   std::string Title() const override { return std::string(content::NameOf(path_)); }
   float WidthFactor() const override { return IsAvatarClass() ? kAvatarEditorWidth : 1.0f; }
+  bool HoldsCanvas() const override { return HasGraph(); }
   void DrawContents() override;
 
  private:
@@ -205,7 +229,7 @@ class ClassEditor final : public DocumentEditor<ClassAsset> {
   void DrawInherited();
   void DrawOwn();
   // Avatars (docs/content_and_classes.md, Avatars): the backing, the inherited components and its own.
-  bool IsAvatarClass() const { return !avatar_.backing.empty() || !document_.backing.empty() || !document_.components.empty(); }
+  bool IsAvatarClass() const { return !avatar_.backing.empty() || !document_.asset.backing.empty() || !document_.asset.components.empty(); }
   // The viewport (The viewport), beside the rest, of the class as it's being edited.
   void DrawViewport();
   content::AvatarValues PreviewValues() const;
@@ -215,6 +239,16 @@ class ClassEditor final : public DocumentEditor<ClassAsset> {
   // Every component name the class and its ancestors take.
   bool NameTaken(const std::string& name) const;
   std::vector<EditorProblem> Problems();
+#if REXFABRIC_WITH_NODE_EDITOR
+  // The avatar class's own graph beside its file, read, with a node of each of its avatars' events it lacks. Opened
+  // with the class as saved, the graph as read is no change of its own.
+  void OpenGraph();
+  // The blueprint layout: shown while the class is an avatar class with its graph open.
+  bool HasGraph() const { return graph_ != nullptr && IsAvatarClass(); }
+  std::unique_ptr<OwnGraph> graph_;
+#else
+  bool HasGraph() const { return false; }
+#endif
 
   std::string resolved_parent_;
   std::vector<Property> inherited_;
@@ -228,35 +262,75 @@ class ClassEditor final : public DocumentEditor<ClassAsset> {
 bool ClassEditor::Save() {
   const std::optional<std::filesystem::path> file = File();
   std::string error;
-  if (!file || !content::WriteClassAsset(*file, document_, &error)) {
+  if (!file || !content::WriteClassAsset(*file, document_.asset, &error)) {
     if (file) SetStatus(error, true);
     return false;
   }
+  bool graph_saved = false;
+#if REXFABRIC_WITH_NODE_EDITOR
+  if (graph_) {
+    graph_saved = graph_->Save(&error);
+    if (!graph_saved) {
+      SetStatus(error, true);
+      return false;
+    }
+  }
+#endif
   MarkSaved();
   host_.Saved(path_);
+  // Its graph's script runs from now, as the node editor's Save and Reload has it.
+  if (graph_saved) host_.model().ReloadScripts();
   SavedStatus(!Problems().empty());
   return true;
 }
 
+#if REXFABRIC_WITH_NODE_EDITOR
+void ClassEditor::OpenGraph() {
+  const ModInfo* mod = Mod();
+  if (mod == nullptr) return;
+  const bool unchanged = !dirty();
+  graph_ = std::make_unique<OwnGraph>(OwnGraph::Host{.status = [this](std::string text, bool error) { SetStatus(std::move(text), error); }, .edited = [this](std::string text) { document_.graph = std::move(text); }});
+  const graph::Location location = graph::ClassGraphLocation(mod->dir, content::AssetFile(*mod, path_), path_);
+  document_.graph = graph_->Open(mod->dir, mod->folder, std::string(content::NameOf(path_)), location, graph::ClassEventNodes(avatar_.game_class));
+  if (unchanged) Reload(document_);
+}
+#endif
+
 void ClassEditor::ContentChanged() {
   // A rename elsewhere may have repointed what this file names: shown as it is now, unless it has changes of its own.
   if (const ModInfo* mod = Mod(); mod && !dirty()) {
-    if (std::optional<ClassAsset> asset = content::ReadClassAsset(content::AssetFile(*mod, path_), nullptr)) Reload(std::move(*asset));
+    if (std::optional<ClassAsset> asset = content::ReadClassAsset(content::AssetFile(*mod, path_), nullptr)) Reload({.asset = std::move(*asset), .graph = document_.graph});
   }
   Resolve();
 }
 
 void ClassEditor::Resolve() {
   const ModInfo* mod = Mod();
-  resolved_parent_ = document_.parent;
+  resolved_parent_ = document_.asset.parent;
   parent_problem_.clear();
-  inherited_ = content::InheritedProperties(host_.model().mods(), document_.parent, &parent_problem_);
-  avatar_ = content::InheritAvatar(host_.model().mods(), document_.parent);
+  inherited_ = content::InheritedProperties(host_.model().mods(), document_.asset.parent, &parent_problem_);
+  avatar_ = content::InheritAvatar(host_.model().mods(), document_.asset.parent);
   choices_ = mod ? host_.Choices(mod->folder) : TypeChoices{};
 }
 
 void ClassEditor::DrawContents() {
-  if (resolved_parent_ != document_.parent) Resolve();
+  if (resolved_parent_ != document_.asset.parent) Resolve();
+#if REXFABRIC_WITH_NODE_EDITOR
+  // A class that became an avatar class (a backing, a parent with one) gets its graph.
+  if (IsAvatarClass() && !graph_) OpenGraph();
+  if (HasGraph()) {
+    // An undo of the editor's may have taken the graph somewhere else; then the canvas's light, the toolbar and the
+    // problems over it, and the blueprint's tabs and panes.
+    graph_->Follow(document_.graph);
+    graph_->DrawBackdrop();
+    DrawToolbar(CanUndo(), CanRedo());
+    DrawProblems(Problems());
+    graph_->Draw([this] { DrawViewport(); }, [this] { DrawBody(); }, std::string(content::NameOf(path_)) + ".graph.lua, beside it");
+    // A drag of a node or of the gizmo is one edit, kept when it's let go.
+    if (!graph_->moving() && (!viewport_ || !viewport_->held())) Remember();
+    return;
+  }
+#endif
   DrawToolbar(CanUndo(), CanRedo());
   DrawProblems(Problems());
   if (!IsAvatarClass()) {
@@ -291,19 +365,15 @@ void ClassEditor::DrawBody() {
 
 void ClassEditor::DrawViewport() {
   if (!viewport_) viewport_ = std::make_unique<AvatarViewport>();
-  const content::ViewportView view{.class_path = path_, .game_class = avatar_.game_class, .backing = document_.backing.empty() ? avatar_.backing : document_.backing, .values = PreviewValues()};
-  viewport_->Draw(ImGui::GetContentRegionAvail(), view, avatar_.components, document_.components, selected_component_);
+  const content::ViewportView view{.class_path = path_, .game_class = avatar_.game_class, .backing = document_.asset.backing.empty() ? avatar_.backing : document_.asset.backing, .values = PreviewValues()};
+  // Its thumbnail framing, kept beside the class's other keys; written back only when the toolbar changed it.
+  const std::optional<content::ThumbnailView> stored = content::ReadThumbnailView(document_.asset.rest);
+  std::optional<content::ThumbnailView> thumbnail = stored;
+  viewport_->Draw(ImGui::GetContentRegionAvail(), view, avatar_.components, document_.asset.components, selected_component_, &thumbnail);
+  if (thumbnail != stored) content::WriteThumbnailView(document_.asset.rest, thumbnail);
 }
 
-content::AvatarValues ClassEditor::PreviewValues() const {
-  content::AvatarValues values;
-  for (const Property& property : inherited_) {
-    const std::string key = KeyOf(document_.defaults, property.name);
-    values[property.name] = content::ToPropertyValue(key.empty() ? property.value : document_.defaults.at(key));
-  }
-  for (const Property& property : document_.properties) values[property.name] = content::ToPropertyValue(property.value);
-  return values;
-}
+content::AvatarValues ClassEditor::PreviewValues() const { return ClassViewValues(inherited_, document_.asset); }
 
 void ClassEditor::DrawClass() {
   ImGui::SeparatorText("Class");
@@ -316,10 +386,15 @@ void ClassEditor::DrawClass() {
   for (const std::string& candidate : choices_.classes) {
     if (!Same(candidate, path_)) parents.push_back(candidate);
   }
-  PathCombo("##parent", document_.parent.c_str(), document_.parent, parents, nullptr);
-  if (std::optional<content::Class> parent = content::FindClass(document_.parent); parent && !parent->help.empty()) ImGui::SetItemTooltip("%s", parent->help.c_str());
+  PathCombo("##parent", document_.asset.parent.c_str(), document_.asset.parent, parents, nullptr);
+  if (std::optional<content::Class> parent = content::FindClass(document_.asset.parent); parent && !parent->help.empty()) ImGui::SetItemTooltip("%s", parent->help.c_str());
   LabelRow("Help");
-  widgets::InputStringMultiline("##help", document_.help, ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 3.0f));
+  widgets::InputStringMultiline("##help", document_.asset.help, ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 3.0f));
+  // What the content browser shows of it: its thumbnail property's picture (From Object), or one made of its viewport.
+  if (Thumbnails* thumbnails = host_.thumbnails()) {
+    LabelRow("Thumbnail");
+    thumbnails->Item(path_, ImGui::GetFontSize() * kThumbnailSize);
+  }
   ImGui::EndTable();
 }
 
@@ -341,9 +416,9 @@ void ClassEditor::DrawInherited() {
     }
     if (!table) continue;
     ImGui::PushID(property.name.c_str());
-    const std::string key = KeyOf(document_.defaults, property.name);
+    const std::string key = KeyOf(document_.asset.defaults, property.name);
     const bool overridden = !key.empty();
-    nlohmann::json value = overridden ? document_.defaults[key] : property.value;
+    nlohmann::json value = overridden ? document_.asset.defaults[key] : property.value;
 
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
@@ -352,10 +427,10 @@ void ClassEditor::DrawInherited() {
     else ImGui::TextUnformatted(property.name.c_str());
     ImGui::SetItemTooltip("%s%s%s, %s", property.help.c_str(), property.help.empty() ? "" : "\n", content::Describe(property.type).c_str(), overridden ? "set here" : "as its parent has it");
     ImGui::TableNextColumn();
-    if (ValueField("##value", property.type, value, host_.Types(), choices_)) document_.defaults[overridden ? key : property.name] = value;
+    if (ValueField("##value", property.type, value, host_.Types(), choices_)) document_.asset.defaults[overridden ? key : property.name] = value;
     ImGui::TableNextColumn();
     ImGui::BeginDisabled(!overridden);
-    if (glass::SmallButton("Reset")) document_.defaults.erase(key);
+    if (glass::SmallButton("Reset")) document_.asset.defaults.erase(key);
     ImGui::EndDisabled();
     ImGui::SetItemTooltip("Back to its parent's value");
     ImGui::PopID();
@@ -367,15 +442,15 @@ void ClassEditor::DrawOwn() {
   ImGui::SeparatorText("Added here");
   size_t acted = 0;
   RowAction action = RowAction::kNone;
-  DrawDeclared("##own", document_.properties, host_, choices_, false, &acted, &action);
-  ApplyRowAction(action, acted, document_.properties);
-  if (document_.properties.empty()) ImGui::TextDisabled("No properties of its own yet");
+  DrawDeclared("##own", document_.asset.properties, host_, choices_, false, &acted, &action);
+  ApplyRowAction(action, acted, document_.asset.properties);
+  if (document_.asset.properties.empty()) ImGui::TextDisabled("No properties of its own yet");
   if (glass::Button("Add Property", glass::kCreate)) {
     const auto taken = [this](const std::string& name) {
       const auto named = [&name](const Property& property) { return Same(property.name, name); };
-      return std::any_of(document_.properties.begin(), document_.properties.end(), named) || std::any_of(inherited_.begin(), inherited_.end(), named);
+      return std::any_of(document_.asset.properties.begin(), document_.asset.properties.end(), named) || std::any_of(inherited_.begin(), inherited_.end(), named);
     };
-    document_.properties.push_back({.name = FreeName(kNewPropertyName, taken), .type = {.type = PropertyType::kInt}, .value = 0});
+    document_.asset.properties.push_back({.name = FreeName(kNewPropertyName, taken), .type = {.type = PropertyType::kInt}, .value = 0});
   }
 }
 
@@ -390,7 +465,7 @@ void CollectNames(const std::vector<content::Component>& components, std::vector
 bool ClassEditor::NameTaken(const std::string& name) const {
   std::vector<std::string> names;
   CollectNames(avatar_.components, names);
-  CollectNames(document_.components, names);
+  CollectNames(document_.asset.components, names);
   return std::any_of(names.begin(), names.end(), [&name](const std::string& taken) { return Same(taken, name); });
 }
 
@@ -400,10 +475,10 @@ void ClassEditor::DrawAvatar() {
   if (BeginLabelTable("##avatar")) {
     LabelRow("Backing");
     const std::string parents = "As its parent's: " + (avatar_.backing.empty() ? std::string("none") : avatar_.backing);
-    if (ImGui::BeginCombo("##backing", document_.backing.empty() ? parents.c_str() : document_.backing.c_str())) {
-      if (ImGui::Selectable(parents.c_str(), document_.backing.empty())) document_.backing.clear();
+    if (ImGui::BeginCombo("##backing", document_.asset.backing.empty() ? parents.c_str() : document_.asset.backing.c_str())) {
+      if (ImGui::Selectable(parents.c_str(), document_.asset.backing.empty())) document_.asset.backing.clear();
       for (const std::string& offered : content::BackingsFor(avatar_.game_class)) {
-        if (ImGui::Selectable(offered.c_str(), Same(offered, document_.backing))) document_.backing = offered;
+        if (ImGui::Selectable(offered.c_str(), Same(offered, document_.asset.backing))) document_.asset.backing = offered;
         if (const auto backing = content::FindBacking(offered); backing && !backing->help.empty()) ImGui::SetItemTooltip("%s", backing->help.c_str());
       }
       ImGui::EndCombo();
@@ -421,11 +496,11 @@ void ClassEditor::DrawAvatar() {
     };
     for (const content::Component& component : avatar_.components) list(component, 0);
   }
-  DrawComponents(document_.components);
-  if (document_.components.empty()) ImGui::TextDisabled("No components of its own yet");
+  DrawComponents(document_.asset.components);
+  if (document_.asset.components.empty()) ImGui::TextDisabled("No components of its own yet");
   if (glass::Button("Add Component", glass::kCreate)) {
     const std::vector<std::string> types = content::ComponentTypePaths();
-    document_.components.push_back({.name = FreeName(kNewComponentName, [this](const std::string& name) { return NameTaken(name); }), .type = types.empty() ? std::string() : types.front()});
+    document_.asset.components.push_back({.name = FreeName(kNewComponentName, [this](const std::string& name) { return NameTaken(name); }), .type = types.empty() ? std::string() : types.front()});
   }
   ImGui::SetItemTooltip("A component of the avatar itself; Add Child puts one on another component");
 }
@@ -519,37 +594,37 @@ std::vector<EditorProblem> ClassEditor::Problems() {
   std::vector<EditorProblem> problems;
   const ModInfo* mod = Mod();
   if (!mod) return problems;
-  if (!document_.backing.empty()) {
+  if (!document_.asset.backing.empty()) {
     const std::vector<std::string> offered = content::BackingsFor(avatar_.game_class);
-    if (std::none_of(offered.begin(), offered.end(), [this](const std::string& path) { return Same(path, document_.backing); })) problems.push_back({"Its backing " + document_.backing + " isn't one the game offers for classes below " + (avatar_.game_class.empty() ? std::string("its game class") : avatar_.game_class), "Use its parent's", [this] { document_.backing.clear(); }});
+    if (std::none_of(offered.begin(), offered.end(), [this](const std::string& path) { return Same(path, document_.asset.backing); })) problems.push_back({"Its backing " + document_.asset.backing + " isn't one the game offers for classes below " + (avatar_.game_class.empty() ? std::string("its game class") : avatar_.game_class), "Use its parent's", [this] { document_.asset.backing.clear(); }});
   }
-  if (!document_.components.empty() && document_.backing.empty() && avatar_.backing.empty()) problems.push_back({"It has components, but nothing gives it a backing, so it isn't an avatar class"});
-  if (!document_.components.empty()) {
+  if (!document_.asset.components.empty() && document_.asset.backing.empty() && avatar_.backing.empty()) problems.push_back({"It has components, but nothing gives it a backing, so it isn't an avatar class"});
+  if (!document_.asset.components.empty()) {
     std::vector<std::string> taken;
     CollectNames(avatar_.components, taken);
-    std::vector<content::Component> checked = document_.components;
+    std::vector<content::Component> checked = document_.asset.components;
     if (std::string why; !content::CheckComponents(checked, taken, &why)) problems.push_back({"Components: " + why});
   }
   if (!parent_problem_.empty()) problems.push_back({"Its parent: " + parent_problem_});
-  const std::vector<std::string> chain = content::ClassChain(host_.model().mods(), document_.parent);
-  if (std::any_of(chain.begin(), chain.end(), [this](const std::string& at) { return Same(at, path_); })) problems.push_back({document_.parent + " comes from this class, so it can't be its parent"});
-  if (auto problem = DependencyProblem(host_, *mod, document_.parent, "Its parent")) problems.push_back(std::move(*problem));
+  const std::vector<std::string> chain = content::ClassChain(host_.model().mods(), document_.asset.parent);
+  if (std::any_of(chain.begin(), chain.end(), [this](const std::string& at) { return Same(at, path_); })) problems.push_back({document_.asset.parent + " comes from this class, so it can't be its parent"});
+  if (auto problem = DependencyProblem(host_, *mod, document_.asset.parent, "Its parent")) problems.push_back(std::move(*problem));
 
-  DeclaredProblems(host_, *mod, document_.properties, "Property", problems);
-  for (const Property& property : document_.properties) {
+  DeclaredProblems(host_, *mod, document_.asset.properties, "Property", problems);
+  for (const Property& property : document_.asset.properties) {
     if (std::any_of(inherited_.begin(), inherited_.end(), [&property](const Property& other) { return Same(other.name, property.name); })) problems.push_back({"Property " + property.name + " is inherited already"});
   }
 
-  for (const auto& [name, value] : document_.defaults.items()) {
+  for (const auto& [name, value] : document_.asset.defaults.items()) {
     const std::string key = name;
     const auto found = std::find_if(inherited_.begin(), inherited_.end(), [&key](const Property& property) { return Same(property.name, key); });
     if (found == inherited_.end()) {
-      problems.push_back({"A default for " + key + ", which " + document_.parent + " doesn't have", "Remove it", [this, key] { document_.defaults.erase(key); }});
+      problems.push_back({"A default for " + key + ", which " + document_.asset.parent + " doesn't have", "Remove it", [this, key] { document_.asset.defaults.erase(key); }});
       continue;
     }
     std::string why;
     if (!content::FitValue(host_.Types(), found->type, value, nullptr, &why)) {
-      problems.push_back({"The default for " + key + ": " + why, "Reset it", [this, key] { document_.defaults.erase(key); }});
+      problems.push_back({"The default for " + key + ": " + why, "Reset it", [this, key] { document_.asset.defaults.erase(key); }});
       continue;
     }
     nlohmann::json walked = value;
@@ -2254,7 +2329,10 @@ bool AssetEditor::Draw() {
   }
   bool open = true;
   const std::string title = Title() + (dirty() ? " *" : "") + "###asset:" + path_;
-  if (glass::BeginWindow(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
+  std::optional<glass::Theme> theme;
+  if (HoldsCanvas()) theme.emplace();
+  const ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | (HoldsCanvas() ? ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse : ImGuiWindowFlags_None);
+  if (glass::BeginWindow(title.c_str(), &open, flags)) {
     const ImGuiIO& io = ImGui::GetIO();
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
       if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) Save();

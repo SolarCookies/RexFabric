@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -185,7 +187,42 @@ bool ValidPath(std::string_view path, std::string* why) {
   return true;
 }
 
+// The game's string lists (StringListDecl), by path; declared before Start, so read without a lock after it.
+std::map<std::string, std::function<std::vector<std::string>()>, std::less<>>& StringLists() {
+  static std::map<std::string, std::function<std::vector<std::string>()>, std::less<>> lists;
+  return lists;
+}
+
+bool TableDeclared(std::string_view path) {
+  Registry& registry = Get();
+  std::shared_lock lock(registry.mutex);
+  return registry.Find(path) != nullptr;
+}
+
 }  // namespace
+
+bool DeclareStringList(StringListDecl decl) {
+  std::string why;
+  if (!ValidPath(decl.path, &why)) {
+    RF_ERROR("content: the game's string list {}: {}", decl.path, why);
+    return false;
+  }
+  if (!decl.list) {
+    RF_ERROR("content: the game's string list {} has nothing making it", decl.path);
+    return false;
+  }
+  if (FindClass(decl.path) || FindStruct(decl.path) || StringLists().contains(decl.path) || TableDeclared(decl.path)) {
+    RF_ERROR("content: the game's string list {} takes a path that's taken", decl.path);
+    return false;
+  }
+  StringLists().emplace(std::move(decl.path), std::move(decl.list));
+  return true;
+}
+
+std::vector<std::string> StringChoices(std::string_view of) {
+  if (const auto list = StringLists().find(of); list != StringLists().end()) return list->second();
+  return RowNames(of);
+}
 
 bool DeclareTable(TableDecl decl) {
   std::string why;
@@ -304,6 +341,11 @@ std::vector<std::string> RowNames(std::string_view path) {
 }
 
 bool HasRow(std::string_view path, std::string_view name) { return TableRow(path, name).has_value(); }
+
+std::optional<std::string> FindTableRow(std::string_view table, std::string_view row) {
+  const std::optional<nlohmann::json> found = TableRow(table, row);
+  return found ? std::optional<std::string>(found->dump()) : std::nullopt;
+}
 
 std::string RowStruct(std::string_view path) {
   Registry& registry = Get();

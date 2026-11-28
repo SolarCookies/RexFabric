@@ -15,12 +15,13 @@
 #include "../content/localisation.h"
 #include "../content/map_edits.h"
 #include "../content/materials.h"
-#include "../content/packets.h"
+#include "../content/game_assets.h"
 #include "../content/tables.h"
 #include "../content/types.h"
 #include "file_picker.h"
 #include "glass.h"
 #include "widgets.h"
+#include "game_asset_editor.h"
 #include "world_mesh_editors.h"
 
 namespace rexfabric::ui {
@@ -35,6 +36,8 @@ constexpr float kTileWidth = 8.5f;
 constexpr float kSearchWidth = 11.0f;
 constexpr float kFilterWidth = 12.0f;
 constexpr float kAskWidth = 26.0f;
+// How much of the glyph's height a thumbnail's square takes.
+constexpr float kThumbnailShare = 0.96f;
 // How many of the references a delete lists before saying how many more.
 constexpr size_t kListedReferences = 8;
 
@@ -43,6 +46,10 @@ constexpr const char* kAskPopup = "###ask";
 constexpr const char* kClosePopup = "Unsaved changes###close";
 constexpr const char* kMetadataLabel = "Metadata";
 constexpr const char* kNewModVersion = "1.0.0";
+// The New menus' submenus of RexFabric's own kinds, and the one of the game's asset types that name no category.
+constexpr std::string_view kBasicCategory = "Basic";
+constexpr std::string_view kAdvancedCategory = "Advanced";
+constexpr std::string_view kOtherCategory = "Other";
 
 // The glass of the panes, and the colors of the tiles by what they are.
 constexpr ImVec4 kPaneTint{0.05f, 0.06f, 0.11f, 0.42f};
@@ -63,8 +70,6 @@ constexpr ImVec4 kMapEditColor{0.55f, 0.85f, 0.45f, 1.0f};
 constexpr ImVec4 kMaterialColor{0.85f, 0.55f, 0.95f, 1.0f};
 constexpr ImVec4 kMeshColor{0.95f, 0.7f, 0.45f, 1.0f};
 constexpr ImVec4 kWorldColor{0.35f, 0.75f, 0.95f, 1.0f};
-constexpr ImVec4 kPacketColor{0.9f, 0.72f, 0.42f, 1.0f};
-constexpr ImVec4 kSproutColor{0.45f, 0.8f, 0.4f, 1.0f};
 constexpr ImVec4 kLandColor{0.45f, 0.8f, 0.4f, 1.0f};
 constexpr ImVec4 kPinColor{0.95f, 0.35f, 0.3f, 1.0f};
 
@@ -127,6 +132,7 @@ ContentBrowserWindow::ContentBrowserWindow(MenuModel& model, std::function<void(
     std::optional<content::Struct> known = content::FindStruct(path);
     return known && known->mod.empty() ? known : std::nullopt;
   };
+  thumbnails_ = std::make_unique<Thumbnails>(model_, types_, [this](std::string_view path) { return AssetOf(path); });
   Refresh();
   Navigate(LastFolder());
 }
@@ -160,7 +166,7 @@ TypeChoices ContentBrowserWindow::Choices(std::string_view mod) {
   for (const std::string& path : content::StructPaths({})) {
     if (std::optional<content::Struct> known = content::FindStruct(path); known && known->mod.empty()) choices.structs.push_back(path);
   }
-  choices.packets = content::GamePacketPaths();
+  for (const auto& type : content::AssetTypes()) choices.game_assets[Lower(type->path)] = content::BuiltInAssetPaths(type->path);
   ForModAndDependencies(mod, [&choices](const content::ModContent& found) {
     for (const AssetInfo& asset : found.assets) {
       if (asset.kind == AssetKind::kClass) choices.classes.push_back(asset.path);
@@ -171,7 +177,7 @@ TypeChoices ContentBrowserWindow::Choices(std::string_view mod) {
       if (asset.kind == AssetKind::kMapEdit) choices.map_edits.push_back(asset.path);
       if (asset.kind == AssetKind::kMesh) choices.meshes.push_back(asset.path);
       if (asset.kind == AssetKind::kWorld) choices.worlds.push_back(asset.path);
-      if (asset.kind == AssetKind::kPacket) choices.packets.push_back(asset.path);
+      if (asset.kind == AssetKind::kGame) choices.game_assets[Lower(asset.type)].push_back(asset.path);
     }
   });
   return choices;
@@ -203,7 +209,7 @@ ContentBrowserWindow::TileKind ContentBrowserWindow::KindOf(std::string_view pat
     case AssetKind::kMaterial: return TileKind::kMaterial;
     case AssetKind::kMesh: return TileKind::kMesh;
     case AssetKind::kWorld: return TileKind::kWorld;
-    case AssetKind::kPacket: return TileKind::kPacket;
+    case AssetKind::kGame: return TileKind::kGameAsset;
     case AssetKind::kOther: return TileKind::kOther;
   }
   return TileKind::kOther;
@@ -239,6 +245,7 @@ void ContentBrowserWindow::OnDraw(ImGuiIO& io) {
     for (const auto& editor : editors_) editor->ContentChanged();
     if (!navigate_after_refresh_.empty()) Navigate(std::exchange(navigate_after_refresh_, {}));
   }
+  thumbnails_->Poll();
 
   ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.6f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
   ImGui::SetNextWindowSize(ImVec2(1320.0f, 720.0f), ImGuiCond_FirstUseEver);
@@ -275,6 +282,7 @@ void ContentBrowserWindow::Refresh() {
   enums_.clear();
   structs_.clear();
   for (const ModInfo& mod : model_.mods().mods()) content_[Lower(mod.folder)] = content::ScanContent(mod);
+  thumbnails_->Forget();
   for (const auto& [mod, found] : content_) {
     for (const AssetInfo& asset : found.assets) {
       if (asset.kind == AssetKind::kEnum) {
@@ -307,7 +315,7 @@ void ContentBrowserWindow::Refresh() {
 
 void ContentBrowserWindow::DrawToolbar() {
   if (glass::Button("Add", glass::kCreate)) ImGui::OpenPopup("##add");
-  ImGui::SetItemTooltip("A new folder, class or mod");
+  ImGui::SetItemTooltip("A new folder, asset or mod");
   DrawAddMenu();
   ImGui::SameLine();
   DrawBreadcrumb();
@@ -352,18 +360,7 @@ void ContentBrowserWindow::DrawToolbar() {
 void ContentBrowserWindow::DrawAddMenu() {
   if (!ImGui::BeginPopup("##add")) return;
   const bool in_mod = !folder_.empty();
-  if (ImGui::MenuItem("New Folder...", nullptr, false, in_mod)) AskFor(Ask::kNewFolder, folder_, "NewFolder");
-  if (ImGui::MenuItem("New Class...", nullptr, false, in_mod)) AskFor(Ask::kNewClass, folder_, "NewClass");
-  if (ImGui::MenuItem("New Enum...", nullptr, false, in_mod)) AskFor(Ask::kNewEnum, folder_, "NewEnum");
-  if (ImGui::MenuItem("New Struct...", nullptr, false, in_mod)) AskFor(Ask::kNewStruct, folder_, "NewStruct");
-  if (ImGui::MenuItem("New Data Table...", nullptr, false, in_mod)) AskFor(Ask::kNewTable, folder_, "NewTable");
-  if (content::HasGameTexts() && ImGui::MenuItem("New Language...", nullptr, false, in_mod)) AskFor(Ask::kNewLanguage, folder_, "NewLanguage");
-  if (!content::Worlds().empty() && ImGui::MenuItem("New Map Edit...", nullptr, false, in_mod)) AskFor(Ask::kNewMapEdit, folder_, "NewMapEdit");
-  if (!content::MaterialTypePaths().empty() && ImGui::MenuItem("New Material...", nullptr, false, in_mod)) AskFor(Ask::kNewMaterial, folder_, "NewMaterial");
-  if (!content::Worlds().empty() && ImGui::MenuItem("New World...", nullptr, false, in_mod)) AskFor(Ask::kNewWorld, folder_, "NewWorld");
-  if (content::HasPackets() && ImGui::MenuItem("New Packet...", nullptr, false, in_mod)) AskFor(Ask::kNewPacket, folder_, "NewPacket");
-  if (ImGui::MenuItem("Import Image...", nullptr, false, in_mod && !picking_)) StartImport(folder_);
-  if (ImGui::MenuItem("Import Mesh...", nullptr, false, in_mod && !picking_)) StartImport(folder_, true);
+  DrawNewItems(folder_, in_mod);
   if (!in_mod) ImGui::TextDisabled("Open a mod to add content to it");
   ImGui::Separator();
   if (ImGui::MenuItem("New Mod...")) AskFor(Ask::kNewMod, {}, "MyMod");
@@ -453,7 +450,7 @@ void ContentBrowserWindow::DrawTreeFolder(const std::string& folder) {
 
 std::vector<ContentBrowserWindow::Tile> ContentBrowserWindow::Tiles() const {
   std::vector<Tile> tiles;
-  const auto add_asset = [this, &tiles](const AssetInfo& asset, std::string sub) { tiles.push_back({KindOf(asset.path), asset.path, asset.name, std::move(sub)}); };
+  const auto add_asset = [this, &tiles](const AssetInfo& asset, std::string sub) { tiles.push_back({.kind = KindOf(asset.path), .path = asset.path, .label = asset.name, .sub = std::move(sub), .type = asset.type}); };
   // What a tile says it is below its name: a class's parent, or the kind of asset.
   const auto parent_of = [](const AssetInfo& asset) {
     switch (asset.kind) {
@@ -467,7 +464,10 @@ std::vector<ContentBrowserWindow::Tile> ContentBrowserWindow::Tiles() const {
       case AssetKind::kMaterial: return std::string("Material");
       case AssetKind::kMesh: return std::string("Mesh");
       case AssetKind::kWorld: return std::string("World");
-      case AssetKind::kPacket: return std::string("Packet");
+      case AssetKind::kGame: {
+        const std::shared_ptr<const content::AssetType> type = content::FindAssetType(asset.type);
+        return type ? type->label : std::string("Game asset");
+      }
       case AssetKind::kOther: break;
     }
     return std::string("Unknown kind");
@@ -531,18 +531,7 @@ void ContentBrowserWindow::DrawGrid() {
 
   // A right click on empty space makes something here.
   if (!folder_.empty() && ImGui::BeginPopupContextWindow("##empty", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
-    if (ImGui::MenuItem("New Folder...")) AskFor(Ask::kNewFolder, folder_, "NewFolder");
-    if (ImGui::MenuItem("New Class...")) AskFor(Ask::kNewClass, folder_, "NewClass");
-    if (ImGui::MenuItem("New Enum...")) AskFor(Ask::kNewEnum, folder_, "NewEnum");
-    if (ImGui::MenuItem("New Struct...")) AskFor(Ask::kNewStruct, folder_, "NewStruct");
-    if (ImGui::MenuItem("New Data Table...")) AskFor(Ask::kNewTable, folder_, "NewTable");
-    if (content::HasGameTexts() && ImGui::MenuItem("New Language...")) AskFor(Ask::kNewLanguage, folder_, "NewLanguage");
-    if (!content::Worlds().empty() && ImGui::MenuItem("New Map Edit...")) AskFor(Ask::kNewMapEdit, folder_, "NewMapEdit");
-    if (!content::MaterialTypePaths().empty() && ImGui::MenuItem("New Material...")) AskFor(Ask::kNewMaterial, folder_, "NewMaterial");
-    if (!content::Worlds().empty() && ImGui::MenuItem("New World...")) AskFor(Ask::kNewWorld, folder_, "NewWorld");
-    if (content::HasPackets() && ImGui::MenuItem("New Packet...")) AskFor(Ask::kNewPacket, folder_, "NewPacket");
-    if (ImGui::MenuItem("Import Image...", nullptr, false, !picking_)) StartImport(folder_);
-    if (ImGui::MenuItem("Import Mesh...", nullptr, false, !picking_)) StartImport(folder_, true);
+    DrawNewItems(folder_, true);
     ImGui::EndPopup();
   }
   if (ImGui::IsWindowFocused() && !ImGui::GetIO().WantTextInput && !selected_.empty()) {
@@ -661,6 +650,13 @@ void ContentBrowserWindow::DrawGlyph(const Tile& tile, const ImVec2& min, float 
     draw->AddConvexPolyFilled(left, 4, Shade(color, 0.72f, alpha));
     draw->AddConvexPolyFilled(right, 4, Shade(color, 0.5f, alpha));
   };
+
+  // A class's or a game asset's thumbnail in place of its icon, once it has one to show: asked for only while the tile
+  // is scrolled into view, so only those are made.
+  if ((tile.kind == TileKind::kClass || tile.kind == TileKind::kGameAsset) && ImGui::IsRectVisible(min, ImVec2(min.x + size, min.y + height))) {
+    const float side = height * kThumbnailShare;
+    if (thumbnails_->Draw(draw, tile.path, ImVec2(center.x - side * 0.5f, center.y - side * 0.5f), side, alpha)) return;
+  }
 
   switch (tile.kind) {
     case TileKind::kMod: {
@@ -820,17 +816,19 @@ void ContentBrowserWindow::DrawGlyph(const Tile& tile, const ImVec2& min, float 
       draw->AddCircle(center, r, Shade(kWorldColor, 1.3f, alpha), 32, 1.5f);
       break;
     }
-    case TileKind::kPacket: {
-      // A seed packet: a paper bag with its top folded over and a sprout on its front.
-      const float w = height * 0.42f;
-      const float h = height * 0.54f;
+    case TileKind::kGameAsset: {
+      // A card in its type's colour, its label's first letter on it.
+      const std::shared_ptr<const content::AssetType> type = content::FindAssetType(tile.type);
+      const ImVec4 color = type ? ImVec4(type->colour[0], type->colour[1], type->colour[2], 1.0f) : kOtherColor;
+      const float w = height * 0.56f;
+      const float h = height * 0.66f;
       const ImVec2 at(center.x - w * 0.5f, center.y - h * 0.5f);
-      draw->AddRectFilled(at, ImVec2(at.x + w, at.y + h), Shade(kPacketColor, 0.85f, alpha), 3.0f);
-      draw->AddRectFilled(at, ImVec2(at.x + w, at.y + h * 0.2f), Shade(kPacketColor, 1.15f, alpha), 3.0f);
-      const ImVec2 stem(center.x, at.y + h * 0.82f);
-      draw->AddLine(stem, ImVec2(stem.x, stem.y - h * 0.38f), Shade(kSproutColor, 0.8f, alpha), 2.0f);
-      draw->AddCircleFilled(ImVec2(stem.x - w * 0.14f, stem.y - h * 0.34f), w * 0.13f, Shade(kSproutColor, 1.0f, alpha), 16);
-      draw->AddCircleFilled(ImVec2(stem.x + w * 0.14f, stem.y - h * 0.42f), w * 0.13f, Shade(kSproutColor, 1.1f, alpha), 16);
+      draw->AddRectFilled(at, ImVec2(at.x + w, at.y + h), Shade(color, 0.85f, alpha), w * 0.14f);
+      draw->AddRect(at, ImVec2(at.x + w, at.y + h), Shade(color, 1.2f, alpha), w * 0.14f, 0, 1.5f);
+      const char letter[2] = {type && !type->label.empty() ? type->label.front() : '?', 0};
+      const float font = h * 0.6f;
+      const ImVec2 extent = ImGui::GetFont()->CalcTextSizeA(font, FLT_MAX, 0.0f, letter);
+      draw->AddText(ImGui::GetFont(), font, ImVec2(center.x - extent.x * 0.5f, center.y - extent.y * 0.5f), Shade(color, 0.35f, alpha), letter);
       break;
     }
     case TileKind::kOther: sheet(kOtherColor, false); break;
@@ -921,7 +919,7 @@ void ContentBrowserWindow::OpenEditor(const std::string& path, TileKind kind) {
     case TileKind::kMaterial: editor = OpenMaterialEditor(*this, path); break;
     case TileKind::kMesh: editor = OpenMeshEditor(*this, path); break;
     case TileKind::kWorld: editor = OpenWorldEditor(*this, path); break;
-    case TileKind::kPacket: editor = OpenPacketEditor(*this, path); break;
+    case TileKind::kGameAsset: editor = OpenGameAssetEditor(*this, path); break;
     default: break;
   }
   if (!editor) {
@@ -947,7 +945,7 @@ void ContentBrowserWindow::Open(const Tile& tile) {
     case TileKind::kMaterial:
     case TileKind::kMesh:
     case TileKind::kWorld:
-    case TileKind::kPacket:
+    case TileKind::kGameAsset:
     case TileKind::kGameTable: OpenEditor(tile.path, tile.kind); break;
     case TileKind::kOther: SetStatus("No editor opens this kind of asset yet", true); break;
   }
@@ -988,6 +986,13 @@ const content::ModContent* ContentBrowserWindow::ContentOf(std::string_view mod)
   return found != content_.end() ? &found->second : nullptr;
 }
 
+const AssetInfo* ContentBrowserWindow::AssetOf(std::string_view path) const {
+  const content::ModContent* found = ContentOf(content::ModOf(path));
+  if (!found) return nullptr;
+  const auto asset = std::find_if(found->assets.begin(), found->assets.end(), [&path](const AssetInfo& info) { return Same(info.path, path); });
+  return asset != found->assets.end() ? &*asset : nullptr;
+}
+
 const ModInfo* ContentBrowserWindow::ModOf(std::string_view path) const { return model_.mods().Find(content::ModOf(path)); }
 
 void ContentBrowserWindow::NavigateGameTables() {
@@ -1004,8 +1009,10 @@ void ContentBrowserWindow::Navigate(std::string folder) {
   reveal_ = true;
 }
 
-void ContentBrowserWindow::AskFor(Ask ask, std::string target, std::string text) {
+void ContentBrowserWindow::AskFor(Ask ask, std::string target, std::string text, std::string type) {
   ask_ = ask;
+  ask_type_ = std::move(type);
+  ask_values_ = nlohmann::json::object();
   ask_target_ = std::move(target);
   ask_text_ = std::move(text);
   // A new class starts below Object; a new table's struct is picked; a new language is of the one the game shows.
@@ -1016,18 +1023,26 @@ void ContentBrowserWindow::AskFor(Ask ask, std::string target, std::string text)
   if (ask == Ask::kNewMaterial) ask_parent_ = content::MaterialTypePaths().empty() ? std::string() : content::MaterialTypePaths().front();
   // A world starts on the game's first world.
   if (ask == Ask::kNewWorld) ask_parent_ = content::Worlds().empty() ? std::string() : content::Worlds().front().path;
-  // A packet starts on the game's first packet base.
-  if (ask == Ask::kNewPacket) {
-    const std::optional<content::Enum> bases = content::FindEnum(content::PacketBaseEnum());
-    ask_parent_ = bases && !bases->values.empty() ? bases->values.front().name : std::string();
+  // A game asset's fields it's created with start at their defaults.
+  if (ask == Ask::kNewGameAsset) {
+    if (const std::shared_ptr<const content::AssetType> found = content::FindAssetType(ask_type_)) {
+      for (const std::string& name : found->create_with) {
+        const auto field = std::find_if(found->fields.begin(), found->fields.end(), [&name](const content::AssetField& known) { return Same(known.name(), name); });
+        if (field != found->fields.end()) ask_values_[field->name()] = field->property.value;
+      }
+    }
   }
   if (ask == Ask::kNewLanguage && ask_parent_.empty() && !content::Languages().empty()) ask_parent_ = content::Languages().front().code;
   ask_references_ = ask == Ask::kRename || ask == Ask::kDelete ? content::ReferencesTo(model_.mods(), ask_target_) : std::vector<content::Reference>{};
   open_ask_ = true;
 }
 
-const char* ContentBrowserWindow::AskTitle(Ask ask) {
-  switch (ask) {
+std::string ContentBrowserWindow::AskTitle() const {
+  if (ask_ == Ask::kNewGameAsset) {
+    const std::shared_ptr<const content::AssetType> found = content::FindAssetType(ask_type_);
+    return "New " + (found ? found->label : std::string("Asset"));
+  }
+  switch (ask_) {
     case Ask::kNone: return "";
     case Ask::kNewMod: return "New Mod";
     case Ask::kNewFolder: return "New Folder";
@@ -1039,7 +1054,7 @@ const char* ContentBrowserWindow::AskTitle(Ask ask) {
     case Ask::kNewMapEdit: return "New Map Edit";
     case Ask::kNewMaterial: return "New Material";
     case Ask::kNewWorld: return "New World";
-    case Ask::kNewPacket: return "New Packet";
+    case Ask::kNewGameAsset: return "New Asset";
     case Ask::kImportImage: return "Import Image";
     case Ask::kImportMesh: return "Import Mesh";
     case Ask::kRename: return "Rename";
@@ -1053,7 +1068,7 @@ void ContentBrowserWindow::DrawPopups() {
     open_ask_ = false;
     ImGui::OpenPopup(kAskPopup);
   }
-  const std::string title = std::string(AskTitle(ask_)) + kAskPopup;
+  const std::string title = AskTitle() + kAskPopup;
   ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * kAskWidth, 0.0f));
   if (!ImGui::BeginPopupModal(title.c_str(), nullptr, ImGuiWindowFlags_NoResize)) return;
 
@@ -1179,22 +1194,22 @@ void ContentBrowserWindow::DrawPopups() {
       ImGui::SetItemTooltip("The world it's built on: entered as it, with the new world's map edits besides its own");
       if (problem.empty() && ask_parent_.empty()) problem = "Pick the world it's built on";
     }
-    if (ask_ == Ask::kNewPacket) {
-      ImGui::AlignTextToFramePadding();
-      ImGui::TextUnformatted("Pours as");
-      ImGui::SameLine();
-      ImGui::SetNextItemWidth(-FLT_MIN);
-      if (ImGui::BeginCombo("##packet_base", ask_parent_.empty() ? "Pick a base" : ask_parent_.c_str())) {
-        if (const std::optional<content::Enum> bases = content::FindEnum(content::PacketBaseEnum())) {
-          for (const content::EnumValue& base : bases->values) {
-            if (ImGui::Selectable(base.name.c_str(), base.name == ask_parent_)) ask_parent_ = base.name;
-            if (!base.help.empty()) ImGui::SetItemTooltip("%s", base.help.c_str());
-          }
+    if (ask_ == Ask::kNewGameAsset) {
+      const std::shared_ptr<const content::AssetType> type = content::FindAssetType(ask_type_);
+      if (!type) {
+        if (problem.empty()) problem = "The game no longer has this asset type";
+      } else {
+        const TypeChoices choices = Choices(content::ModOf(ask_target_));
+        for (const content::AssetField* field : content::ShownFields(*type, ask_values_)) {
+          if (std::none_of(type->create_with.begin(), type->create_with.end(), [field](const std::string& name) { return Same(name, field->name()); })) continue;
+          ImGui::AlignTextToFramePadding();
+          ImGui::TextUnformatted(field->Label().c_str());
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(-FLT_MIN);
+          ValueField(("##" + field->name()).c_str(), field->property.type, ask_values_[field->name()], types_, choices);
+          if (!field->property.help.empty()) ImGui::SetItemTooltip("%s", field->property.help.c_str());
         }
-        ImGui::EndCombo();
       }
-      ImGui::SetItemTooltip("The game's packet it's a variant of: it pours, grows and counts as that one does, and looks and sells as it says");
-      if (problem.empty() && ask_parent_.empty()) problem = "Pick the packet it pours as";
     }
     if (ask_ == Ask::kImportImage || ask_ == Ask::kImportMesh) ImGui::TextDisabled("From %s", ask_parent_.c_str());
     if (!problem.empty()) ImGui::TextColored(widgets::kErrorColor, "%s", problem.c_str());
@@ -1210,7 +1225,7 @@ void ContentBrowserWindow::DrawPopups() {
       if (ask_ == Ask::kNewMapEdit) CreateMapEdit(ask_text_, ask_parent_);
       if (ask_ == Ask::kNewMaterial) CreateMaterial(ask_text_, ask_parent_);
       if (ask_ == Ask::kNewWorld) CreateWorld(ask_text_, ask_parent_);
-      if (ask_ == Ask::kNewPacket) CreatePacket(ask_text_, ask_parent_);
+      if (ask_ == Ask::kNewGameAsset) CreateGameAsset(ask_text_);
       if (ask_ == Ask::kImportImage) ImportImage(ask_text_, ask_parent_);
       if (ask_ == Ask::kImportMesh) ImportMesh(ask_text_, ask_parent_);
       if (ask_ == Ask::kRename) RenameTarget(ask_text_);
@@ -1347,10 +1362,10 @@ void ContentBrowserWindow::CreateWorld(const std::string& name, const std::strin
   SetStatus("Made " + path);
 }
 
-void ContentBrowserWindow::CreatePacket(const std::string& name, const std::string& base) {
+void ContentBrowserWindow::CreateGameAsset(const std::string& name) {
   const ModInfo* mod = ModOf(ask_target_);
   std::string error;
-  if (!mod || !content::CreatePacket(*mod, ask_target_, name, base, &error)) {
+  if (!mod || !content::CreateGameAsset(*mod, ask_target_, name, ask_type_, ask_values_, &error)) {
     SetStatus(error, true);
     return;
   }
@@ -1358,8 +1373,65 @@ void ContentBrowserWindow::CreatePacket(const std::string& name, const std::stri
   Saved(path);
   Refresh();
   selected_ = path;
-  OpenEditor(path, TileKind::kPacket);
+  OpenEditor(path, TileKind::kGameAsset);
   SetStatus("Made " + path);
+}
+
+void ContentBrowserWindow::DrawNewItems(const std::string& folder, bool enabled) {
+  if (ImGui::MenuItem("New Folder...", nullptr, false, enabled)) AskFor(Ask::kNewFolder, folder, "NewFolder");
+  const bool worlds = !content::Worlds().empty();
+  const bool materials = !content::MaterialTypePaths().empty();
+  // RexFabric's own submenus first, then the game's categories in the order its types first name them, then Other.
+  struct Category {
+    std::string name;
+    std::vector<std::shared_ptr<const content::AssetType>> types;
+  };
+  std::vector<Category> categories = {{std::string(kBasicCategory), {}}, {std::string(kAdvancedCategory), {}}};
+  Category other{std::string(kOtherCategory), {}};
+  for (const auto& type : content::AssetTypes()) {
+    if (type->category.empty() || Same(type->category, kOtherCategory)) {
+      other.types.push_back(type);
+      continue;
+    }
+    auto found = std::find_if(categories.begin(), categories.end(), [&type](const Category& known) { return Same(known.name, type->category); });
+    if (found == categories.end()) found = categories.insert(categories.end(), Category{type->category, {}});
+    found->types.push_back(type);
+  }
+  categories.push_back(std::move(other));
+  const auto item = [&](const char* label, Ask ask, const char* name) {
+    if (ImGui::MenuItem(label)) AskFor(ask, folder, name);
+  };
+  for (const Category& category : categories) {
+    const bool basic = category.name == kBasicCategory;
+    const bool advanced = category.name == kAdvancedCategory;
+    // Whether it has entries of RexFabric's own: Advanced's are there only where the game has worlds or materials.
+    const bool own = basic || (advanced && (worlds || materials));
+    if (!own && category.types.empty()) continue;
+    if (!ImGui::BeginMenu(category.name.c_str(), enabled)) continue;
+    if (basic) {
+      item("New Class...", Ask::kNewClass, "NewClass");
+      item("New Enum...", Ask::kNewEnum, "NewEnum");
+      item("New Struct...", Ask::kNewStruct, "NewStruct");
+      item("New Data Table...", Ask::kNewTable, "NewTable");
+      if (content::HasGameTexts()) item("New Language...", Ask::kNewLanguage, "NewLanguage");
+    }
+    if (advanced) {
+      if (worlds) {
+        item("New Map Edit...", Ask::kNewMapEdit, "NewMapEdit");
+        item("New World...", Ask::kNewWorld, "NewWorld");
+      }
+      if (materials) item("New Material...", Ask::kNewMaterial, "NewMaterial");
+    }
+    if (own && !category.types.empty()) ImGui::Separator();
+    for (const auto& type : category.types) {
+      const std::string label = "New " + type->label + "...";
+      if (ImGui::MenuItem(label.c_str())) AskFor(Ask::kNewGameAsset, folder, "New" + std::string(content::NameOf(type->path)), type->path);
+      if (!type->help.empty()) ImGui::SetItemTooltip("%s", type->help.c_str());
+    }
+    ImGui::EndMenu();
+  }
+  if (ImGui::MenuItem("Import Image...", nullptr, false, enabled && !picking_)) StartImport(folder);
+  if (ImGui::MenuItem("Import Mesh...", nullptr, false, enabled && !picking_)) StartImport(folder, true);
 }
 
 void ContentBrowserWindow::StartImport(const std::string& folder, bool mesh) {

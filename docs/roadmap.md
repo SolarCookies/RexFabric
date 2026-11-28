@@ -25,7 +25,7 @@ What RexFabric does today, and what comes next, roughly in order.
 | Meshes | 3D models imported as binary glTF, which the game reads and draws (content_and_classes.md, Meshes) |
 | Worlds | Mods' worlds built on the game's, with map edits of their own, entered where the game would enter the base (content_and_classes.md, Worlds) |
 | Waiting and the console | `rex.run`, `rex.wait` and `rex.wait_for` in Lua coroutines; a Lua console running a line in the mods' VM |
-| Packets | Kinds of ground mods add as variants of a game's own, with their texts, icon, look and unlock, made and edited in the content browser and listed for the game with its own (content_and_classes.md, Packets) |
+| Game asset types | Kinds of asset a game declares beside RexFabric's own (Trouble in Paradise's packets): typed fields, some shown only for certain values of another, made and edited in the content browser with one generic editor, renamed, translated and listed for the game with its own (content_and_classes.md, Game asset types) |
 | Saved with the world | Avatars spawned saved kept in the game's save of their world and spawned again when it loads, each mod's own `rex.world_data()`, and parts the game keeps of its own (`DeclareWorldSavePart`); what a mod that's gone had is kept for when it's back, never failing the load |
 | Mod channel | Messages by named topic between the boxes of a co-op game, over a transport the game gives on its own network stream (docs/mod_channel.md); used by retip to keep mod packets in step |
 

@@ -27,6 +27,14 @@ constexpr std::array<std::string_view, 16> kReservedGlobals = {
     "rex", "math", "string", "table", "os", "io", "utf8", "coroutine", "print", "tostring", "tonumber", "type", "select", "pairs", "ipairs", "require",
 };
 
+// A class graph's names (Emitter::ClassGraph): the avatar a chain runs for, its own table, the class and what makes it.
+constexpr std::array<std::string_view, 4> kClassNames = {"Self", "My", "Class", "Fresh"};
+// What each function of a class graph starts with, once something in the graph reads the avatar's own table.
+constexpr std::string_view kOwnLine = "local My = rex.content.own(Self, Class, Fresh)";
+// An event's chain as a function for one avatar, the same function each time it's handed on (so Unbind finds it), and
+// doing nothing once the avatar is gone (a looping timer of a removed avatar).
+constexpr std::string_view kRunAsHelper = "local function rf_as(Self, own, run)\n  local bound = own[run]\n  if bound == nil then\n    bound = function(...) if Self.valid then return run(Self, ...) end end\n    own[run] = bound\n  end\n  return bound\nend";
+
 std::string Indentation(int levels) { return std::string(static_cast<size_t>(std::max(levels, 0)) * 2, ' '); }
 
 // A pin's name as part of a Lua name: "Arg 1" is Arg_1.
@@ -193,7 +201,9 @@ Compiled Compile(const Graph& graph, const CompileOptions& options) {
 
 // Emitter -------------------------------------------------------------------------------------------------
 
-Emitter::Emitter(const Graph& graph, const CompileOptions& options) : graph_(graph), options_(options) {}
+Emitter::Emitter(const Graph& graph, const CompileOptions& options) : graph_(graph), options_(options), globals_(options.globals) {
+  if (ClassGraph()) globals_.insert(globals_.end(), kClassNames.begin(), kClassNames.end());
+}
 
 const Node& Emitter::node() const { return *stack_.back().node; }
 
@@ -263,8 +273,34 @@ std::string Emitter::Param(std::string_view pin) { return LocalName(stack_.back(
 
 std::string Emitter::State(std::string_view name, std::string_view initial) {
   const std::string local = LocalName(stack_.back().instance, node().id, name);
+  // A class graph's is each avatar's own: a Do Once done once for each.
+  if (ClassGraph()) {
+    uses_own_ = true;
+    if (state_names_.insert(local).second) own_state_.emplace_back(local, initial);
+    return "My." + local;
+  }
   if (state_names_.insert(local).second) state_.push_back("local " + local + " = " + std::string(initial));
   return local;
+}
+
+std::string Emitter::Member(std::string_view name) {
+  if (!ClassGraph()) return std::string(name);
+  uses_own_ = true;
+  return "My." + std::string(name);
+}
+
+std::vector<std::string> Emitter::EventParams() {
+  const Node& at = event();
+  std::vector<std::string> params;
+  for (const Pin& pin : PinsOf(at, graph_).outputs) {
+    if (pin.type.kind != PinKind::kExec && pin.type.kind != PinKind::kDelegate) params.push_back(LocalName(-1, at.id, pin.name));
+  }
+  return params;
+}
+
+std::string Emitter::WithSelf(const std::string& params) const {
+  if (!ClassGraph()) return params;
+  return params.empty() ? std::string("Self") : "Self, " + params;
 }
 
 std::string Emitter::EventLocal(std::string_view name) {
@@ -285,6 +321,9 @@ void Emitter::Line(std::string_view text) { lines_.push_back(Indentation(indent_
 void Emitter::Open() {
   Indent();
   functions_.push_back({lines_.size(), indent_, node().id, {}, {}});
+  // A function the script writes fetches the avatar's own table (a callback inside one sees its caller's); dropped again
+  // as the script is put together when nothing reads it.
+  if (ClassGraph() && functions_.size() == 1) Line(kOwnLine);
 }
 
 void Emitter::Close() {
@@ -308,7 +347,7 @@ void Emitter::Chain(std::string_view output) {
     for (const Pin& pin : stack_.back().pins.outputs) {
       if (pin.type.kind != PinKind::kExec && pin.type.kind != PinKind::kDelegate) params += (params.empty() ? "" : ", ") + Param(pin.name);
     }
-    Line(LocalName(-1, from, "Run") + "(" + params + ")");
+    Line(LocalName(-1, from, "Run") + "(" + WithSelf(params) + ")");
     return;
   }
   for (const Link* link : graph_.LinksOutOf({from, std::string(output)})) {
@@ -407,8 +446,14 @@ std::string Emitter::ValueOf(const PinRef& output) {
   }
   const int instance = stack_.back().instance;
 
-  // An event's delegate pin is its chain's function, written before the events, so any of them can take it.
-  if (desc->delegate && output.pin == kDelegatePin) return LocalName(-1, source->id, "Run");
+  // An event's delegate pin is its chain's function, written before the events, so any of them can take it. In a class
+  // graph it's handed on as the chain run for this avatar.
+  if (desc->delegate && output.pin == kDelegatePin) {
+    if (!ClassGraph()) return LocalName(-1, source->id, "Run");
+    uses_own_ = true;
+    Helper("rf_as", kRunAsHelper);
+    return "rf_as(Self, My, " + LocalName(-1, source->id, "Run") + ")";
+  }
 
   // A macro's inputs are what the node using it is given there; its outputs, what its exit is given inside it.
   const Routine* routine = source->type == kRoutineEntry || source->type == kRoutineCall ? RoutineOf(*source, graph_) : nullptr;
@@ -535,7 +580,7 @@ void Emitter::EmitDelegate(const Node& event) {
   }
   lines_.push_back({});
   lines_.push_back("-- " + TitleOf(event) + ", which a timer or a dispatcher can run too");
-  Line("function " + name + "(" + params + ")");
+  Line("function " + name + "(" + WithSelf(params) + ")");
   delegate_ = event.id;
   Open();
   Chain(kExecOut);
@@ -556,7 +601,7 @@ void Emitter::EmitFunction(const Routine& routine) {
   for (const graph::Param& param : routine.inputs) params += (params.empty() ? "" : ", ") + Param(param.name);
   lines_.push_back({});
   lines_.push_back("-- " + routine.name);
-  Line("function " + routine.name + "(" + params + ")");
+  Line("function " + routine.name + "(" + WithSelf(params) + ")");
   Open();
   if (routine.pure) {
     // No chain: the function gives back what its outputs work out to.
@@ -621,7 +666,7 @@ void Emitter::CheckRoutines() {
   for (const Routine& routine : graph_.routines()) {
     const std::string what = (routine.kind == RoutineKind::kMacro ? "Macro " : "Function ") + routine.name;
     std::string reason;
-    if (!IsVariableName(routine.name, options_.globals, &reason)) problems_.push_back({0, what + ": " + reason, false});
+    if (!IsVariableName(routine.name, globals_, &reason)) problems_.push_back({0, what + ": " + reason, false});
     if (!names.insert(routine.name).second || graph_.FindVariable(routine.name)) problems_.push_back({0, what + ": another function, macro or variable has that name", false});
     if (!EntryOf(graph_, routine.id) || !ExitOf(graph_, routine.id)) problems_.push_back({0, what + " is missing its inputs or outputs node", false});
     for (const auto* side : {&routine.inputs, &routine.outputs}) {
@@ -641,7 +686,7 @@ void Emitter::CheckDispatchers() {
   for (const Dispatcher& dispatcher : graph_.dispatchers()) {
     const std::string what = "Event dispatcher " + dispatcher.name;
     std::string reason;
-    if (!IsVariableName(dispatcher.name, options_.globals, &reason)) problems_.push_back({0, what + ": " + reason, false});
+    if (!IsVariableName(dispatcher.name, globals_, &reason)) problems_.push_back({0, what + ": " + reason, false});
     const bool routine = std::any_of(graph_.routines().begin(), graph_.routines().end(), [&](const Routine& entry) { return entry.name == dispatcher.name; });
     if (!seen.insert(dispatcher.name).second || routine || graph_.FindVariable(dispatcher.name)) problems_.push_back({0, what + ": something else in the graph has that name", false});
     std::set<std::string> params;
@@ -657,10 +702,44 @@ void Emitter::CheckVariables() {
   std::set<std::string> seen;
   for (const Variable& variable : graph_.variables()) {
     std::string reason;
-    if (!IsVariableName(variable.name, options_.globals, &reason)) problems_.push_back({0, "Variable " + variable.name + ": " + reason, false});
+    if (!IsVariableName(variable.name, globals_, &reason)) problems_.push_back({0, "Variable " + variable.name + ": " + reason, false});
     if (!seen.insert(variable.name).second) problems_.push_back({0, "Two variables are named " + variable.name, false});
     CheckObjectType("Variable " + variable.name, VariableType(variable));
   }
+}
+
+void Emitter::CheckClassEvents(const std::vector<const Node*>& events) {
+  std::set<std::string> seen;
+  for (const Node* event : events) {
+    if (IsClassEvent(*event)) {
+      if (!seen.insert(event->type).second) problems_.push_back({event->id, "The graph has this event twice; an avatar runs one of each", false});
+    } else if (event->type != kCustomEvent) {
+      problems_.push_back({event->id, "A class graph runs for each avatar, so its events are the avatar's own (and Custom Events); this one goes in one of the mod's graphs", false});
+    }
+  }
+}
+
+std::string Emitter::ClassHeader() {
+  std::string lua = "\n-- The class this is the own graph of, as it's named now: wherever its files are, so a rename or a copy needs no compiling.\n";
+  lua += "local Class = rex.content.script_asset()\n";
+  if (!uses_own_) return lua;
+  // Each avatar's own: the variables, the dispatchers and what the nodes keep, as they start.
+  lua += "\n-- What each avatar's own variables start as; rex.content.own keeps them for it while it's there.\nlocal function Fresh()\n  return {\n";
+  const auto field = [&lua](const std::string& name, const std::string& value, std::string comment) {
+    lua += "    " + name + " = " + value + ",";
+    std::replace(comment.begin(), comment.end(), '\n', ' ');
+    if (!comment.empty()) lua += "  -- " + comment;
+    lua += "\n";
+  };
+  for (const Variable& variable : graph_.variables()) {
+    const Pin pin = ValuePin(variable.name, VariableType(variable));
+    const bool table = pin.type.container != PinContainer::kSingle || pin.type.kind == PinKind::kStruct;
+    field(variable.name, !variable.initial.is_null() || table ? Literal(pin, variable.initial) : std::string("nil"), variable.comment);
+  }
+  for (const Dispatcher& dispatcher : graph_.dispatchers()) field(dispatcher.name, "{}", dispatcher.comment);
+  for (const auto& [name, initial] : own_state_) field(name, initial, {});
+  lua += "  }\nend\n";
+  return lua;
 }
 
 void Emitter::CheckObjectType(const std::string& what, const PinType& type) {
@@ -691,6 +770,7 @@ Compiled Emitter::Finish(std::string_view source) {
     if (node.owner == 0) events.push_back(&node);
     else problems_.push_back({node.id, "Events only run in the event graph", false});
   }
+  if (ClassGraph()) CheckClassEvents(events);
 
   // Functions first, declared together so each can call any other.
   std::string functions;
@@ -730,8 +810,14 @@ Compiled Emitter::Finish(std::string_view source) {
   if (!source.empty()) lua += " from " + std::string(source);
   lua += ".\n-- Saving the graph again replaces this file, so change the graph rather than this file.\n";
 
-  if (!graph_.variables().empty() || !graph_.dispatchers().empty() || !state_.empty()) lua += "\n";
-  for (const Variable& variable : graph_.variables()) {
+  if (ClassGraph()) lua += ClassHeader();
+  // A class graph's variables and dispatchers are each avatar's own, in Fresh.
+  const std::vector<Variable> no_variables;
+  const std::vector<Dispatcher> no_dispatchers;
+  const std::vector<Variable>& variables = ClassGraph() ? no_variables : graph_.variables();
+  const std::vector<Dispatcher>& dispatchers = ClassGraph() ? no_dispatchers : graph_.dispatchers();
+  if (!variables.empty() || !dispatchers.empty() || !state_.empty()) lua += "\n";
+  for (const Variable& variable : variables) {
     const Pin pin = ValuePin(variable.name, VariableType(variable));
     lua += "local " + variable.name;
     // An array, a map or a struct starts as one, empty when nothing says otherwise.
@@ -745,7 +831,7 @@ Compiled Emitter::Finish(std::string_view source) {
     lua += "\n";
   }
   // Each dispatcher, the events bound to it in the order they were bound.
-  for (const Dispatcher& dispatcher : graph_.dispatchers()) {
+  for (const Dispatcher& dispatcher : dispatchers) {
     lua += "local " + dispatcher.name + " = {}";
     if (!dispatcher.comment.empty()) {
       std::string comment = dispatcher.comment;
@@ -755,7 +841,10 @@ Compiled Emitter::Finish(std::string_view source) {
     lua += "\n";
   }
   for (const std::string& line : state_) lua += line + "\n";
-  for (const std::string& line : lines_) lua += line + "\n";
+  for (const std::string& line : lines_) {
+    if (!uses_own_ && Trim(line) == kOwnLine) continue;
+    lua += line + "\n";
+  }
 
   // A pure node read twice reports its problem twice.
   for (const Problem& problem : problems_) {

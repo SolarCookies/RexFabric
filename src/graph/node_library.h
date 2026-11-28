@@ -29,6 +29,7 @@ struct EnumDef;
 
 namespace rexfabric::content {
 struct ValueType;
+struct AssetEventDecl;
 }
 
 namespace rexfabric::graph {
@@ -88,6 +89,7 @@ enum class SettingKind : uint8_t {
   kStruct,      // one of the structs the graph's mod may use
   kTable,       // one of the data tables the graph's mod may use (content/tables.h)
   kAvatarClass, // one of the classes the graph's mod may spawn avatars of (content/classes.h)
+  kProperty,    // one of the properties of the class of the avatar the node acts on (AvatarClassOf)
 };
 
 struct SettingDesc {
@@ -146,6 +148,8 @@ struct NodeDesc {
   std::function<std::string(Emitter& emit, std::string_view output)> expression;
   // The role for a node whose role depends on it: a call to a pure function is pure. Unset: `role`.
   std::function<NodeRole(const Node& node, const Graph& graph)> role_of;
+  // Whether the add menu offers it in this graph: Self only in an avatar class's own. Unset: in every graph.
+  std::function<bool(const Graph& graph)> offered;
 };
 
 // The exec pins most nodes have. Their labels aren't drawn.
@@ -270,6 +274,52 @@ Routine& CreateRoutine(Graph& graph, RoutineKind kind, std::string name);
 // Removes a routine, its graph, and the nodes calling it.
 void DeleteRoutine(Graph& graph, int id);
 void RenameRoutine(Graph& graph, int id, const std::string& name);
+// A game asset's own graph (content.h, AssetTypeDecl::events): one event node for each event the game fires for the
+// asset, the event fired for this asset alone (nodes_game.cpp), placed when the graph is made and never deleted.
+inline constexpr std::string_view kAssetEventPrefix = "asset.event:";
+// The node type of an event on an asset's own graph: "asset.event:tip.star_leaf_pressed".
+std::string AssetEventNode(std::string_view event);
+bool IsAssetEvent(const Node& node);
+// Adds a node of each of `types` (an asset's or a class's event nodes) the graph lacks, down the left of its event
+// graph, each below the last. True when it added one. Field events (below) aren't one of these.
+bool PlaceEventNodes(Graph& graph, const std::vector<std::string>& types);
+
+// A field event: an asset event node made from the asset's fields (content.h, AssetTypeDecl::asset_events), such as a
+// shop catalog's On Bought of one of its actions. It's an asset.event node of its event whose Match setting holds the
+// values the event's arguments after the asset must equal, as a JSON array of strings, and whose Title setting holds
+// its title (empty for the event's own). It's known by its event and its match, so the fields' order doesn't matter.
+inline constexpr std::string_view kMatchSetting = "Match";
+inline constexpr std::string_view kTitleSetting = "Title";
+bool IsFieldEvent(const Node& node);
+// The values a field event's arguments after the asset must equal, in order; none for any other node.
+std::vector<std::string> MatchOf(const Node& node);
+// Makes the graph's field events the ones in `events`: one for each, new ones down the left below the event nodes
+// there, and the ones `events` no longer has (a field renamed or removed) gone, with what was linked from them left
+// where it is, unlinked, as a ghost. One whose title alone changed keeps its place and links. True when it changed
+// the graph.
+bool PlaceFieldEvents(Graph& graph, const std::vector<content::AssetEventDecl>& events);
+
+// An avatar class's own graph (Graph::self_class; docs/content_and_classes.md, Class graphs): one event node for each
+// event of its avatars, RexFabric's own (content.h, kAvatarSpawned) and the ones its game classes declare
+// (ClassDecl::events), run for the avatar it's fired for as Self (nodes_content.cpp). Placed when the graph is made and
+// never deleted; one with nothing linked is a ghost, as a blueprint's is, and leaves the parent class's to run.
+inline constexpr std::string_view kClassEventPrefix = "class.event:";
+// The node type of an event on a class graph: "class.event:avatar_tick", "class.event:tip.avatar_interacted".
+std::string ClassEventNode(std::string_view event);
+bool IsClassEvent(const Node& node);
+// The event a class event node stands for: "avatar_tick".
+std::string ClassEventOf(const Node& node);
+// The node types of every event an avatar of a class below `game_class` has: RexFabric's own, then its game classes'.
+std::vector<std::string> ClassEventNodes(std::string_view game_class);
+// Writes a class event's handler: rex.content.on_class(Class, event, function(Self, params) chain end), `convert`
+// writing what readies the params first. A ghost (nothing linked to it) writes nothing.
+void EmitClassEvent(Emitter& emit, std::string_view event, const std::vector<std::string>& params, const std::function<void()>& convert = {});
+// The class of the avatar a node acts on (its Avatar input): the class of what's linked into it, or else, as a
+// blueprint's Target is, the graph's Self. Empty for neither.
+std::string AvatarClassOf(const Node& node, const Graph& graph);
+// The node types events nothing fires are: a Custom Event runs when a timer or a dispatcher runs it.
+inline constexpr std::string_view kCustomEvent = "event.custom";
+
 // Reroutes: a point a link passes through, to lead it around things. Its two pins are the type of what comes in, or
 // else of what it goes to; with no links at all they're wildcards, and link to anything. Exec chains run through it,
 // and data is read through it.

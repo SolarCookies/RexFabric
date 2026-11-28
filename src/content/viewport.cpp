@@ -56,4 +56,16 @@ void CloseViewport(uint64_t viewport) {
   }
 }
 
+bool CaptureViewport(uint64_t viewport, const ViewportView& view, double seconds, std::function<void(ViewportCapture)> done) {
+  const std::shared_ptr<const ViewportRenderer> renderer = Renderer();
+  if (!renderer || !renderer->capture) return false;
+  try {
+    renderer->capture(viewport, view, seconds, std::move(done));
+  } catch (const std::exception& error) {
+    RF_WARN("content: capturing viewport {}: {}", viewport, error.what());
+    return false;
+  }
+  return true;
+}
+
 }  // namespace rexfabric::content

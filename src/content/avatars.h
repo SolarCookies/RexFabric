@@ -3,6 +3,11 @@
 // each where the avatar and the components above it put it; removing it detaches them in reverse order and removes its
 // backing. One whose backing is gone from the world (its garden unloaded) is detached and forgotten on the next tick.
 //
+// Each avatar fires RexFabric's avatar events (content.h, kAvatarSpawned), which its class graph runs: spawned once its
+// components are attached, tick each frame after they ticked, and removed before they detach, whether it's removed or
+// goes with its world. A reload of the mods' scripts removes the avatars it spawned without the event, as the scripts
+// whose graphs would run it are gone; the saved ones it keeps are spawned again for the new scripts (AnnounceAvatars).
+//
 // An avatar keeps the class as it was when it was spawned: a class saved since changes the next one spawned. Its
 // property values start as its class's and can be changed on it alone, for as long as it's there.
 //
@@ -12,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -43,6 +49,9 @@ void RemoveAllAvatars();
 bool MoveAvatar(uint32_t id, const Transform& to, std::string* why);
 
 std::optional<AvatarView> FindAvatar(uint32_t id);
+// The class of an avatar that's there (removed or gone with its world, it isn't), or empty: cheaper than FindAvatar,
+// as it asks the game nothing.
+std::string ClassOfAvatar(uint32_t id);
 // Every avatar of the class or a class below it, every one for an empty path, oldest first.
 std::vector<uint32_t> AvatarsOf(std::string_view path);
 // The avatar whose backing is the game's object, or 0.
@@ -72,7 +81,18 @@ struct SavedAvatar {
 // Every saved avatar, oldest first.
 std::vector<SavedAvatar> SavedAvatars();
 
-// Ticks every avatar's components, after forgetting the ones whose backing is gone. Each frame, before the frame event.
+// Whoever keeps something of its own for each avatar (the Lua VM, the tables of its class graphs) is told here once an
+// avatar is gone for good, after its removed event: once per avatar, on the thread it went on. One listener, which a new
+// one replaces; an empty one stops it.
+void OnAvatarGone(std::function<void(uint32_t id)> listener);
+
+// The avatars there are now are new to the scripts about to load (the scripts are loaded again): each still there on the
+// next tick fires its spawned event again then, so the new scripts' class graphs start each one's own. An avatar the
+// scripts spawn as they load fires its own. Any thread.
+void AnnounceAvatars();
+
+// Ticks every avatar's components, after forgetting the ones whose backing is gone, and fires each one's tick event.
+// Each frame, before the frame event.
 void TickAvatars(double seconds);
 
 }  // namespace rexfabric::content
